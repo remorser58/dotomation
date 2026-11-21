@@ -8,6 +8,8 @@ Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자�
 - 반복·병렬·조사: ulw-loop · mass-ulw · ulw-research · 독립 관점 교차 검토: hyperplan.
 - [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
 
+- Astra 작업에는 [GPT‑6.2 Astra 프롬프트와 REM·Ultra·xhigh 역할별 브리핑](profiles/astra/PROFILE.md)을 같은 커밋에서 읽습니다. [역할 판정 예시](examples/astra-cases.md)도 있습니다.
+
 ## 한 건 시작하기
 
 1. 승인된 저장소에서 사용할 **40자리 커밋 SHA**를 정한다. 브랜치명이나 최신판이라는 표현만으로는 버전을 고정할 수 없다.

@@ -9,6 +9,8 @@ This is a Dots instruction router, not an input hook. Use it in the root, a work
 5. Dots calls are direct by default. Group genuinely independent read-only lookups; run mutations, approvals, dependent commands and checks after each predecessor's actual result. Keep native file/widget delivery, waiting, credentials and confirmations in their supported interfaces. A wrapper cannot replace them. No automatic provider, effort, instructions, prompt rewrites or child inheritance; deliver a pinned brief, name actual model/capability only when independently observable, and preserve the child's approved surface.
 6. During plan/research/review-only requests, inspect only. Do not start implementation, checkout changes or a background planner. Native plan selection and the decision to execute are separate; a completed plan is not implementation authority. If a user later explicitly requests implementation, resume the outcome at a new revision, preserving decisions and unimplemented obligations.
 
+7. When the owner or an authorized active brief chooses GPT‑6.2 Astra for a role, follow the [Astra profile](../profiles/astra/PROFILE.md) and open the appropriate role brief at the same kit SHA. Other or unknown models retain this generic dispatch. A profile changes working guidance only, never permissions, model identity, or completion gates.
+
 ### Dispatch checks a person can try
 
 | Text | Expected route/result |
