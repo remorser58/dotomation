@@ -96,6 +96,10 @@
         {
           "locator": "example://immutable-message-note-01",
           "observation": "The example note says: A repeated reply no longer creates a second draft. Relay-only workflows still require manual readback."
+        },
+        {
+          "locator": "example://native/hold/writer/s1",
+          "observation": "Writer confirms s1 is the only submission, with no superseded target or blocker; work is on hold pending close. This receipt is visible to lead."
         }
       ]
     }
@@ -127,7 +131,7 @@
           "verdict": "PASS",
           "evidence": {
             "locator": "example://immutable-message-note-01#limit",
-            "observation": "The note explicitly identifies manual readback for relay-only workflows."
+            "observation": "The note explicitly identifies manual readback for relay-only workflows. Reviewer confirms both PASS on s1, with no conflicting verdict or outstanding block, and holds pending close."
           }
         }
       ]
@@ -154,6 +158,10 @@
         {
           "locator": "example://immutable-message-note-01",
           "observation": "Lead independently read the note and the named check against both conditions; no open block or pause."
+        },
+        {
+          "locator": "example://native/hold/writer/s1",
+          "observation": "The coordinator opened the writer's latest receipt and the verifier's s1 check, matched target and lineage, and found no later submission, conflicting verdict, block or pause."
         }
       ]
     }
