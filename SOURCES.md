@@ -1,0 +1,5 @@
+# Provenance and scope
+
+Design reference: [dbc-hbin/omp-superkit at ecdc6abc327ea0cef81036003840c34f2694ddde](https://github.com/dbc-hbin/omp-superkit/tree/ecdc6abc327ea0cef81036003840c34f2694ddde). The [pinned README](https://github.com/dbc-hbin/omp-superkit/blob/ecdc6abc327ea0cef81036003840c34f2694ddde/README.md) describes an OMP extension for model adaptation and work planning. The [package manifest](https://github.com/dbc-hbin/omp-superkit/blob/ecdc6abc327ea0cef81036003840c34f2694ddde/package.json) names the OMP extension entry point and contains no package license field. No repository-wide reuse grant was established in this review; the upstream project describes component-specific attribution.
+
+This repository independently expresses a narrower Dots workflow in newly written instructions, a data-only contract and synthetic examples. It does not redistribute upstream text, code, presets, skills or dependencies. It does not emulate OMP hooks, slash commands, model presets, tool injection, persistent scheduling or storage, or claim native compatibility or upstream endorsement. No external software needs to be downloaded.

@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dots-superkit:handoff-v1",
+  "title": "dots-superkit/handoff-v1",
+  "description": "One event. Shape only; sender authority, current revision, immutable target, reference ordering, duplicates and completion gates are verified according to the skill.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "work_id": {
+      "$ref": "#/$defs/token"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_id": {
+      "$ref": "#/$defs/token"
+    },
+    "kind": {
+      "enum": [
+        "brief",
+        "question",
+        "answer",
+        "submit",
+        "check",
+        "block",
+        "pause",
+        "resume",
+        "close"
+      ]
+    },
+    "from": {
+      "type": "string",
+      "minLength": 1
+    },
+    "to": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reply_to": {
+      "$ref": "#/$defs/token"
+    },
+    "body": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "work_id",
+    "revision",
+    "event_id",
+    "kind",
+    "from",
+    "to",
+    "body"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "brief"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/brief"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "question"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/question"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "answer"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/answer"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "submit"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/submit"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "check"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/check"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "block"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/block"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "pause"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/pause"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "resume"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/resume"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "close"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "body": {
+            "$ref": "#/$defs/close"
+          }
+        },
+        "required": [
+          "reply_to"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observation": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "locator",
+        "observation"
+      ]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "condition": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id",
+        "condition"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "locator",
+        "version"
+      ]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gate": {
+          "$ref": "#/$defs/token"
+        },
+        "verdict": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "NOT_RUN"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      },
+      "required": [
+        "gate",
+        "verdict",
+        "evidence"
+      ]
+    },
+    "brief": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kit_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "coordinator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "writer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verifier": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exclusions": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deliverable": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        }
+      },
+      "required": [
+        "kit_sha",
+        "coordinator",
+        "writer",
+        "verifier",
+        "outcome",
+        "scope",
+        "exclusions",
+        "deliverable",
+        "gates"
+      ]
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "question"
+      ]
+    },
+    "answer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "answer"
+      ]
+    },
+    "submit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "supersedes": {
+          "$ref": "#/$defs/token"
+        }
+      },
+      "required": [
+        "target",
+        "evidence"
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/result"
+          }
+        }
+      },
+      "required": [
+        "target",
+        "results"
+      ]
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "next": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "cause",
+        "next"
+      ]
+    },
+    "pause": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner_instruction": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "reason",
+        "owner_instruction"
+      ]
+    },
+    "resume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_instruction": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "owner_instruction"
+      ]
+    },
+    "close": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/token"
+          },
+          "uniqueItems": true
+        },
+        "resolved": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/token"
+          },
+          "uniqueItems": true
+        },
+        "readback": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      },
+      "required": [
+        "target",
+        "checks",
+        "resolved",
+        "readback"
+      ]
+    }
+  }
+}
