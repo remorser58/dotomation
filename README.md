@@ -1,6 +1,12 @@
 # Dots Superkit
 
-Dots에서 담당자와 검증자가 직접 대화하고, 조정자가 실제 결과를 확인한 뒤 끝내는 절차다. 실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다.
+Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자와 검증자가 직접 대화하는 작업 키트다. 실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다.
+
+## 원하는 작업 고르기
+
+- 목표부터 정하기: WISH · 증거를 갖춰 실행: ULW · 계획만: ulw-plan · 승인된 계획 실행: ulw-execute.
+- 반복·병렬·조사: ulw-loop · mass-ulw · ulw-research · 독립 관점 교차 검토: hyperplan.
+- [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
 
 ## 한 건 시작하기
 

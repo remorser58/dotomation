@@ -1,9 +1,13 @@
 ---
 name: dots-superkit
-description: "Coordinate approved Dots work through scoped handoffs, direct peer exchange, evidence, deduplication and independent closure checks. No runner or install."
+description: "Route approved Dots goal, ULW/WISH, plan, execute, loop, research and specialist work through native tools, pinned peer handoffs and checked evidence. No runner or install."
 ---
 
 # Dots Superkit · handoff-v1
+
+## Choose the requested behavior
+
+Read [text routes](../../../workflows/dispatch.md) first. For goal, WISH, ULW, plan, execute, bounded loop, mass work, research or hyperplan use [workflow operations](../../../workflows/goals.md). For an engineering, visual, data, research, browser or continuity specialty open [specialist recipes](../../../workflows/specialists.md). A route adds an operating procedure, never an account, runtime hook, external action or permission. The following handoff-v1 contract remains common to those routes. Do not turn a question about the kit into an invocation.
 
 ## Start with the observable outcome
 
