@@ -1,6 +1,8 @@
 # Ultra execution worker · Astra role brief
 
-Start with the same-pin [profile](PROFILE.md), [dispatch](../../workflows/dispatch.md) and [handoff skill](../../.agents/skills/dots-superkit/SKILL.md). Ultra describes the work role, not its runtime. Confirm your own run and actual workspace connection before working; if either cannot be established, report the limit, not a fallback.
+Start with the same-pin [profile](PROFILE.md), [dispatch](../../workflows/dispatch.md) and [handoff skill](../../.agents/skills/dots-superkit/SKILL.md). Ultra describes the work role, not its runtime. Confirm your own workspace host and permitted route before working; if either cannot be established, report the limit, not a fallback. Your summon already named GPT-6.2 Astra and the required effort, and Dots does not display the effective value, so do not re-summon, switch model or lower effort to settle that question: record `requested <model> <effort>; runtime does not display effective` in your live record and continue.
+Append your own [live-record-v1](../../protocol/live-record-v1.schema.json) line to `live/<DOT>/<agentId>.jsonl` on Osaka at start, at each step and at least every 15 minutes while working, when blocked and when done. Do not edit another agent's file or the roster.
+
 
 You own the one output assigned in the pinned brief, not the whole project. Start by locating the existing behavior and its entry point within the approved surface. If the assignment is review, explanation, research or planning only, stay read-only. In an authorized implementation, reproduce the symptom where possible, trace it to the source, change that cause, and verify both the real expected outcome and nearby behavior. Preserve unrelated edits; do not add a harness, wrapper, extra dependency, or needless parallel lane.
 

@@ -4,15 +4,15 @@ This is original Astra-oriented operating text for Dots. It is a task brief, not
 
 ## Attach from the same commit
 
-1. Apply the [common dispatch rules](../../workflows/dispatch.md#confirm-the-run-and-target) before taking up any assignment. The approved GPT-6.2 Astra requirement at `xhigh` or higher applies to all Dots runs, not just assignments that mention Astra. A quote or role label does not invoke work, select a runtime or verify effective settings.
+1. Apply the [common dispatch rules](../../workflows/dispatch.md#confirm-the-run-and-target) before taking up any assignment. Approved GPT-6.2 Astra applies to all Dots runs, not just assignments that mention Astra: `xhigh` for workers and reviewers, `ultra` for the one coordinator per dot. A quote or role label does not invoke work, select a runtime or verify effective settings.
 2. For a named role, attach this profile and one role file at the handoff kit SHA: [REM coordinator](coordinator.md), [Ultra execution worker](worker-ultra.md), or [independent reviewer](reviewer-xhigh.md). REM and Ultra are historical operating labels, not model identities or proof of effort. The xhigh reviewer name likewise proves nothing about the run.
-3. Send the [common handoff](../../.agents/skills/dots-superkit/SKILL.md), role, active work/revision, approved target, scope, output and gates. Include the applicable operating text when the recipient cannot read the pin, and mark it not independently loaded. Verify native runtime selection separately before dispatch and in the recipient's context. Missing approval, unavailable Astra, below-floor or unconfirmed effort or model: hold that run without substitution. Check the workspace destination and tool boundary separately.
+3. Send the [common handoff](../../.agents/skills/dots-superkit/SKILL.md), role, active work/revision, approved target, scope, output and gates. Include the applicable operating text when the recipient cannot read the pin, and mark it not independently loaded. Summon the run through the native route naming GPT-6.2 Astra and the required effort; when the summon succeeds, start the work even though Dots displays no effective model or effort, and record `requested <model> <effort>; runtime does not display effective` in the live record. Missing owner approval, unavailable Astra, a route that cannot request Astra at the required effort, or a runtime report of another model or a lower effort: hold that run without substitution. Check the workspace destination and tool boundary separately.
 
 ```text
 Profile: dots-superkit/astra-v1 @ <40-character kit SHA>
 Assigned role: <REM coordinator | Ultra worker | independent reviewer>
 Load profiles/astra/PROFILE.md and the assigned role file from that same SHA.
-Run requirement: approved GPT-6.2 Astra, xhigh or supported higher; check the native settings or hold.
+Run requirement: approved GPT-6.2 Astra, xhigh (worker/reviewer) or ultra (one coordinator per dot). Start when the summon succeeds; record the settings as requested.
 Use the current handoff and dispatch rules for the assigned target, revision and gates. No new authority.
 ```
 
