@@ -13,7 +13,7 @@ Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자�
 ## 한 건 시작하기
 
 1. 승인된 저장소에서 사용할 **40자리 커밋 SHA**를 정한다. 브랜치명이나 최신판이라는 표현만으로는 버전을 고정할 수 없다.
-2. 그 커밋의 [스킬](.agents/skills/dots-superkit/SKILL.md)과 [공통 실행 규칙](workflows/dispatch.md#confirm-the-run-and-target)을 먼저 읽는다. 조정자와 모든 하위 작업은 승인된 GPT‑6.2 Astra를 네이티브 경로로 소환한다: 담당·검증은 `xhigh`, Dot마다 총괄 하나는 `ultra`. 소환이 성공하면 Dots가 실제 모델·강도를 표시하지 않아도 작업을 시작하고, 기록에는 `requested <model>/<effort>; runtime does not display effective`로 남긴다. 다른 모델이나 더 낮은 강도로 다시 소환하지 않는다. 작업 전 호스트 이름으로 현재 호스트를 확인하고 대상이 바뀌면 다시 확인한다. Dots 자체 기기 연결로 붙은 컴퓨터는 그 컴퓨터의 네이티브 CLI만 쓴다. 오너가 설치한 이름 있는 Web GPT Agent 커넥터는 그 호스트로 가는 승인 경로다([승인 경로](workflows/hosts.md#approved-routes)). Codex(Codex Native2, Codex cloud, Codex 연동 도구)는 어느 호스트에서도 쓰지 않는다.
+2. 그 커밋의 [스킬](.agents/skills/dots-superkit/SKILL.md)과 [공통 실행 규칙](workflows/dispatch.md#confirm-the-run-and-target)을 먼저 읽는다. 조정자는 모든 하위 작업자를 승인된 GPT‑6.2 Astra로 네이티브 경로에서 소환한다: 담당·검증은 `xhigh`, Dot마다 총괄 하나는 `ultra`. 소환이 성공하면 Dots가 실제 모델·강도를 표시하지 않아도 작업을 시작하고, 기록에는 `requested <model> <effort>; runtime does not display effective`로 남긴다. 다른 모델이나 더 낮은 강도로 다시 소환하지 않는다. 작업 전 호스트 이름으로 현재 호스트를 확인하고 대상이 바뀌면 다시 확인한다. Dots 자체 기기 연결로 붙은 컴퓨터는 그 컴퓨터의 네이티브 CLI만 쓴다. 오너가 설치한 이름이 지정된 Web GPT Agent 커넥터는 그 호스트로 가는 승인 경로다([승인 경로](workflows/hosts.md#approved-routes)). Codex(Codex Native2, Codex cloud, Codex 연동 도구)는 어느 호스트에서도 쓰지 않는다.
 3. 담당자는 짝 검증자에게 결과를 직접 보낸다. 검증자는 정확히 그 결과를 열어 확인한다. 조정자는 검사 기록뿐 아니라 산출물과 요구 조건을 직접 비교해 종료 여부를 정한다. 별도 실행이나 등록 없이 기존 작업의 메시지/메모만 쓰면 된다.
 
 각 담당자와 검증자에게 같은 버전과 범위, 승인된 작업 대상과 도구 제한을 명시해 직접 전달한다. 수신자는 자기 실행 환경에서 확인한다. 호스트나 승인 경로를 확인할 수 없다면 그 작업을 보류하며 다른 모델, 강도, 호스트로 대체하지 않는다.

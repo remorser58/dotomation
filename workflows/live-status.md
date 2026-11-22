@@ -17,23 +17,27 @@ Creating the folder and appending a line are ordinary filesystem operations on t
 ## One line, ten fields
 
 ```json
-{"t":"2026-11-22T20:37:55Z","agent":"yomanchi-lead","role":"총괄","model":"requested gpt-6.2-astra/ultra; runtime does not display effective","project":"yomanchi","task":"rev-task intake","state":"step","host":"osaka","note":"Open rev-task issues: 0. No assignment made.","evidence":"https://github.com/remorser58/Yomanchi/issues"}
+{"t":"2026-11-22T20:37:55Z","agent":"yomanchi-lead","role":"총괄","model":"requested gpt-6.2-astra ultra; runtime does not display effective","project":"yomanchi","task":"rev-task intake","state":"step","host":"osaka","note":"Open rev-task issues: 0. No assignment made.","evidence":"https://github.com/remorser58/Yomanchi/issues"}
 ```
 
-[Schema](../protocol/live-record-v1.schema.json). Field names are exact; `t` is required. A synthetic start-to-done sequence is in [examples/live-records.json](../examples/live-records.json).
+[Schema](../protocol/live-record-v1.schema.json). Exactly these ten field names, all present, nothing extra; `t` is required. `state` is the only enumerated field. `role`, `model`, `project` and `host` accept any non-empty single line so that records already in the folder stay readable, and the table below gives the wording to use from now on. A synthetic start-to-done sequence is in [examples/live-records.json](../examples/live-records.json).
 
-| Field | Value |
-|---|---|
-| `t` | RFC 3339 UTC timestamp, e.g. `2026-11-22T20:37:55Z`. Fractional seconds and `+00:00` are accepted. A line that uses `timestamp`, `time` or `at` instead of `t` is not a live record. |
-| `agent` | The agent's stable id (`rem-root`, `yomanchi-lead`, `REV`). |
-| `role` | One of 총괄 (lead/coordinator), 구현 (implementation), 연구 (research), 디자인 (design), 디버깅 (debugging), 검토 (review). One record names one role. |
-| `model` | Starts with `confirmed` or `requested`. `confirmed gpt-6.2-astra/xhigh` only when the runtime displays it; otherwise `requested gpt-6.2-astra/ultra; runtime does not display effective`. A role name, a prior run or a coordinator's statement is never the value. |
-| `project` | `kice`, `remorswarm` or `yomanchi`. A lane that spans two projects appends one record per project rather than a combined value. |
-| `task` | The approved task or its `work_id/revision`. Keep it stable for the whole task so the lines group. |
-| `state` | `start`, `step`, `blocked` or `done`. |
-| `host` | `vm` (Dots VM), `osaka` (Osaka OCI), `mini` (Mac mini), `macbook` (MacBook). The host actually used, confirmed by hostname — not where the agent was launched from. |
-| `note` | One line: what changed, what was observed, what is missing. No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text. |
-| `evidence` | A path or link to the exact artifact: commit and path, PR, message id, file path. "It worked" is not evidence. |
+| Field | Required shape | Wording to use |
+|---|---|---|
+| `t` | RFC 3339 date-time, e.g. `2026-11-22T20:37:55Z`. Fractional seconds and `+00:00` are accepted. | UTC. A line that uses `timestamp`, `time` or `at` instead of `t` is not a live record. |
+| `agent` | Stable id token. | The same id used in messages and in the roster (`rem-root`, `yomanchi-lead`, `REV`). |
+| `role` | One non-empty line. | One of 총괄 (lead/coordinator), 구현 (implementation), 연구 (research), 디자인 (design), 디버깅 (debugging), 검토 (review). One record names one role. |
+| `model` | One non-empty line. | `confirmed gpt-6.2-astra xhigh` only when the runtime displays the model and effort; otherwise `requested gpt-6.2-astra ultra; runtime does not display effective`, naming what the summon asked for. A role name, a prior run or a coordinator's statement is never the value. |
+| `project` | One non-empty line. | `kice`, `remorswarm` or `yomanchi`. A lane that spans two projects appends one record per project rather than a combined value. |
+| `task` | One non-empty line. | The approved task or its `work_id/revision`. Keep it stable for the whole task so the lines group. |
+| `state` | `start`, `step`, `blocked` or `done`. | — |
+| `host` | One non-empty line. | `vm` (Dots VM), `osaka` (Osaka OCI), `mini` (Mac mini), `macbook` (MacBook). The host actually used, confirmed by hostname — not where the agent was launched from. |
+| `note` | One non-empty line. | What changed, what was observed, what is missing. No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text. |
+| `evidence` | One non-empty line. | A path or link to the exact artifact: commit and path, PR, message id, file path. "It worked" is not evidence. |
+
+## Legacy lines
+
+Lines already in the folder may use `timestamp` instead of `t`, miss a field, or spell a role, host, project or model in the wording of the day. They stay exactly as written: never rewritten, reformatted, migrated or deleted, because the log is append-only. Read them as unconfirmed — they still show what that agent said at that time, but they are not v1 records, they do not start a stall clock or prove a step, and they cannot be cited as a confirmed setting. The correction is a new v1 line, not an edit of the old one.
 
 ## When to append
 
@@ -42,7 +46,7 @@ Creating the folder and appending a line are ordinary filesystem operations on t
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules.
 
-A working agent with no new line for 30 minutes is **stalled**. The coordinator checks that agent directly — alive, waiting on a peer, host gone — and either resumes it with one concrete follow-up or reassigns the slot. A stall is not evidence of a VM reset, and a reset suspicion is not a stall.
+A working agent with no new line for 30 minutes is **stalled**. The coordinator checks that agent directly — alive, waiting on a peer, host gone — and reassigns the slot. A stall is not evidence of a VM reset, and a reset suspicion is not a stall.
 
 ## Roster
 
@@ -57,7 +61,7 @@ A working agent with no new line for 30 minutes is **stalled**. The coordinator 
     {
       "agent": "rem-root",
       "role": "총괄",
-      "model": "requested gpt-6.2-astra/ultra; runtime does not display effective",
+      "model": "requested gpt-6.2-astra xhigh; runtime does not display effective",
       "task": "root approvals and verified handoffs",
       "state": "running",
       "last_record_at": "2026-11-22T20:34:39Z"

@@ -21,7 +21,7 @@ Move directly on a clear, authorized objective. Trace the real entry point and i
 
 ## Live records
 
-Each root, coordinator, worker and reviewer appends one [live-record-v1](../../../protocol/live-record-v1.schema.json) line to `live/<DOT>/<agentId>.jsonl` in the shared Osaka folder at start, at each step (at least every 15 minutes while working), when blocked and when done. `model` begins with `confirmed` only when the runtime displays the setting; otherwise it states what the summon requested. The coordinator keeps `live/<DOT>/roster.json` and treats a working agent with no line for 30 minutes as stalled: check it, then resume it with one concrete follow-up or reassign its slot. A suspected VM reset is `state: "blocked"` with `note: "vm reset suspected"`; it keeps the job on HOLD and follows the [VM watchdog](../../../workflows/vm-watchdog.md). These are ordinary file appends, not a service, watcher or dashboard.
+Each root, coordinator, worker and reviewer appends one [live-record-v1](../../../protocol/live-record-v1.schema.json) line to `live/<DOT>/<agentId>.jsonl` in the shared Osaka folder at start, at each step (at least every 15 minutes while working), when blocked and when done. `model` begins with `confirmed` only when the runtime displays the setting; otherwise it states what the summon requested. The coordinator keeps `live/<DOT>/roster.json` and treats a working agent with no line for 30 minutes as stalled: check that agent, then reassign its slot. A suspected VM reset is `state: "blocked"` with `note: "vm reset suspected"`; it keeps the job on HOLD and follows the [VM watchdog](../../../workflows/vm-watchdog.md). These are ordinary file appends, not a service, watcher or dashboard.
 
 ## Direct exchanges, not another queue
 

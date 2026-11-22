@@ -2,36 +2,31 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:dots-superkit:live-record-v1",
   "title": "dots-superkit/live-record-v1",
-  "description": "One append-only line in live/<DOT>/<agentId>.jsonl. Shape only; whether the line is true, timely and enough to show progress is judged by the coordinator according to the skill and workflows/live-status.md. A line with any other field name, including timestamp instead of t, is not a live record.",
+  "description": "One append-only line in live/<DOT>/<agentId>.jsonl. Shape only; whether the line is true, timely and enough to show progress is judged by the coordinator according to the skill and workflows/live-status.md. Exactly these ten fields, all required, no extras. role, model, project and host are non-empty single-line strings because the field names are the contract; the recommended wording for each is in workflows/live-status.md. Lines written before this version that use another time field or miss a field stay in the file as written, are never rewritten, and are read as unconfirmed.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "t": {
       "type": "string",
-      "format": "date-time"
+      "minLength": 1,
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$",
+      "description": "RFC 3339 UTC timestamp, for example 2026-11-22T20:37:55Z. Fractional seconds and a +00:00 offset are accepted. A line that uses timestamp, time or at instead of t is not a live record."
     },
     "agent": {
       "$ref": "#/$defs/token"
     },
     "role": {
-      "enum": [
-        "총괄",
-        "구현",
-        "연구",
-        "디자인",
-        "디버깅",
-        "검토"
-      ]
+      "$ref": "#/$defs/line",
+      "description": "Recommended: one of 총괄, 구현, 연구, 디자인, 디버깅, 검토."
     },
     "model": {
-      "$ref": "#/$defs/setting"
+      "$ref": "#/$defs/line",
+      "description": "Recommended: 'confirmed <model> <effort>' only when the runtime displays it, otherwise 'requested <model> <effort>; runtime does not display effective'."
     },
     "project": {
-      "enum": [
-        "kice",
-        "remorswarm",
-        "yomanchi"
-      ]
+      "$ref": "#/$defs/line",
+      "description": "Recommended: kice, remorswarm or yomanchi."
     },
     "task": {
       "$ref": "#/$defs/line"
@@ -45,12 +40,8 @@
       ]
     },
     "host": {
-      "enum": [
-        "vm",
-        "osaka",
-        "mini",
-        "macbook"
-      ]
+      "$ref": "#/$defs/line",
+      "description": "Recommended: vm, osaka, mini or macbook — the host actually used, confirmed by hostname."
     },
     "note": {
       "$ref": "#/$defs/line"
@@ -74,17 +65,14 @@
   "$defs": {
     "token": {
       "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     },
     "line": {
       "type": "string",
       "minLength": 1,
       "pattern": "^[^\\r\\n]+$"
-    },
-    "setting": {
-      "type": "string",
-      "description": "Starts with confirmed or requested. confirmed is used only when the runtime displays the model and effort; otherwise requested states what the summon asked for.",
-      "pattern": "^(confirmed|requested) [^\\r\\n]+$"
     }
   }
 }
