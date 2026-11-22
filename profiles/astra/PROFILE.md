@@ -4,16 +4,16 @@ This is original Astra-oriented operating text for Dots. It is a task brief, not
 
 ## Attach from the same commit
 
-1. When the owner's active assignment explicitly names `gpt-6.2-astra`, or the coordinator can see an approved worker was started on that exact model for this role, use the same kit SHA as the common handoff. REM can use the coordinator instructions as an approved operating role without claiming its own underlying model was observed. Mentioning Astra in a question, quote, source, or document does not select it.
-2. Pin both this file and exactly one role brief: [REM coordinator](coordinator.md), [Astra Ultra worker](worker-ultra.md), or [Astra xhigh independent reviewer](reviewer-xhigh.md). Send their paths, kit SHA and the live brief with the real assignee, revision, scope, output and acceptance gates. Include both texts directly if the recipient cannot access the commit; record this as briefing delivered, pin not independently loaded.
-3. Read the common [dispatch](../../workflows/dispatch.md), [handoff skill](../../.agents/skills/dots-superkit/SKILL.md), and named workflow as applicable. If a required model/effort or worker surface is unavailable, report that requirement BLOCKED; do not quietly swap accounts or models. If identity is merely unobservable and not required for acceptance, report the guidance used and leave runtime identity unconfirmed. Model/effort selection through an authorized existing tool remains separate. Other or unknown models continue with the generic kit; never map 6.1 Terra or Sol to Astra merely because OMP did.
+1. Apply the [common dispatch rules](../../workflows/dispatch.md#confirm-the-run-and-target) before taking up any assignment. The approved GPT-6.2 Astra requirement at `xhigh` or higher applies to all Dots runs, not just assignments that mention Astra. A quote or role label does not invoke work, select a runtime or verify effective settings.
+2. For a named role, attach this profile and one role file at the handoff kit SHA: [REM coordinator](coordinator.md), [Ultra execution worker](worker-ultra.md), or [independent reviewer](reviewer-xhigh.md). REM and Ultra are historical operating labels, not model identities or proof of effort. The xhigh reviewer name likewise proves nothing about the run.
+3. Send the [common handoff](../../.agents/skills/dots-superkit/SKILL.md), role, active work/revision, approved target, scope, output and gates. Include the applicable operating text when the recipient cannot read the pin, and mark it not independently loaded. Verify native runtime selection separately before dispatch and in the recipient's context. Missing approval, unavailable Astra, below-floor or unconfirmed effort or model: hold that run without substitution. Check the workspace destination and tool boundary separately.
 
 ```text
 Profile: dots-superkit/astra-v1 @ <40-character kit SHA>
-Requested mode and role: <REM coordinator | worker Ultra | reviewer xhigh>
-Load profiles/astra/PROFILE.md and profiles/astra/<role file> from that same SHA.
-Host-observed model / effort or NOT OBSERVED: <actual evidence / location>
-Continue the named work/revision and its mandatory gates. This brief grants no new authority.
+Assigned role: <REM coordinator | Ultra worker | independent reviewer>
+Load profiles/astra/PROFILE.md and the assigned role file from that same SHA.
+Run requirement: approved GPT-6.2 Astra, xhigh or supported higher; check the native settings or hold.
+Use the current handoff and dispatch rules for the assigned target, revision and gates. No new authority.
 ```
 
 ## Working text for the recipient
@@ -22,6 +22,6 @@ Start from the current outcome and ask what kind of work was requested. For an e
 
 Let the code, document, or service answer routine questions first. When evidence cannot settle a decision that changes the result or an action needs consent, say exactly what is open. Keep other authorized work moving. A refusal or approval denial is a boundary, not an invitation to switch mechanisms.
 
-Use what your current role can actually access. Group independent reads, then observe every dependent effect in order. For a bug, distinguish the first failure from your proposed cause. If the next attempt changes nothing meaningful, don't repeat it. Verify at the real entry point: exercise what the reader or user receives, render visual changes, and distinguish an exact target run from a related unit check. Record the current candidate, what checked it, and what remains unverified. Pending work or an unreadable receipt is not success or absence.
+Use the capabilities actually available to your role. Follow the shared skill's recovery and verification rules; exercise the real requested path and report a missing run rather than substituting related evidence. Bind observations to the exact candidate and gate.
 
 Write the answer in the reader's language and lead with your best-supported conclusion. Give the few facts that make it usable. If an uncertainty would change the decision, name that specific gap once. State a reasoned judgment as such, and separate verified observations from claims you did not test. Report a failure, omission or refusal only with the scope and consequence it actually has.

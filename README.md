@@ -8,13 +8,15 @@ Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자�
 - 반복·병렬·조사: ulw-loop · mass-ulw · ulw-research · 독립 관점 교차 검토: hyperplan.
 - [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
 
-- Astra 작업에는 [GPT‑6.2 Astra 프롬프트와 REM·Ultra·xhigh 역할별 브리핑](profiles/astra/PROFILE.md)을 같은 커밋에서 읽습니다. [역할 판정 예시](examples/astra-cases.md)도 있습니다.
+- 역할을 배정할 때는 [Astra 프로필과 역할별 브리핑](profiles/astra/PROFILE.md)을 같은 커밋에서 읽는다. REM·Ultra·xhigh는 브리핑 이름이지 실행 설정의 증거가 아니다. [역할 판정 예시](examples/astra-cases.md)도 있다.
 
 ## 한 건 시작하기
 
 1. 승인된 저장소에서 사용할 **40자리 커밋 SHA**를 정한다. 브랜치명이나 최신판이라는 표현만으로는 버전을 고정할 수 없다.
-2. 그 커밋의 [.agents/skills/dots-superkit/SKILL.md](.agents/skills/dots-superkit/SKILL.md)를 읽고, 아래 브리핑의 빈칸을 채워 기존 Dots 대화의 담당자에게 보낸다. 하위 검증자를 부르면 같은 버전과 해당 범위를 함께 전달한다.
+2. 그 커밋의 [스킬](.agents/skills/dots-superkit/SKILL.md)과 [공통 실행 규칙](workflows/dispatch.md#confirm-the-run-and-target)을 먼저 읽는다. 조정자와 모든 하위 작업은 승인된 GPT‑6.2 Astra와 `xhigh` 이상의 지원 강도를 확인할 수 있을 때만 진행한다. 작업 전 현재 연결 또는 호스트 신원을 확인하고 대상이 바뀌면 다시 확인한다. 연결된 컴퓨터는 그 컴퓨터의 네이티브 CLI만 사용한다. Dots VM에서라도 그 컴퓨터의 작업에 Web GPT Agents MCP를 쓰지 않는다.
 3. 담당자는 짝 검증자에게 결과를 직접 보낸다. 검증자는 정확히 그 결과를 열어 확인한다. 조정자는 검사 기록뿐 아니라 산출물과 요구 조건을 직접 비교해 종료 여부를 정한다. 별도 실행이나 등록 없이 기존 작업의 메시지/메모만 쓰면 된다.
+
+각 담당자와 검증자에게 같은 버전과 범위, 승인된 작업 대상과 도구 제한을 명시해 직접 전달한다. 수신자는 자기 실행 환경에서 확인한다. 확인할 수 없다면 해당 작업을 보류하며 다른 모델, 강도, 호스트로 대체하지 않는다.
 
 ```text
 Dots Superkit: dots-superkit/handoff-v1 @ <kit commit SHA>
@@ -22,6 +24,7 @@ work_id / revision: <안정된 작업 ID> / 1
 조정자 / 담당자 / 검증자: <역할별 실제 수신자>
 목표와 완료 조건: <사람에게 어떤 결과가 보이면 끝인가>
 승인 범위 / 제외 대상: <허용된 대상·경로·행동, 하지 않을 일>
+실행 규칙: <승인된 작업 대상·연결과 도구 제한> | 같은 SHA의 공통 실행 규칙을 각 역할에 전달하고, 확인되지 않으면 보류.
 담당 산출물: <경로 또는 메시지 ID> | 필수 검사: <검사 ID와 판정 기준>
 직접 교류: 질문, 답, 수정 요청, 검증 결과를 관련 담당자에게 보낸다.
 제출: 대상 버전·증거 위치·확인한 결과·미확인 항목. 중복 여부를 먼저 확인한다.
@@ -30,4 +33,4 @@ work_id / revision: <안정된 작업 ID> / 1
 
 [교류 명세와 JSON Schema](protocol/handoff-v1.schema.json) · [예시 대화](examples/success.json) · [실패·재개 판정 예](examples/edge-cases.md) · [참조 원본과 구현 범위](SOURCES.md)
 
-이 키트는 소환 브리핑에 포함해서 쓴다. 파일을 둔다고 서비스 전체나 기존 작업자에게 자동 적용되지 않는다. 소유자가 기본 적용을 승인한 환경에서는 모든 새 담당자와 하위 검증자에게 전달하고, 다른 환경에서는 그 환경의 지시와 권한을 먼저 확인한다. 브리핑 전달, 상대방의 수신 확인, 실제 작업에서의 적용 검증은 각각 구분해서 보고한다.
+이 키트는 직접 브리핑에 포함해서 쓴다. 파일만으로 서비스 전체나 기존 작업자에게 자동 적용되거나, 백그라운드 전달이 시작되거나, 호스트·권한·모델이 확인되지 않는다. 브리핑 전달, 상대방의 수신 확인, 실제 작업에서의 적용 검증은 각각 구분해서 보고한다.
