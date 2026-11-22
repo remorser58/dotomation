@@ -1,6 +1,6 @@
 # Specialist routes
 
-These are operating recipes for an already authorized assignment. They do not register slash commands, grant credentials, or install tools. Use the current Dots skill catalog for the actual surface. Return **inputs actually opened → observation → decision/output → evidence and limits**, with the common handoff contract. A missing specialist tool does not justify pretending a different kind of evidence is equivalent.
+These recipes apply to an authorized assignment under the [common handoff](../.agents/skills/dots-superkit/SKILL.md) and [run/host/tool rules](dispatch.md#confirm-the-run-and-target). Use the current Dots catalog only within those boundaries. Return the inputs opened, observation, decision or output, and limits. A missing tool does not make a different kind of evidence equivalent.
 
 ### Engineering
 
@@ -17,6 +17,8 @@ These are operating recipes for an already authorized assignment. They do not re
 
 ### Design, data and evaluation
 
+For a visual change, compare the actual render against the reference or stated intent: type, imagery and layout. On the web, exercise the flow at desktop and mobile widths and look for blank content, clipping and overlap. For 3D, inspect framing and occlusion from several angles. Keep interface copy the user requested or people need to understand and operate the surface. Record what was rendered on the exact candidate; if the required render is unavailable through an allowed route, record the visual check as NOT_RUN.
+
 | Route | What the operator actually does | Acceptance / safe fallback |
 |---|---|---|
 | frontend | Define the audience, task, visual hierarchy, key states and viewport constraints. Reuse the observed design system. For authorized implementation, render the intended surface and inspect the actual main flow. | Test relevant viewport, focus/accessibility and loading/empty/error states. A spec or generated mock is not an implementation screenshot; no imported frontend corpora. |
@@ -29,9 +31,9 @@ These are operating recipes for an already authorized assignment. They do not re
 
 | Route | What the operator actually does | Acceptance / safe fallback |
 |---|---|---|
-| web-browser (upstream directory: browser) | For an expressly authorized interaction use an existing connected app first, then the explicitly requested/approved browser surface. Identify a control, act once, reread outcome and pass the result through the authorized native route. | Surface/recipient and observed state must match. Do not silently switch accounts, bypass warnings or claim an action on an unreadable page. For factual lookup use public research instead. |
-| ultimate-browsing | Start with the approved public search workflow (GPTaku Insane when configured), official primary pages and direct public links. Compare independent evidence; if extraction fails, try another authorized public representation. | Separate snippet, full content, date observed and coverage. No WAF, login or access-control bypass; do not invent access to private archives. |
-| computer-use | Only use a desktop if permitted and the task needs direct interaction. Inspect current surface, choose a grounded control, act, re-inspect, record actual user-visible outcome. | Cannot substitute an agent's imagined screen or fresh unauthorized environment. If unavailable, state what was not observed or done. |
+| web-browser (upstream directory: browser) | For an expressly authorized web interaction, use the approved surface only where dispatch permits it. Identify a control, act once, and reread the outcome. Work on a connected computer is native CLI only; a browser surface or connector is not an alternate route to it. | Surface, recipient and state must match. Do not switch accounts, bypass warnings or claim success on an unreadable page. For factual lookup use public research. |
+| ultimate-browsing | Use authorized public search, primary pages and direct public links. Compare independent evidence; if extraction fails, try another authorized public representation. Any delegated model run still needs the common approved runtime. | Separate snippet, full content, date observed and coverage. No WAF, login or access-control bypass; do not invent access to private archives. |
+| computer-use | Use permitted desktop interaction only where it meets dispatch's tool boundary and the task needs it. Inspect the current surface, choose a grounded control, act, and reread the result. Do not use desktop control as an alternative to native CLI for a connected computer. | If the required interaction cannot be observed or performed through the approved route, state what was not done. A mock or another host cannot fill that gap. |
 | coding-agent-sessions | For an authorized historical question, read the relevant existing conversation/connector history, match actual IDs, dates and latest user decision, then verify any externally consequential state again. | Do not scan hidden session files, token storage or other accounts. Say if the required history is unavailable. |
 | reflection | Review a finished attempt's verified artifacts, failed assumptions, alternative interventions and the latest owner's correction. Produce one concrete next-run improvement with an observable check. | Separate causal evidence from hindsight. No edits to global rules or private memory without authority. |
 | memory-advisor | Identify whether a fact is stable preference, project-local choice or one-off constraint. Identify its source, audience and expected lifetime; propose the smallest destination and honor corrections. | Use only an already approved memory service and retention policy; otherwise recommend without storing. Do not preserve secrets, hidden history or speculative conclusions. |
