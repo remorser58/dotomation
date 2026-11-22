@@ -6,11 +6,16 @@ No network, no ssh and no gh: a fake transport serves synthetic ledger and daemo
 log dumps, and a fake gh answers the evidence lookups.
 """
 
+import contextlib
+import io
 import json
 import os
+import re
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 sys.dont_write_bytecode = True  # leave no __pycache__ next to the tool
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,36 +48,48 @@ def record(agent="writer", minutes_ago=5, state="step", evidence="MATCH-CHECK",
     return json.dumps(body, ensure_ascii=False)
 
 
-def ledger_dump(files_by_dot, rosters=None, sizes=None):
+TEST_NONCE = "0123456789abcdef"
+NONCE_RE = re.compile(r"==(?:DOT|LOG) ([0-9a-f]{16}) ")
+
+
+def tag(name, nonce, *rest):
+    """A dump sentinel; ``nonce=None`` gives the pre-nonce framing of 50e0272."""
+    return " ".join([name] + ([nonce] if nonce else []) + [str(r) for r in rest])
+
+
+def ledger_dump(files_by_dot, rosters=None, sizes=None, nonce=TEST_NONCE, nodirs=()):
     """Build the framed dump that ledger_script() produces."""
     rosters = rosters or {}
     sizes = sizes or {}
     lines = []
-    for dot, files in files_by_dot.items():
-        lines.append("==DOT %s" % dot)
-        payload = dict(files)
+    for dot in list(files_by_dot) + [d for d in nodirs if d not in files_by_dot]:
+        lines.append(tag("==DOT", nonce, dot))
+        if dot in nodirs:
+            lines.append(tag("==NODIR", nonce))
+            continue
+        payload = dict(files_by_dot[dot])
         if dot in rosters:
             payload["roster.json"] = json.dumps(rosters[dot], ensure_ascii=False)
         for name, text in payload.items():
             size = sizes.get((dot, name), len(text.encode("utf-8")))
-            lines.append("==FILE %s %d" % (name, size))
+            lines.append(tag("==FILE", nonce, name, size))
             lines.append(text)
-            lines.append("==END")
+            lines.append(tag("==END", nonce))
     return "\n".join(lines) + "\n"
 
 
-def activity_dump(paths_text, sizes=None):
+def activity_dump(paths_text, sizes=None, nonce=TEST_NONCE):
     """Build the framed dump that activity_script() produces."""
     sizes = sizes or {}
     lines = []
     for index, text in enumerate(paths_text):
-        lines.append("==LOG %d" % index)
+        lines.append(tag("==LOG", nonce, index))
         if text is None:
-            lines.append("==MISSING")
+            lines.append(tag("==MISSING", nonce))
             continue
-        lines.append("==SIZE %d" % sizes.get(index, len(text.encode("utf-8"))))
+        lines.append(tag("==SIZE", nonce, sizes.get(index, len(text.encode("utf-8")))))
         lines.append(text)
-        lines.append("==END")
+        lines.append(tag("==END", nonce))
     return "\n".join(lines) + "\n"
 
 
@@ -82,19 +99,34 @@ def log_line(minutes_ago, path="mcp/core", status="200", extra=""):
 
 
 class FakeTransport:
-    def __init__(self, ledger=None, activity=None, gh=None, failures=None):
-        self.ledger = ledger or {}
-        self.activity = activity or {}
+    """Answers the generated scripts with synthetic dumps.
+
+    The dumps are framed with the nonce read from the script itself, so a
+    mismatch between ledger_script()/activity_script() and their parsers fails
+    here instead of only on a real host.
+    """
+
+    def __init__(self, files=None, rosters=None, activity_texts=None, gh=None,
+                 failures=None, sizes=None, nodirs=()):
+        self.files = files or {}
+        self.rosters = rosters or {}
+        self.activity_texts = activity_texts or []
         self.gh_map = gh or {}
         self.failures = failures or {}
+        self.sizes = sizes or {}
+        self.nodirs = tuple(nodirs)
         self.gh_calls = []
+        self.scripts = []
 
     def run(self, host, script):
+        self.scripts.append(script)
         if host in self.failures:
             return None, self.failures[host]
+        found = NONCE_RE.search(script)
+        nonce = found.group(1) if found else None
         if "==DOT" in script:
-            return self.ledger.get(host, ""), None
-        return self.activity.get(host, ""), None
+            return ledger_dump(self.files, self.rosters, self.sizes, nonce, self.nodirs), None
+        return activity_dump(self.activity_texts, None, nonce), None
 
     def gh(self, endpoint, jq):
         self.gh_calls.append(endpoint)
@@ -119,14 +151,13 @@ def base_config(dots=("REM17",), activity=None, repos=("owner/repo",), enabled=T
 
 
 def snapshot_for(files, activity_text=None, roster=None, gh=None, config=None,
-                 failures=None, sizes=None):
+                 failures=None, sizes=None, nodirs=()):
     config = config or base_config()
-    ledger = ledger_dump(files, {config["ledger"]["dots"][0]: roster} if roster else None,
-                         sizes)
     transport = FakeTransport(
-        ledger={"osaka": ledger},
-        activity={"osaka": activity_dump([activity_text] if activity_text is not None else [])},
-        gh=gh, failures=failures)
+        files=files,
+        rosters={config["ledger"]["dots"][0]: roster} if roster else None,
+        activity_texts=[activity_text] if activity_text is not None else [],
+        gh=gh, failures=failures, sizes=sizes, nodirs=nodirs)
     errors = []
     snapshot = dm.build_snapshot(config, transport, NOW, errors)
     return snapshot, transport, errors
@@ -215,7 +246,8 @@ class TestRecordParsing(unittest.TestCase):
 class TestLedgerFraming(unittest.TestCase):
     def test_parse_dump(self):
         dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": record()}},
-                                                {"REM17": {"dot": "REM17", "slots": []}}))
+                                                {"REM17": {"dot": "REM17", "slots": []}}),
+                                    TEST_NONCE)
         self.assertEqual(sorted(dump["REM17"]["files"]), ["roster.json", "writer.jsonl"])
         self.assertIn('"agent": "writer"', dump["REM17"]["files"]["writer.jsonl"]["text"])
 
@@ -228,10 +260,79 @@ class TestLedgerFraming(unittest.TestCase):
         first = record(agent="writer", minutes_ago=60)
         body = first + "\n" + record(agent="writer", minutes_ago=5)
         dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": body}},
-                                                sizes={("REM17", "writer.jsonl"): 9999}))
+                                                sizes={("REM17", "writer.jsonl"): 9999}),
+                                    TEST_NONCE)
         data = dm.read_dot("REM17", dump, 100)
         self.assertEqual(len(data["agents"]["writer"]["records"]), 1)
         self.assertEqual(len(data["agents"]["writer"]["legacy"]), 0)
+
+    def test_content_cannot_forge_sentinels(self):
+        # Bare or wrong-nonce sentinels inside a file are file content, not framing.
+        body = "\n".join([record(minutes_ago=9), "==END", "==DOT REV18",
+                          "==END ffffffffffffffff", record(minutes_ago=2, state="done")])
+        dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": body}},
+                                                nonce=TEST_NONCE), TEST_NONCE)
+        self.assertEqual(list(dump), ["REM17"])
+        data = dm.read_dot("REM17", dump, 262144)
+        records = data["agents"]["writer"]["records"]
+        self.assertEqual([r["state"] for r in records], ["step", "done"])
+        self.assertEqual(len(data["agents"]["writer"]["legacy"]), 3)
+
+    def test_activity_content_cannot_end_a_section(self):
+        text = log_line(2) + "\n==END\n" + log_line(1)
+        dump = dm.parse_activity_dump(activity_dump([text]), TEST_NONCE)
+        self.assertEqual(dump["0"]["text"].count("request POST"), 2)
+
+    def test_generated_scripts_parse_on_a_real_shell(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.mkdir(os.path.join(root, "REM17"))
+            with open(os.path.join(root, "REM17", "writer.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(record() + "\n==END\n==DOT REV18\n")
+            log = os.path.join(root, "app.log")
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write(log_line(1) + "\n==END\n")
+            transport = dm.Transport(10, 10)
+            nonce = dm.new_nonce()
+            out, error = transport.run("local", dm.ledger_script(root, ["REM17", "REV18"],
+                                                                 262144, nonce))
+            self.assertIsNone(error)
+            dump = dm.parse_ledger_dump(out, nonce)
+            self.assertFalse(dump["REM17"]["nodir"])
+            self.assertTrue(dump["REV18"]["nodir"])
+            self.assertIn("==DOT REV18", dump["REM17"]["files"]["writer.jsonl"]["text"])
+            out, error = transport.run("local", dm.activity_script([log, root + "/none"],
+                                                                   262144, nonce))
+            self.assertIsNone(error)
+            dump = dm.parse_activity_dump(out, nonce)
+            self.assertIn("==END", dump["0"]["text"])
+            self.assertIsNone(dump["1"]["text"])
+
+
+class TestMissingLiveDirectory(unittest.TestCase):
+    def test_missing_live_directory_is_a_ledger_error(self):
+        snapshot, _, errors = snapshot_for({}, activity_text=log_line(1), nodirs=("REM17",))
+        self.assertEqual(snapshot["dots"]["REM17"]["agents"], [])
+        self.assertTrue(any(e["source"] == "ledger" and "REM17" in e["detail"]
+                            and "missing" in e["detail"] for e in errors), errors)
+        self.assertIn("DOTS_ERROR ledger REM17: live directory missing", dm.render_table(snapshot))
+
+    def test_unreachable_host_is_reported_once(self):
+        _, _, errors = snapshot_for({}, failures={"osaka": "exit 255: connection refused"})
+        self.assertEqual(len([e for e in errors if e["source"] == "ledger"]), 1)
+
+    def test_snapshot_exits_two_when_a_live_directory_is_missing(self):
+        config = base_config(activity=[], enabled=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(config, fh)
+            fake = FakeTransport(files={}, nodirs=("REM17",))
+            out = io.StringIO()
+            with mock.patch.object(dm, "Transport", lambda *a, **k: fake), \
+                    contextlib.redirect_stdout(out):
+                code = dm.main(["--config", path, "snapshot"])
+        self.assertEqual(code, 2)
+        self.assertIn("DOTS_ERROR ledger", out.getvalue())
 
 
 class TestActivity(unittest.TestCase):
@@ -259,7 +360,7 @@ class TestActivity(unittest.TestCase):
         self.assertTrue(dm.count_calls(text, len(text), 262144, NOW, windows)["partial"])
 
     def test_activity_dump_indexes(self):
-        dump = dm.parse_activity_dump(activity_dump(["a", None]))
+        dump = dm.parse_activity_dump(activity_dump(["a", None]), TEST_NONCE)
         self.assertEqual(dump["0"]["text"], "a")
         self.assertIsNone(dump["1"]["text"])
 
@@ -387,6 +488,97 @@ class TestClassification(unittest.TestCase):
                                            failures={"osaka": "timed out after 5s"})
         self.assertEqual(snapshot["dots"]["REM17"]["agents"], [])
         self.assertTrue(any(e["source"] == "ledger" for e in errors))
+
+    def test_done_on_stale_pull_request_head_is_unproven(self):
+        gh = {"repos/owner/repo/pulls/7": ({"state": "open", "draft": False,
+                                            "merged": False, "head": "1" * 40,
+                                            "merge": None}, None)}
+        snapshot, _, _ = snapshot_for(
+            {"REM17": {"writer.jsonl": record(
+                minutes_ago=5, state="done",
+                evidence="https://github.com/owner/repo/pull/7 @" + "2" * 40)}},
+            gh=gh)
+        row = rows(snapshot)["writer"]
+        self.assertEqual(row["evidence_status"], "stale")
+        self.assertEqual(row["classification"], "UNPROVEN")
+
+    def test_legacy_only_agent_past_the_threshold_is_stalled(self):
+        old = json.dumps({"timestamp": stamp(90), "agent": "old", "state": "step"})
+        undated = json.dumps({"agent": "undated", "state": "step"})
+        snapshot, _, _ = snapshot_for({"REM17": {"old.jsonl": old, "undated.jsonl": undated}},
+                                      activity_text=log_line(1))
+        found = rows(snapshot)
+        self.assertEqual(found["old"]["classification"], "STALLED")
+        self.assertEqual(found["old"]["legacy_last_at"], stamp(90))
+        self.assertIsNone(found["old"]["last_record_at"])
+        self.assertEqual(found["undated"]["classification"], "STALLED")
+
+    def test_legend_uses_configured_stall_threshold(self):
+        config = base_config()
+        config["thresholds"]["stall_minutes"] = 5
+        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=7)}},
+                                      config=config)
+        self.assertEqual(rows(snapshot)["writer"]["classification"], "STALLED")
+        table = dm.render_table(snapshot)
+        self.assertIn("older than 5m", table)
+        self.assertNotIn("30m", table)
+
+    def test_file_name_that_is_not_a_token_is_skipped_and_reported(self):
+        snapshot, _, errors = snapshot_for(
+            {"REM17": {"writer.jsonl": record(), "bad name.jsonl": record(agent="bad")}})
+        self.assertEqual(sorted(rows(snapshot)), ["writer"])
+        self.assertTrue(any(e["source"] == "ledger" and "1 live file(s) skipped" in e["detail"]
+                            for e in errors), errors)
+
+
+class TestReviewRegressions(unittest.TestCase):
+    """Blocking findings from the review of 50e0272; each test fails on that commit."""
+
+    def test_json_output_redacts_every_field(self):
+        snapshot, _, _ = snapshot_for(
+            {"REM17": {"writer.jsonl": record(task="api_key=SECRETTASK2",
+                                              role="password=SECRETROLE3",
+                                              project="ghp_" + "A" * 36)}},
+            activity_text=log_line(1),
+            roster={"coordinator": "ghp_" + "D" * 36, "slots": [{"agent": "writer"}]})
+        text = dm.render_json(snapshot)
+        for secret in ("SECRETTASK2", "SECRETROLE3", "ghp_AAAA", "ghp_DDDD"):
+            self.assertNotIn(secret, text)
+        self.assertEqual(json.loads(text)["dots"]["REM17"]["agents"][0]["agent"], "writer")
+
+    def test_watch_json_events_are_redacted(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dm.emit_event({"event": "DOTS_BLOCKED", "dot": "REM17", "agent": "writer",
+                           "detail": {"role": "ghp_" + "B" * 36, "task": "api_key=SECRET9"}},
+                          True)
+        self.assertNotIn("SECRET9", out.getvalue())
+        self.assertNotIn("ghp_BBBB", out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["agent"], "writer")
+
+    def test_table_redacts_and_flattens_roster_coordinator(self):
+        snapshot, _, _ = snapshot_for(
+            {"REM17": {"writer.jsonl": record()}},
+            roster={"coordinator": "ghp_" + "C" * 36 + "\nDOTS_ERROR ledger forged",
+                    "updated_at": "2026\nDOTS_STALLED forged", "slots": [{"agent": "writer"}]})
+        table = dm.render_table(snapshot)
+        self.assertNotIn("ghp_CCCC", table)
+        lines = table.splitlines()
+        self.assertFalse([l for l in lines if l.startswith("DOTS_ERROR ledger forged")])
+        self.assertFalse([l for l in lines if l.startswith("DOTS_STALLED forged")])
+
+    def test_forged_roster_agent_id_is_dropped_and_reported(self):
+        forged = "bad\nDOTS_ERROR ledger fake line"
+        snapshot, _, errors = snapshot_for(
+            {"REM17": {"writer.jsonl": record()}},
+            roster={"slots": [{"agent": "writer"}, {"agent": forged}, {"agent": 7}, "x"]})
+        table = dm.render_table(snapshot)
+        self.assertFalse([l for l in table.splitlines()
+                          if l.startswith("DOTS_ERROR ledger fake line")], table)
+        self.assertEqual(sorted(rows(snapshot)), ["writer"])
+        self.assertTrue(any(e["source"] == "roster" and "3 roster slot(s) dropped" in e["detail"]
+                            for e in errors), errors)
+        self.assertNotIn("fake line", json.dumps(errors))
 
 
 class TestEvidence(unittest.TestCase):

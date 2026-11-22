@@ -14,8 +14,9 @@ GitHub where it names a pull request, commit, issue, comment, workflow run or a
 40-character SHA.
 
 Standard library only; ``ssh`` and ``gh`` are called as subprocesses. The tool
-never writes to a host it reads: every remote command is ``tail``/``wc``/``ls``
-style, every subprocess has a timeout, and log reads are bounded byte tails.
+never writes to a host it reads: the remote side runs only ``wc -c`` and
+``tail -c`` over the configured files, every subprocess has a timeout, and
+every printed value is redacted.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -105,6 +107,23 @@ def one_line(text, limit=120):
     if len(out) > limit:
         out = out[: max(0, limit - 1)] + "\u2026"
     return out
+
+
+def redact_tree(value):
+    """Return value with every string redacted, recursively.
+
+    The JSON and watch paths apply this to the whole document, so a field added
+    later cannot reach stdout unredacted by missing its call-site wrapper.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [redact_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_tree(item) for item in value)
+    if isinstance(value, dict):
+        return {key: redact_tree(item) for key, item in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -203,31 +222,45 @@ def parse_record_line(raw):
     return rec, None
 
 
-def parse_ledger_dump(text):
-    """Parse the framed dump produced by ledger_script()."""
+def new_nonce():
+    """Return a per-run sentinel nonce that file content cannot predict."""
+    return secrets.token_hex(8)
+
+
+def parse_ledger_dump(text, nonce):
+    """Parse the framed dump produced by ledger_script() for this run's nonce.
+
+    Every sentinel carries the nonce, so a record or note that happens to
+    contain ``==END`` or ``==DOT REV18`` cannot close a file early or move the
+    following lines into another dot's table.
+    """
+    dot_tag = "==DOT %s " % nonce
+    nodir_tag = "==NODIR %s" % nonce
+    file_re = re.compile(r"^==FILE %s (.+) ([0-9]+)$" % re.escape(nonce))
+    end_tag = "==END %s" % nonce
     dots = {}
     current = None
     name = None
     size = None
     buf = []
     for line in text.splitlines():
-        if line.startswith("==DOT "):
-            current = line[6:].strip()
+        if line.startswith(dot_tag):
+            current = line[len(dot_tag):].strip()
             dots.setdefault(current, {"files": {}, "nodir": False})
             name = None
             continue
         if current is None:
             continue
-        if line == "==NODIR":
+        if line == nodir_tag:
             dots[current]["nodir"] = True
             continue
-        match = re.match(r"^==FILE (.+) ([0-9]+)$", line)
+        match = file_re.match(line)
         if match and name is None:
             name = match.group(1)
             size = int(match.group(2))
             buf = []
             continue
-        if line == "==END" and name is not None:
+        if line == end_tag and name is not None:
             dots[current]["files"][name] = {"size": size, "text": "\n".join(buf)}
             name = None
             buf = []
@@ -237,23 +270,25 @@ def parse_ledger_dump(text):
     return dots
 
 
-def ledger_script(root, dots, tail_bytes):
+def ledger_script(root, dots, tail_bytes, nonce):
     quoted_root = _remote_path(root)
     parts = ["set -u", "export LC_ALL=C", 'root=%s' % quoted_root]
     parts.append("for dot in %s; do" % " ".join(shlex.quote(d) for d in dots))
-    parts.append("""  printf '==DOT %s\\n' "$dot" """)
+    parts.append("""  printf '==DOT %s %%s\\n' "$dot" """ % nonce)
     parts.append('  d="$root/$dot"')
-    parts.append('  if [ ! -d "$d" ]; then printf \'==NODIR\\n\'; continue; fi')
+    parts.append("""  if [ ! -d "$d" ]; then printf '==NODIR %s\\n'; continue; fi""" % nonce)
     parts.append('  for f in "$d"/*.jsonl; do')
     parts.append('    [ -f "$f" ] || continue')
-    parts.append("""    printf '==FILE %s %s\\n' "${f##*/}" "$(wc -c < "$f" | tr -d ' ')" """)
+    parts.append("""    printf '==FILE %s %%s %%s\\n' "${f##*/}" "$(wc -c < "$f" | tr -d ' ')" """
+                 % nonce)
     parts.append('    tail -c %d "$f"' % tail_bytes)
-    parts.append("""    printf '\\n==END\\n' """)
+    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
     parts.append('  done')
     parts.append('  if [ -f "$d/roster.json" ]; then')
-    parts.append("""    printf '==FILE roster.json %s\\n' "$(wc -c < "$d/roster.json" | tr -d ' ')" """)
+    parts.append("""    printf '==FILE %s roster.json %%s\\n' "$(wc -c < "$d/roster.json" | tr -d ' ')" """
+                 % nonce)
     parts.append('    tail -c %d "$d/roster.json"' % tail_bytes)
-    parts.append("""    printf '\\n==END\\n' """)
+    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
     parts.append('  fi')
     parts.append('done')
     return "\n".join(parts)
@@ -277,18 +312,47 @@ def split_tail(text, size, tail_bytes):
     return text
 
 
+def legacy_time(raw):
+    """Best-effort timestamp from an off-format line, used only for the stall clock.
+
+    A legacy line is never repaired or counted as a step. Its own ``t`` or time
+    alias, when it is still RFC 3339, says how long ago that agent last spoke.
+    """
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    for key in ("t",) + TIME_ALIASES:
+        value = obj.get(key)
+        if isinstance(value, str):
+            parsed = parse_ts(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def collect_ledger(config, transport, errors):
     ledger = config["ledger"]
     dots = ledger["dots"]
     tail_bytes = config["limits"]["tail_bytes"]
-    script = ledger_script(ledger["root"], dots, tail_bytes)
+    nonce = new_nonce()
+    script = ledger_script(ledger["root"], dots, tail_bytes, nonce)
     out, error = transport.run(ledger["host"], script)
     if error:
         errors.append({"source": "ledger", "host": ledger["host"], "detail": error})
         return {dot: {"files": {}, "nodir": True, "error": error} for dot in dots}
-    dump = parse_ledger_dump(out)
+    dump = parse_ledger_dump(out, nonce)
+    # A reachable host that answers without the dot's directory is a failure
+    # too: a mistyped root, an unmounted share or a renamed dot must not render
+    # as an empty table that looks like "nothing to report".
     for dot in dots:
         dump.setdefault(dot, {"files": {}, "nodir": True})
+        if dump[dot].get("nodir"):
+            errors.append({"source": "ledger", "host": ledger["host"],
+                           "detail": "%s: live directory missing under %s"
+                                     % (dot, ledger["root"])})
     return dump
 
 
@@ -298,6 +362,7 @@ def read_dot(dot, dump, tail_bytes):
     agents = {}
     roster = None
     roster_error = None
+    dropped_files = []
     for name, info in entry["files"].items():
         text = split_tail(info["text"], info["size"], tail_bytes)
         if name == "roster.json":
@@ -307,6 +372,11 @@ def read_dot(dot, dump, tail_bytes):
                 roster_error = "roster.json is not JSON"
             continue
         agent = name[:-6] if name.endswith(".jsonl") else name
+        # The file name becomes the AGENT column; hold it to the same token rule
+        # as a record's agent field so a name cannot carry a line break or escape.
+        if not TOKEN_RE.match(agent):
+            dropped_files.append(name)
+            continue
         records = []
         legacy = []
         for raw in text.splitlines():
@@ -314,7 +384,8 @@ def read_dot(dot, dump, tail_bytes):
                 continue
             rec, reason = parse_record_line(raw)
             if rec is None:
-                legacy.append({"reason": reason, "line": raw.strip()[:400]})
+                legacy.append({"reason": reason, "line": raw.strip()[:400],
+                               "_t": legacy_time(raw)})
             else:
                 records.append(rec)
         records.sort(key=lambda r: r["_t"])
@@ -323,23 +394,33 @@ def read_dot(dot, dump, tail_bytes):
         "agents": agents,
         "roster": roster if isinstance(roster, dict) else None,
         "roster_error": roster_error,
+        "dropped_files": dropped_files,
         "nodir": entry.get("nodir", False),
         "error": entry.get("error"),
     }
 
 
 def roster_slots(roster):
-    """Accept both observed roster shapes: ``slots`` or ``agents``."""
+    """Return (slots, dropped) from a roster using ``slots``, ``agents`` or ``actors``.
+
+    A slot whose agent id is not a token is dropped, not printed: the id is
+    written by the coordinator and would otherwise reach the table verbatim.
+    ``dropped`` counts those slots so the caller can report them.
+    """
     slots = {}
+    dropped = 0
     if not isinstance(roster, dict):
-        return slots
+        return slots, dropped
     for key in ("slots", "agents", "actors"):
         for slot in roster.get(key) or []:
-            if isinstance(slot, dict) and isinstance(slot.get("agent"), str):
-                merged = dict(slot)
-                merged.setdefault("_key", key)
-                slots.setdefault(slot["agent"], merged)
-    return slots
+            if not (isinstance(slot, dict) and isinstance(slot.get("agent"), str)
+                    and TOKEN_RE.match(slot["agent"])):
+                dropped += 1
+                continue
+            merged = dict(slot)
+            merged.setdefault("_key", key)
+            slots.setdefault(slot["agent"], merged)
+    return slots, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -353,47 +434,54 @@ LOG_LINE_RE = re.compile(
 )
 
 
-def activity_script(paths, tail_bytes):
+def activity_script(paths, tail_bytes, nonce):
     parts = ["set -u", "export LC_ALL=C", "i=0"]
     parts.append("for p in %s; do" % " ".join(_remote_path(p) for p in paths))
-    parts.append("""  printf '==LOG %s\\n' "$i" """)
+    parts.append("""  printf '==LOG %s %%s\\n' "$i" """ % nonce)
     parts.append("  i=$((i+1))")
     parts.append('  if [ -f "$p" ]; then')
-    parts.append("""    printf '==SIZE %s\\n' "$(wc -c < "$p" | tr -d ' ')" """)
+    parts.append("""    printf '==SIZE %s %%s\\n' "$(wc -c < "$p" | tr -d ' ')" """ % nonce)
     parts.append('    tail -c %d "$p"' % tail_bytes)
-    parts.append("""    printf '\\n==END\\n' """)
+    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
     parts.append('  else')
-    parts.append("""    printf '==MISSING\\n' """)
+    parts.append("""    printf '==MISSING %s\\n' """ % nonce)
     parts.append('  fi')
     parts.append('done')
     return "\n".join(parts)
 
 
-def parse_activity_dump(text):
-    """Parse the framed dump into {index: {"size": int|None, "text": str|None}}."""
+def parse_activity_dump(text, nonce):
+    """Parse the framed dump into {index: {"size": int|None, "text": str|None}}.
+
+    Sentinels carry this run's nonce, so log content cannot end a section.
+    """
+    log_tag = "==LOG %s " % nonce
+    missing_tag = "==MISSING %s" % nonce
+    size_re = re.compile(r"^==SIZE %s ([0-9]+)$" % re.escape(nonce))
+    end_tag = "==END %s" % nonce
     out = {}
     path = None
     size = None
     buf = []
     for line in text.splitlines():
-        if line.startswith("==LOG "):
-            path = line[6:].strip()
+        if line.startswith(log_tag):
+            path = line[len(log_tag):].strip()
             size = None
             buf = []
             out.setdefault(path, {"size": None, "text": None})
             continue
         if path is None:
             continue
-        if line == "==MISSING":
+        if line == missing_tag:
             out[path]["text"] = None
             path = None
             continue
-        match = re.match(r"^==SIZE ([0-9]+)$", line)
+        match = size_re.match(line)
         if match and size is None:
             size = int(match.group(1))
             out[path]["size"] = size
             continue
-        if line == "==END":
+        if line == end_tag:
             out[path]["text"] = "\n".join(buf)
             path = None
             continue
@@ -446,12 +534,14 @@ def collect_activity(config, transport, now, errors):
         by_host.setdefault(src["host"], []).append(src)
     per_dot = {}
     for host, sources in by_host.items():
-        script = activity_script([s["path"] for s in sources], config["limits"]["tail_bytes"])
+        nonce = new_nonce()
+        script = activity_script([s["path"] for s in sources], config["limits"]["tail_bytes"],
+                                 nonce)
         out, error = transport.run(host, script)
         if error:
             errors.append({"source": "activity", "host": host, "detail": error})
             continue
-        dump = parse_activity_dump(out)
+        dump = parse_activity_dump(out, nonce)
         for index, src in enumerate(sources):
             info = dump.get(str(index))
             if info is None:
@@ -696,19 +786,25 @@ def evidence_status(text, resolver):
 def classify(row, stall_minutes):
     if not row["file_present"]:
         return "NO_RECORD"
+    age = row["age_seconds"]
+    stalled = age is None or age > stall_minutes * 60
     if row["state"] == "unconfirmed":
-        return "LEGACY"
+        # No v1 line means no confirmed clock (live-status: "an agent with no v1
+        # line is checked as stalled"). Only a recent off-format line keeps it
+        # LEGACY instead.
+        return "STALLED" if stalled else "LEGACY"
     status = row["evidence_status"]
     if row["state"] == "blocked":
         return "BLOCKED"
     if row["state"] == "done":
-        if status in ("resolved", "stale", "unknown"):
+        # A drifted pull-request head is not proof; "unknown" means GitHub could
+        # not be asked, which is reported as an error rather than as a failure.
+        if status in ("resolved", "unknown"):
             return "DONE"
         return "UNPROVEN"
     if status in ("missing", "unresolved"):
         return "UNPROVEN"
-    age = row["age_seconds"]
-    if age is None or age > stall_minutes * 60:
+    if stalled:
         return "STALLED"
     return "WORKING" if row["activity_since_record"] > 0 else "QUIET"
 
@@ -723,10 +819,18 @@ def build_snapshot(config, transport, now, errors=None):
     dots = {}
     for dot in config["ledger"]["dots"]:
         data = read_dot(dot, ledger, config["limits"]["tail_bytes"])
-        slots = roster_slots(data["roster"])
+        slots, dropped_slots = roster_slots(data["roster"])
         if data["roster_error"]:
             errors.append({"source": "roster", "host": config["ledger"]["host"],
                            "detail": "%s: %s" % (dot, data["roster_error"])})
+        if dropped_slots:
+            errors.append({"source": "roster", "host": config["ledger"]["host"],
+                           "detail": "%s: %d roster slot(s) dropped: agent id is not a token"
+                                     % (dot, dropped_slots)})
+        if data["dropped_files"]:
+            errors.append({"source": "ledger", "host": config["ledger"]["host"],
+                           "detail": "%s: %d live file(s) skipped: name is not an agent token"
+                                     % (dot, len(data["dropped_files"]))})
         dot_activity = activity.get(dot) or {"by_host": {}, "timestamps": []}
         stamps = dot_activity.get("timestamps") or []
         rows = []
@@ -737,6 +841,7 @@ def build_snapshot(config, transport, now, errors=None):
             records = entry["records"] if entry else []
             legacy = entry["legacy"] if entry else []
             latest = records[-1] if records else None
+            legacy_t = max((l["_t"] for l in legacy if l["_t"]), default=None)
             if latest:
                 state = latest["state"]
                 role = latest["role"]
@@ -757,10 +862,13 @@ def build_snapshot(config, transport, now, errors=None):
                 host = slot.get("host") or ""
                 model = slot.get("model") or ""
                 last_t = None
-            age = (now - last_t).total_seconds() if last_t else None
+            # The stall clock runs from the newest v1 line; an agent without one
+            # falls back to its newest off-format line that still has a time.
+            clock_t = last_t if last_t is not None else legacy_t
+            age = (now - clock_t).total_seconds() if clock_t else None
             since = 0
-            if last_t is not None:
-                since = sum(1 for ts in stamps if ts >= last_t)
+            if clock_t is not None:
+                since = sum(1 for ts in stamps if ts >= clock_t)
             status, detail, refs = evidence_status(evidence, resolver)
             row = {
                 "dot": dot,
@@ -772,6 +880,7 @@ def build_snapshot(config, transport, now, errors=None):
                 "host": host,
                 "model": model,
                 "last_record_at": iso(last_t),
+                "legacy_last_at": iso(legacy_t),
                 "age_seconds": int(age) if age is not None else None,
                 "age": age_text(age),
                 "note": one_line(note, 200),
@@ -818,6 +927,7 @@ def build_snapshot(config, transport, now, errors=None):
         "version": TOOL_VERSION,
         "generated_at": iso(now),
         "config_dots": config["ledger"]["dots"],
+        "thresholds": dict(config["thresholds"]),
         "dots": dots,
         "errors": errors,
     }
@@ -850,8 +960,8 @@ def render_table(snapshot):
         roster = data["roster"]
         lines.append("")
         lines.append("%s  roster=%s@%s slots=%s" % (
-            head, roster.get("coordinator") or "?",
-            (roster.get("updated_at") or "?")[:19], roster.get("slots") or 0))
+            head, one_line(roster.get("coordinator"), 40) or "?",
+            one_line(str(roster.get("updated_at") or "")[:19], 40) or "?", roster.get("slots") or 0))
         for label, act in data["activity"].items():
             lines.append("  activity %-6s 15m=%-4d 60m=%-5d last=%s covered_since=%s%s" % (
                 label, act["calls_15m"], act["calls_60m"], act["last_call_at"] or "-",
@@ -862,7 +972,7 @@ def render_table(snapshot):
         rows = []
         for row in data["agents"]:
             rows.append((
-                row["agent"], row["classification"], row["state"], row["age"],
+                one_line(row["agent"], 128), row["classification"], row["state"], row["age"],
                 row["evidence_status"], one_line(row["role"], 10),
                 one_line(row["task"], 30),
             ))
@@ -883,20 +993,25 @@ def render_table(snapshot):
                     agent_row["evidence_detail"]))
         unrostered = data.get("unrostered") or []
         if unrostered:
-            lines.append("  note: live file without roster slot: %s" % ", ".join(unrostered))
+            lines.append("  note: live file without roster slot: %s"
+                         % one_line(", ".join(unrostered), 300))
         missing = [r["agent"] for r in data["agents"] if not r["file_present"]]
         if missing:
-            lines.append("  note: roster slot without live file: %s" % ", ".join(missing))
+            lines.append("  note: roster slot without live file: %s"
+                         % one_line(", ".join(missing), 300))
+    stall = (snapshot.get("thresholds") or {}).get("stall_minutes", 30)
     lines.append("")
     lines.append("classes: WORKING record<=%dm and tool calls since it | QUIET record<=%dm, no calls since it | "
-                 "STALLED start/step older than %dm | BLOCKED | DONE | UNPROVEN evidence missing/unresolved "
-                 "or done on local-only evidence | LEGACY off-format line | NO_RECORD roster slot without file"
-                 % (30, 30, 30))
+                 "STALLED start/step older than %dm, or only off-format lines and none in %dm | BLOCKED | "
+                 "DONE evidence resolves or GitHub was unreachable | UNPROVEN evidence missing/unresolved, "
+                 "or done on local-only or stale evidence | LEGACY recent off-format lines only | "
+                 "NO_RECORD roster slot without file"
+                 % (stall, stall, stall, stall))
     return "\n".join(lines)
 
 
 def render_json(snapshot):
-    return json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(redact_tree(snapshot), ensure_ascii=False, indent=2, sort_keys=True)
 
 
 # ---------------------------------------------------------------------------
@@ -967,7 +1082,7 @@ def format_event(event):
 
 def emit_event(event, as_json):
     if as_json:
-        print(json.dumps(event, ensure_ascii=False), flush=True)
+        print(json.dumps(redact_tree(event), ensure_ascii=False), flush=True)
     else:
         print(format_event(event), flush=True)
 
@@ -1017,9 +1132,10 @@ class Transport:
         if host in (None, "", "local", "localhost"):
             cmd = ["/bin/sh", "-c", script]
         else:
+            # "--" ends ssh's options, so a configured host can never be parsed as one.
             cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
                    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-                   host, script]
+                   "--", host, script]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                   timeout=self.timeout)
@@ -1077,9 +1193,9 @@ def load_config(path):
             config[key] = value
     for dot in config["ledger"]["dots"]:
         config["dots"].setdefault(dot, {})
-    for source in config["activity"]:
-        if "dot" not in source or "path" not in source:
-            raise SystemExit("activity entry needs 'dot' and 'path': %r" % (source,))
+    for index, source in enumerate(config["activity"]):
+        if not isinstance(source, dict) or "dot" not in source or "path" not in source:
+            raise SystemExit("activity entry %d needs 'dot' and 'path'" % index)
         source.setdefault("host", "local")
     return config
 

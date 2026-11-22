@@ -1,5 +1,5 @@
 {
-  "_comment": "Owner config: hosts, ledger root, daemon logs and repos. Paths and host names only; no tokens, no account credentials. Edit the dot list and paths for another machine.",
+  "_comment": "Owner config: hosts, ledger root, daemon logs, account numbers and repos. No tokens, no account credentials. Edit the dot list and paths for another machine.",
   "ledger": {
     "host": "osaka",
     "root": "~/CodeProjects/.dots-ops/live",
