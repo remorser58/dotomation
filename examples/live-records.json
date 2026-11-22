@@ -1,0 +1,62 @@
+[
+  {
+    "t": "2026-11-22T20:33:41Z",
+    "agent": "example-root",
+    "role": "총괄",
+    "model": "requested gpt-6.2-astra/ultra; runtime does not display effective",
+    "project": "remorswarm",
+    "task": "example-live-1/1",
+    "state": "start",
+    "host": "osaka",
+    "note": "Root took the brief and will assign one lane; orchestration goes to the single ultra coordinator.",
+    "evidence": "example://brief/example-live-1"
+  },
+  {
+    "t": "2026-11-22T20:35:49Z",
+    "agent": "example-coordinator",
+    "role": "총괄",
+    "model": "requested gpt-6.2-astra/ultra; runtime does not display effective",
+    "project": "remorswarm",
+    "task": "example-live-1/1",
+    "state": "step",
+    "host": "vm",
+    "note": "Two independent lanes dispatched; roster written with three slots and one unassigned.",
+    "evidence": "example://live/EXAMPLE17/roster.json"
+  },
+  {
+    "t": "2026-11-22T20:36:37Z",
+    "agent": "example-writer",
+    "role": "구현",
+    "model": "requested gpt-6.2-astra/xhigh; runtime does not display effective",
+    "project": "remorswarm",
+    "task": "example-live-1/1",
+    "state": "step",
+    "host": "osaka",
+    "note": "Inspected the pinned candidate and started the scoped change inside the approved root.",
+    "evidence": "example://candidate/01"
+  },
+  {
+    "t": "2026-11-22T20:51:12Z",
+    "agent": "example-writer",
+    "role": "구현",
+    "model": "requested gpt-6.2-astra/xhigh; runtime does not display effective",
+    "project": "remorswarm",
+    "task": "example-live-1/1",
+    "state": "blocked",
+    "host": "vm",
+    "note": "vm reset suspected: environment omitted from a complete list while the job is registered; no replay attempted.",
+    "evidence": "example://ledger/status-before-reset"
+  },
+  {
+    "t": "2026-11-22T21:04:05Z",
+    "agent": "example-writer",
+    "role": "구현",
+    "model": "requested gpt-6.2-astra/xhigh; runtime does not display effective",
+    "project": "remorswarm",
+    "task": "example-live-1/1",
+    "state": "done",
+    "host": "osaka",
+    "note": "Next stage only resumed from the last confirmed checkpoint and the result hash matched; submitted to the verifier.",
+    "evidence": "example://checkpoint/02"
+  }
+]

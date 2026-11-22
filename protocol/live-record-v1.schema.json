@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dots-superkit:live-record-v1",
+  "title": "dots-superkit/live-record-v1",
+  "description": "One append-only line in live/<DOT>/<agentId>.jsonl. Shape only; whether the line is true, timely and enough to show progress is judged by the coordinator according to the skill and workflows/live-status.md. A line with any other field name, including timestamp instead of t, is not a live record.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "t": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agent": {
+      "$ref": "#/$defs/token"
+    },
+    "role": {
+      "enum": [
+        "총괄",
+        "구현",
+        "연구",
+        "디자인",
+        "디버깅",
+        "검토"
+      ]
+    },
+    "model": {
+      "$ref": "#/$defs/setting"
+    },
+    "project": {
+      "enum": [
+        "kice",
+        "remorswarm",
+        "yomanchi"
+      ]
+    },
+    "task": {
+      "$ref": "#/$defs/line"
+    },
+    "state": {
+      "enum": [
+        "start",
+        "step",
+        "blocked",
+        "done"
+      ]
+    },
+    "host": {
+      "enum": [
+        "vm",
+        "osaka",
+        "mini",
+        "macbook"
+      ]
+    },
+    "note": {
+      "$ref": "#/$defs/line"
+    },
+    "evidence": {
+      "$ref": "#/$defs/line"
+    }
+  },
+  "required": [
+    "t",
+    "agent",
+    "role",
+    "model",
+    "project",
+    "task",
+    "state",
+    "host",
+    "note",
+    "evidence"
+  ],
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "line": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "setting": {
+      "type": "string",
+      "description": "Starts with confirmed or requested. confirmed is used only when the runtime displays the model and effort; otherwise requested states what the summon asked for.",
+      "pattern": "^(confirmed|requested) [^\\r\\n]+$"
+    }
+  }
+}
