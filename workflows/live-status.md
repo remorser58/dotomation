@@ -1,6 +1,6 @@
 # Live records: seeing Dots internal work as it happens
 
-The owner opens one folder on Osaka and sees which internal agent is doing what, on which host, with which model requested, and how long ago. It is an append-only log written by the agents themselves — not a service, dashboard, broker, watcher or telemetry.
+The owner opens one folder on Osaka and sees which internal agent is doing what, on which host, with which model requested, and how long ago. It is an append-only log written by the agents themselves — not a service, dashboard, broker, watcher or telemetry. The one read-only tool that reads it is [monitoring](monitoring.md); it writes nothing here.
 
 ## Where the record lives
 
@@ -80,6 +80,8 @@ A working agent with no new line for 30 minutes is **stalled**. The coordinator 
 ## Reading it
 
 The owner, or any authorised reader, reads `live/<DOT>/` through `ssh osaka` read-only or the approved route for that account ([hosts](hosts.md#approved-routes)). Show the roster, then the newest line of each agent, then the stalls. Do not edit, truncate or reorder another dot's files.
+
+A self-report alone does not show that an agent is working. [Monitoring](monitoring.md) reads these files and compares them with the Web GPT Agent daemon request log of the dot's account, and resolves each `evidence` reference against GitHub: `python3 tools/dots_monitor.py snapshot`. It is read-only, and a `WORKING` there still means only "recent claim and real tool calls", not a verified result.
 
 What the record establishes: the last confirmed step, the host actually used, and the model and effort that were requested. What it does not establish: the effective model or effort when Dots does not display them, the content of a tool run, that a gate passed (the handoff check does that), or that an agent is idle — a missing line means the agent has not recorded.
 

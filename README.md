@@ -1,12 +1,12 @@
 # Dots Superkit
 
-Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자와 검증자가 직접 대화하는 작업 키트다. 실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다.
+Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자와 검증자가 직접 대화하는 작업 키트다. 실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 유일한 예외는 소유자가 요청한 읽기 전용 점검 도구 `tools/dots_monitor.py` 한 파일이며, 설치·서비스·계정·자격 증명 없이 읽기만 한다([모니터링](workflows/monitoring.md)).
 
 ## 원하는 작업 고르기
 
 - 목표부터 정하기: WISH · 증거를 갖춰 실행: ULW · 계획만: ulw-plan · 승인된 계획 실행: ulw-execute.
 - 반복·병렬·조사: ulw-loop · mass-ulw · ulw-research · 독립 관점 교차 검토: hyperplan.
-- [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [호스트 배치와 승인 경로](workflows/hosts.md), [실시간 작업 기록](workflows/live-status.md), [VM 체크포인트·리셋 복구](workflows/vm-watchdog.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
+- [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [호스트 배치와 승인 경로](workflows/hosts.md), [실시간 작업 기록](workflows/live-status.md), [실제 작업 여부 모니터링](workflows/monitoring.md), [VM 체크포인트·리셋 복구](workflows/vm-watchdog.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
 
 - 역할을 배정할 때는 [Astra 프로필과 역할별 브리핑](profiles/astra/PROFILE.md)을 같은 커밋에서 읽는다. REM·Ultra·xhigh는 브리핑 이름이지 실행 설정의 증거가 아니다. [역할 판정 예시](examples/astra-cases.md)도 있다.
 
@@ -38,5 +38,6 @@ work_id / revision: <안정된 작업 ID> / 1
 - 오사카 공유 폴더 `~/CodeProjects/.dots-ops/`의 `live/<DOT>/`(DOT = REM17·REV18)에 총괄·담당·검증자가 각자 한 줄씩 JSONL로 남긴다: 시작, 단계마다(작업 중 최소 15분), 막힘, 종료. 필드와 시점은 [live-record-v1](protocol/live-record-v1.schema.json)과 [실시간 작업 기록](workflows/live-status.md)에 있다.
 - 조정자는 `live/<DOT>/roster.json`에 슬롯(담당·역할·모델·작업·상태·마지막 기록 시각)을 유지한다. 30분 넘게 새 줄이 없는 작업 담당은 정체로 보고 직접 확인한 뒤 재배정한다.
 - VM 작업은 단계마다 오사카에 체크포인트를 남긴다. 리셋이 의심되면 `state:"blocked"`, `note:"vm reset suspected"`로 남기고, 복구는 마지막 확정 체크포인트의 다음 단계 하나부터 진행한다: [VM watchdog](workflows/vm-watchdog.md).
+- 기록은 자기 보고다. 실제로 일하는지는 `python3 tools/dots_monitor.py snapshot`으로 본다. 각 에이전트의 마지막 기록과 그 계정의 Web GPT Agent 데몬 요청 수(15분·60분)를 맞대고, 기록의 증거 링크(PR·커밋·이슈·댓글·CI 실행)가 GitHub에 실제로 있는지 확인해 WORKING·QUIET·STALLED·BLOCKED·DONE·UNPROVEN·LEGACY로 나눈다. `watch --interval 60`은 상태가 바뀔 때만 `DOTS_STALLED` 같은 한 줄을 출력한다. 읽기만 하며 기록을 고치거나 Dot에 메시지를 보내거나 작업을 배정하지 않는다: [모니터링](workflows/monitoring.md).
 
 이 키트는 직접 브리핑에 포함해서 쓴다. 파일만으로 서비스 전체나 기존 작업자에게 자동 적용되거나, 백그라운드 전달이 시작되거나, 호스트·권한·모델이 확인되지 않는다. 브리핑 전달, 상대방의 수신 확인, 실제 작업에서의 적용 검증은 각각 구분해서 보고한다.
