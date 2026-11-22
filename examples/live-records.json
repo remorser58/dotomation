@@ -21,7 +21,7 @@
     "state": "start",
     "host": "osaka",
     "note": "Accepted the brief and opened the roster with two slots and one unassigned.",
-    "evidence": "example://live/EXAMPLE17/roster.json"
+    "evidence": "example://live/REM17/roster.json"
   },
   {
     "t": "2026-11-22T20:33:00Z",
@@ -129,7 +129,7 @@
     "state": "step",
     "host": "osaka",
     "note": "Roster updated from the newest lines; writer and verifier receipts read and matched to the same target.",
-    "evidence": "example://live/EXAMPLE17/roster.json"
+    "evidence": "example://live/REM17/roster.json"
   },
   {
     "t": "2026-11-22T21:18:00Z",
