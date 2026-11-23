@@ -168,6 +168,7 @@ def token(name, value):
     return value
 
 READ_WARNED = set()
+BYTE_WARNED = {}
 
 def regular(path):
     """False for a path that is not a regular file. This is the cheap first check; it cannot be the only
@@ -188,6 +189,20 @@ def unreadable(path, exc):
     READ_WARNED.add(path)
     name = exc if isinstance(exc, str) else exc.__class__.__name__
     print(f"dots: cannot read {path} ({name}); treated as no lines", file=sys.stderr)
+
+def skipped_lines(path, count):
+    """One stderr line per path and count: a line whose bytes are not UTF-8 is skipped on its own, so
+    the count says how much of the file was not read and every other line still is. A poll that finds
+    the same count again stays quiet, and a clean read clears the entry, so damage that comes back is
+    reported again."""
+    if not count:
+        BYTE_WARNED.pop(path, None)
+        return
+    if BYTE_WARNED.get(path) == count:
+        return
+    BYTE_WARNED[path] = count
+    print(f"dots: skipped {count} line{'' if count == 1 else 's'} in {path}, not UTF-8; "
+          f"every other line was read", file=sys.stderr)
 
 def open_raw(path):
     """An open descriptor for reading, or None. O_NONBLOCK is what makes this safe: a FIFO open returns
@@ -222,27 +237,45 @@ def jsonl(path):
     """Lines of one JSONL file, skipping any line that is not a JSON object. A path the root made
     unreadable — a folder or a FIFO where the file should be, a file with no read permission — reads as
     no lines, never as a crash and never as a block, and says so once on stderr: every reader here runs
-    on shapes the root can write, so a silent empty read would be a claim this tool cannot make."""
+    on shapes the root can write, so a silent empty read would be a claim this tool cannot make.
+
+    A line ends at \\n, \\r\\n or a bare \\r, which is what a text-mode read used to accept and what a
+    hand-written mailbox may contain: splitlines() is the only splitter that keeps all three, so a
+    file that ends its lines in \\r is read, not silently called empty.
+
+    Decoding is per line on purpose. A mailbox is bytes the root can append to, and one byte that is
+    not UTF-8 must cost that one line: each line is decoded on its own, so damage cannot swallow the
+    good lines after it, and the skipped count is printed once per change (skipped_lines). Decoding
+    the stream instead would drop everything from the bad byte to the next buffer boundary, which is a
+    silent loss of mail a later `watch` never rings. The whole file is read here and this function
+    returns every parsed line anyway, so the copy costs no more than the list it builds."""
     if not regular(path):
         unreadable(path, "not a regular file")
         return []
     out = []
-    fh = open_read(path)
-    if fh is None:
+    fd = open_raw(path)
+    if fd is None:
         return out
+    skipped = 0
     try:
-        with fh:
-            for ln in fh:
+        with os.fdopen(fd, "rb") as raw:
+            for bline in raw.read().splitlines():
+                try:
+                    ln = bline.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped += 1
+                    continue
                 try:
                     obj = json.loads(ln)
                 except ValueError:
                     continue
                 if isinstance(obj, dict):
                     out.append(obj)
-    except (OSError, UnicodeDecodeError) as exc:
+    except OSError as exc:
         unreadable(path, exc)
         return out
     READ_WARNED.discard(path)
+    skipped_lines(path, skipped)
     return out
 
 def v1_lines(path):
