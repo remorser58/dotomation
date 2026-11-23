@@ -189,8 +189,9 @@ from the files alone:
   notify argv once. A message counts as owed until an `out.jsonl` line answers it, read or not: a
   `.agent-read` marker that reached it prints `WATCH_STUCK … read=yes unanswered=yes` once and the
   notify runs anyway, because that marker lives in the same folder as the mail. An owed line always
-  has an age — its own `t`, else the moment the ledger first saw it — so an unparseable or future `t`
-  cannot hide a message, and `WATCH_ERROR … no usable time` is the last resort. The ledger records
+  has an age — its own `t`, else the moment the ledger first saw it — so an unparseable `t` cannot
+  hide a message; a time still in the future is not an age either, and if both are ahead the run
+  prints `WATCH_ERROR … no usable time t=… seen_t=…` instead of staying silent. The ledger records
   that first sight, so a line deleted before its first ring still ends as `WATCH_RESOLVED`; the cost
   is one `WATCH_RESOLVED` per answered message. Its ledger defaults to `<base>/watch/state.json`, so
   a restart never rings twice, and `--state PATH` keeps it outside the folder the root writes. The
@@ -209,9 +210,11 @@ from the files alone:
   date years away is not a waiter, and a marker written on another host is judged by `until` alone.
   A live marker suppresses the wake but not the report: a real waiter prints unread mail and marks
   it read within a second, so owed mail still unread past `after_min` contradicts it, and
-  `WATCH_HELD {project} {agent} {id} age=… pid=… host=… until=… read=…` prints on every run. That is
-  the one case the tool cannot settle by itself: check `ps -p <pid>` and the agent's newest live
-  line before believing the marker.
+  `WATCH_HELD {project} {agent} {id} age=… pid=… host=… until=… read=…` prints on every run. That
+  line is the contradiction signal, and both halves of it are the root's to write: `read=` is
+  forgeable exactly like the marker. Nothing else fires while a marker holds the wake — no notify —
+  so this stdout line is the owner's only warning, and the one case the tool cannot settle by
+  itself: check `ps -p <pid>` and the agent's newest live line before believing the marker.
 
 **What it only detects.** The tool cannot make the root honest. A line the root writes looks exactly
 like one an agent wrote, because `from` is a string and nothing signs it. A roster entry is a claim,
@@ -249,6 +252,12 @@ wake command ran.
   wake or a notify already ran suppresses that step, and the tool prints `WATCH_SKIP … wake_already`
   or `notify_already` so the suppression is visible; `--state PATH` keeps the ledger where the root
   cannot write it, which is the only way to make the record trustworthy.
+- **A path replaced by a folder.** Any name in that folder can be a directory instead of a file:
+  `in.jsonl`, `out.jsonl`, `.agent-read`, a `listen/` marker, the ledger. Each one then reads as
+  empty — no lines, no waiter, no record — and `watch`, `wait` and `reply` keep running rather than
+  dying on it; a read marker that cannot be written prints `dots: cannot mark … read (…)` once on
+  stderr and the mail stays unread. Nothing is repaired, and an unreadable mailbox hides its mail
+  from `watch` the same way a deleted line does.
 - **A forged listen marker.** A `listen/<agent>.<pid>.json` with a plausible `until` and a live local
   pid looks like a waiter and holds the wake back. It needs `until` inside the next 24 hours; compare
   `ps -p <pid>` with the agent's newest live line when a wait looks too convenient.

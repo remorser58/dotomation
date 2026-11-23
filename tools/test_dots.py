@@ -269,6 +269,18 @@ class WaitTests(Base):
         self.assertEqual(run(["wait", "bad dot", "agent-1", "--timeout", "1"], self.base).returncode, 2)
         self.assertEqual(run(["wait", "DOT-A", "agent-1", "--timeout", "0"], self.base).returncode, 2)
 
+    def test_a_folder_where_the_read_marker_belongs_does_not_kill_wait(self):
+        # .agent-read sits in the mailbox the root writes: a folder there used to end the wait with a
+        # traceback, which for an agent holding the command open is the same as ending its turn
+        mid = self.send(text="handle this")
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        os.makedirs(os.path.join(box, ".agent-read"))
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "3"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"MAIL_NEW proj {mid}", res.stdout)
+        self.assertIn("it stays unread", res.stderr)      # said once, on stderr, not raised
+        self.assertNotIn("Traceback", res.stderr)
+
 class WakeTests(Base):
     def test_wake_argv_runs_once_with_placeholders(self):
         target = os.path.join(self.base, "wake.txt")
@@ -996,6 +1008,93 @@ class WatchTests(Base):
                                            "until": d.iso_after(86400 + 7200)}) + "\n")
         res = run(["watch"], self.base)
         self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+
+    def test_a_non_string_re_does_not_kill_the_watchdog(self):
+        # out.jsonl is the root's to write as well: a `re` that is not a string answers nothing, and
+        # feeding it to a set of answers used to end the run with a traceback
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        d.append_line(os.path.join(self.base, "proj", "mail", "agent-1", "out.jsonl"),
+                      {"v": 1, "id": "m-20260101T000000Z-0001", "t": d.now(), "from": "agent-1",
+                       "to": "proj-main", "task": "issue 1", "kind": "note", "re": {"n": 1},
+                       "text": "not an answer", "refs": []})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)   # the task is still owed
+        self.assertEqual(read(target).split(), [mid])
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        self.assertEqual([m.get("id") for m in d.waiting_on(box)], [mid])   # a non-answer answers nothing
+
+    def test_a_non_string_id_does_not_kill_the_watchdog(self):
+        # the same for in.jsonl: an id that is a list cannot be answered, and cannot be hashed either
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        d.append_line(os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl"),
+                      {"v": 1, "id": ["x"], "t": d.now(), "from": "proj-main", "to": "agent-1",
+                       "task": "issue 1", "kind": "task", "re": None, "text": "hand written", "refs": []})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)   # the real task still rings
+        self.assertEqual(run(["board"], self.base).returncode, 0)
+
+    def test_a_folder_where_a_marker_belongs_does_not_kill_the_watchdog(self):
+        # listen/ is the root's folder too: a directory named like a marker is not a waiter, and it
+        # must not be read or pruned into an exception
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        os.makedirs(os.path.join(self.base, "listen", "agent-1.5.json"))
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        # send prunes markers on the same path and must survive the same folder
+        self.assertEqual(run(["send", "proj", "agent-1", "note", "issue 1"], self.base,
+                             stdin="still here").returncode, 0)
+
+    def test_a_folder_where_a_mailbox_file_belongs_does_not_kill_the_watchdog(self):
+        self.waiting_message(read=False)
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        os.unlink(os.path.join(box, "in.jsonl"))
+        os.makedirs(os.path.join(box, "in.jsonl"))
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(run(["board"], self.base).returncode, 0)
+
+    def test_a_folder_where_the_ledger_belongs_still_rings(self):
+        # a record that cannot be written may only make a later run ring again, never end the run
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        os.makedirs(os.path.join(self.base, "watch", "state.json"))
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        self.assertIn("cannot write the ledger", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(read(target).split(), [mid])
+
+    def test_a_time_in_the_future_on_both_sides_is_reported_not_hidden(self):
+        # a future t is not an age, and a future seen_t is not one either: silence would hide the
+        # message, so both are dropped and the run says why
+        mid = self.waiting_message(read=False)
+        self.config_with(watch={"after_min": 0})
+        inbox = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        line = lines(inbox)[0]
+        d.write_atomic(inbox, json.dumps(dict(line, t="2099-01-01T00:00:00Z"), ensure_ascii=False) + "\n")
+        ledger = os.path.join(self.base, "watch", "state.json")
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        d.write_atomic(ledger, json.dumps({"v": 1, "messages": {mid: {
+            "project": "proj", "agent": "agent-1", "seen_t": "2099-01-01T00:00:00Z"}}}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_ERROR proj agent-1 {mid} no usable time", res.stdout)
+
 class InitTests(Base):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

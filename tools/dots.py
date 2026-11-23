@@ -168,6 +168,9 @@ def token(name, value):
     return value
 
 def jsonl(path):
+    """Lines of one JSONL file, skipping any line that is not a JSON object. A path the root made
+    unreadable — a folder where the file should be, a file with no read permission — reads as no
+    lines, never as a crash: every reader here runs on shapes the root can write."""
     out = []
     try:
         with open(path, encoding="utf-8") as fh:
@@ -178,7 +181,7 @@ def jsonl(path):
                     continue
                 if isinstance(obj, dict):
                     out.append(obj)
-    except FileNotFoundError:
+    except OSError:
         pass
     return out
 
@@ -202,14 +205,14 @@ def load_json(path):
         with open(path, encoding="utf-8") as fh:
             obj = json.load(fh)
         return obj if isinstance(obj, dict) else None
-    except (FileNotFoundError, ValueError):
+    except (OSError, ValueError):
         return None
 
 def marker(path):
     try:
         with open(path, encoding="utf-8") as fh:
             return fh.read().strip() or None
-    except FileNotFoundError:
+    except OSError:
         return None
 
 def after(msgs, last):
@@ -225,14 +228,25 @@ def mailboxes(agent):
     token("agent", agent)
     return sorted(d for d in glob.glob(os.path.join(BASE, "*", "mail", glob.escape(agent))) if os.path.isdir(d))
 
+def answered_ids(outbox):
+    """Ids that a line in `outbox` answers. Only a string `re` can match an inbox id, so a line the
+    root wrote with a list or an object there answers nothing and cannot crash a read."""
+    return {m.get("re") for m in outbox if isinstance(m.get("re"), str)}
+
+def owes_answer(m, answered):
+    """A line owes an answer when its kind asks for one and no answer names its id. An id that is not
+    a string cannot be answered, so it stays owed instead of raising as an unhashable set member."""
+    mid = m.get("id")
+    return m.get("kind") in NEEDS_ANSWER and not (isinstance(mid, str) and mid in answered)
+
 def mail_state(box):
     inbox = jsonl(os.path.join(box, "in.jsonl"))
     outbox = jsonl(os.path.join(box, "out.jsonl"))
     mark = marker(os.path.join(box, ".agent-read"))
     new = after(inbox, mark)
     taken = inbox[:len(inbox) - len(new)]
-    answered = {m.get("re") for m in outbox}
-    return {"new": new, "unanswered": [m for m in taken if m.get("id") not in answered],
+    answered = answered_ids(outbox)
+    return {"new": new, "unanswered": [m for m in taken if owes_answer(m, answered)],
             "unread_out": after(outbox, marker(os.path.join(box, ".main-read")))}
 
 def unread_upto(box, took):
@@ -249,9 +263,8 @@ def waiting_on(box):
     """Inbox lines that still owe an answer: kind task, question or review with no out.jsonl line
     whose `re` is that id. Read state is deliberately ignored — a wait whose session was abandoned
     marks mail read without anyone handling it, so the answer is still owed."""
-    answered = {m.get("re") for m in jsonl(os.path.join(box, "out.jsonl"))}
-    return [m for m in jsonl(os.path.join(box, "in.jsonl"))
-            if m.get("kind") in NEEDS_ANSWER and m.get("id") not in answered]
+    answered = answered_ids(jsonl(os.path.join(box, "out.jsonl")))
+    return [m for m in jsonl(os.path.join(box, "in.jsonl")) if owes_answer(m, answered)]
 
 def write_atomic(path, data):
     tmp = f"{path}.tmp.{os.getpid()}"
@@ -274,7 +287,7 @@ def append_unique(path, msg):
     The check runs under the same lock as the write, so two senders cannot pick the same id."""
     with open(path, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        seen = {m.get("id") for m in jsonl(path)}
+        seen = {m.get("id") for m in jsonl(path) if isinstance(m.get("id"), str)}
         while msg["id"] in seen:
             msg["id"] = new_id()
         fh.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
@@ -283,7 +296,8 @@ def append_unique(path, msg):
 
 def show_mail(project, m, tag):
     re_ = f" re={m['re']}" if m.get("re") else ""
-    refs = f" refs={','.join(m['refs'])}" if m.get("refs") else ""
+    refs = [x for x in m["refs"] if isinstance(x, str)] if isinstance(m.get("refs"), list) else []
+    refs = f" refs={','.join(refs)}" if refs else ""
     print(f"{tag} {project} {m.get('id')} {m.get('t')} {m.get('from')} kind={m.get('kind')} task={m.get('task')}{re_}{refs}")
     print(f"    {m.get('text', '')}")
 
@@ -632,13 +646,15 @@ def listen_state(agent):
     return None
 
 def prune_markers(agent):
-    """Remove markers of waiters that are gone; never one that is still listening."""
+    """Remove markers of waiters that are gone; never one that is still listening. A marker path the
+    root made undeletable — a folder named like a marker, a file in a folder with no write permission —
+    is left alone: the marker already reads as not listening, and the command must not die on it."""
     for path in marker_paths(agent):
         m = load_json(path)
         if m is None or not marker_live(m):
             try:
                 os.unlink(path)
-            except FileNotFoundError:
+            except OSError:
                 pass
 
 # ---------------------------------------------------------------- mail
@@ -678,8 +694,8 @@ def send(a):
     re_id = token("re", a.re) if a.re else None
     new_project = not os.path.isdir(os.path.join(BASE, project))
     box = mail_box(project, agent, create=True)
-    known = {m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))}
-    known |= {m.get("id") for m in jsonl(os.path.join(box, "out.jsonl"))}
+    known = {m.get("id") for m in jsonl(os.path.join(box, "in.jsonl")) if isinstance(m.get("id"), str)}
+    known |= {m.get("id") for m in jsonl(os.path.join(box, "out.jsonl")) if isinstance(m.get("id"), str)}
     if re_id and re_id not in known:
         die(f"--re {re_id} is not in {project}/mail/{agent}/in.jsonl or out.jsonl")
     msg = mail_line(project, agent, a.kind, task, re_id, refs, body, main_name(project))
@@ -834,8 +850,10 @@ def wait_loop(dot, agent, timeout, expect=None):
     not the answer, and mail already unread when the reply started must not end it either.
 
     `shown` holds what this process has already printed. A line whose id cannot be marked delivered —
-    a hand-written one with a bad id — would otherwise print again on every poll, once a second."""
+    a hand-written one with a bad id, or a mailbox whose `.agent-read` the root made a folder — would
+    otherwise print again on every poll, once a second; `warned` keeps the marker failure to one line."""
     shown = set()
+    warned = set()
 
     def fresh(pending):
         out = []
@@ -853,7 +871,7 @@ def wait_loop(dot, agent, timeout, expect=None):
     pending = fresh(unread_all(agent))
     if pending:
         print_pending(pending)
-        mark_delivered(pending)
+        mark_delivered(pending, warned)
         if answer_arrived(pending):
             return 0
     if not os.path.isdir(os.path.join(BASE, "live", dot)):
@@ -877,7 +895,7 @@ def wait_loop(dot, agent, timeout, expect=None):
             pending = fresh(unread_all(agent))
             if pending:
                 print_pending(pending)
-                mark_delivered(pending)
+                mark_delivered(pending, warned)
                 if answer_arrived(pending):
                     return 0
             if time.monotonic() >= deadline:
@@ -903,13 +921,23 @@ def print_pending(pending):
         show_mail(project, m, "MAIL_NEW")
     print(f"WAIT mail={len(pending)} unread (handle these before your next step)", flush=True)
 
-def mark_delivered(pending):
+def mark_delivered(pending, warned):
     """Move each box's read marker to the newest message `wait` printed, so the next wait blocks
-    instead of printing it again. `tick --took` moves the same marker for a working agent."""
+    instead of printing it again. `tick --took` moves the same marker for a working agent.
+
+    A marker path the root made unwritable — a folder named `.agent-read`, a mailbox with no write
+    permission — is reported once per box and never raised: the line was printed and the set of what
+    was shown keeps this command from printing it again, but the mail stays unread on disk."""
     for box, _project, m in pending:
         mid = m.get("id")
         if isinstance(mid, str) and TOKEN.match(mid):
-            write_atomic(os.path.join(box, ".agent-read"), mid + "\n")
+            try:
+                write_atomic(os.path.join(box, ".agent-read"), mid + "\n")
+            except OSError as exc:
+                if box not in warned:
+                    warned.add(box)
+                    print(f"dots: cannot mark {box} read ({exc.__class__.__name__}); it stays unread",
+                          file=sys.stderr)
 
 # ---------------------------------------------------------------- watch
 
@@ -966,9 +994,18 @@ def load_state(path):
     msgs = st.get("messages")
     return {"v": 1, "messages": msgs if isinstance(msgs, dict) else {}}
 
-def save_state(path, st):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    write_atomic(path, json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+def save_state(path, st, warn=None):
+    """Write the ledger. A path the root made unwritable — a folder where `state.json` should be, a
+    folder with no write permission — is reported once and never raised: a record that cannot be
+    written can only make a later run ring again, which is the direction this ledger may fail in."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_atomic(path, json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+    except OSError as exc:
+        if warn is not None and path not in warn:
+            warn.add(path)
+            print(f"dots: cannot write the ledger {path} ({exc.__class__.__name__}); "
+                  f"a restart may ring twice", file=sys.stderr)
 
 def owed_mail():
     """(project, agent, box, message) for every inbox line that still owes an answer, read from the
@@ -1015,6 +1052,7 @@ def watch_once(expected, wake, notify, delays, st_path, src):
     seen = set()
     dirty = False
     no_wake = no_notify = False
+    ledger_warned = set()
     for project, agent, box, m in owed_mail():
         mid = m.get("id")
         if not isinstance(mid, str) or not TOKEN.match(mid):
@@ -1028,8 +1066,10 @@ def watch_once(expected, wake, notify, delays, st_path, src):
             # ring still ends as WATCH_RESOLVED instead of vanishing
             rec["seen_t"] = now()
             dirty = True
-        # an unparseable or future `t` must not hide a message: fall back to when it was first seen
-        ages = [a for a in (age_min(m.get("t")), age_min(rec.get("seen_t"))) if a is not None]
+        # an unparseable or future `t` must not hide a message: fall back to when it was first seen,
+        # and only a time in the past is an age — a future one cannot make a message old enough
+        ages = [a for a in (age_min(m.get("t")), age_min(rec.get("seen_t")))
+                if a is not None and a >= 0]
         if not ages:
             print(f"WATCH_ERROR {project} {agent} {mid} no usable time t={m.get('t')!r} "
                   f"seen_t={rec.get('seen_t')!r}", flush=True)
@@ -1058,7 +1098,7 @@ def watch_once(expected, wake, notify, delays, st_path, src):
                 else:
                     if code is not None:
                         rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
-                        save_state(st_path, st)
+                        save_state(st_path, st, ledger_warned)
                     print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
                           f"exit={detail or code}", flush=True)
         if not rec.get("wake_t"):
@@ -1070,7 +1110,7 @@ def watch_once(expected, wake, notify, delays, st_path, src):
         # as the mail, so it can add a visible event here, never silence this one.
         if not unread_in(box, mid) and not rec.get("stuck_t"):
             rec["stuck_t"] = now()
-            save_state(st_path, st)
+            save_state(st_path, st, ledger_warned)
             print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
                   f"wake_t={rec['wake_t']}", flush=True)
         if rec.get("notify_t"):
@@ -1085,16 +1125,16 @@ def watch_once(expected, wake, notify, delays, st_path, src):
             continue
         if code is not None:
             rec["notify_t"] = now()
-            save_state(st_path, st)
+            save_state(st_path, st, ledger_warned)
         print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={round(since)}m "
               f"read={'no' if unread_in(box, mid) else 'yes'} exit={detail or code}", flush=True)
     if dirty:
-        save_state(st_path, st)   # first sight is a ledger write: a vanished line must resolve, not vanish
+        save_state(st_path, st, ledger_warned)   # first sight is a ledger write: a vanished line must resolve, not vanish
     for mid, rec in sorted(st["messages"].items()):
         if mid in seen:
             continue
         del st["messages"][mid]
-        save_state(st_path, st)
+        save_state(st_path, st, ledger_warned)
         print(f"WATCH_RESOLVED {rec.get('project') or '-'} {rec.get('agent') or '-'} {mid}", flush=True)
 
 def stop_quiet(signum, frame):
