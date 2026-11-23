@@ -281,6 +281,19 @@ class WaitTests(Base):
         self.assertIn("it stays unread", res.stderr)      # said once, on stderr, not raised
         self.assertNotIn("Traceback", res.stderr)
 
+    def test_a_fifo_in_place_of_the_inbox_does_not_hang_wait(self):
+        # the same FIFO an agent holding `wait` open would otherwise sit on forever: it reads as no
+        # mail, so the command reaches its own timeout instead of blocking past it
+        self.send(text="handle this")
+        inbox = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        os.unlink(inbox)
+        os.mkfifo(inbox)
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "1"], self.base, timeout=8)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn(f"dots: cannot read {inbox} (not a regular file); treated as no lines",
+                      res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
 class WakeTests(Base):
     def test_wake_argv_runs_once_with_placeholders(self):
         target = os.path.join(self.base, "wake.txt")
@@ -1138,6 +1151,57 @@ class WatchTests(Base):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(f"dots: cannot read {inbox} (PermissionError); treated as no lines", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+    def test_a_fifo_in_place_of_the_inbox_does_not_hang_watch_or_board(self):
+        # a FIFO is neither mail nor a folder: opening one for reading blocks until a writer appears,
+        # so the readers refuse it before the open. The timeout is the assertion: a hang fails here
+        self.waiting_message(read=False)
+        inbox = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        os.unlink(inbox)
+        os.mkfifo(inbox)
+        res = run(["board"], self.base, timeout=5)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        res = run(["watch"], self.base, timeout=5)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"dots: cannot read {inbox} (not a regular file); treated as no lines",
+                      res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_a_fifo_in_place_of_the_ledger_still_rings(self):
+        # the ledger is in the root's folder too: a FIFO there reads as an empty ledger, and an empty
+        # ledger rings
+
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        ledger = os.path.join(self.base, "watch", "state.json")
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        os.mkfifo(ledger)
+        res = run(["watch"], self.base, timeout=5)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"dots: cannot read {ledger} (not a regular file); treated as no lines",
+                      res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(read(target).split(), [mid])
+
+class ReadWarningTests(unittest.TestCase):
+    """A path that cannot be read is reported once, and once more if it breaks again after working."""
+
+    def test_a_path_that_recovers_and_breaks_again_is_reported_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "in.jsonl")
+            os.makedirs(path)          # a folder where a file belongs reads as no lines
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(d.jsonl(path), [])
+                os.rmdir(path)
+                d.write_atomic(path, "{}\n")
+                self.assertEqual(d.jsonl(path), [{}])   # a good read clears the warning
+                os.unlink(path)
+                os.makedirs(path)
+                self.assertEqual(d.jsonl(path), [])
+            self.assertEqual(err.getvalue().count("cannot read"), 2, err.getvalue())
 
 class InitTests(Base):
     def setUp(self):

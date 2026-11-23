@@ -245,19 +245,25 @@ wake command ran.
   replaced. Keep the tool outside the shared folder and pass `--expect-sha256` on the owner's own
   `watch` command line — not in the root's brief, which the root writes — with the hash of the file
   the owner reviewed; `WATCH_TOOL_CHANGED expected=… actual=… path=…` prints as soon as the bytes
-  differ. A copy that does sit in a root-writable folder drops `sys.path[0]` before importing the
-  standard library, so a `json.py` or `socket.py` beside it cannot be imported in its place, but that
-  only protects the imports: the copy's own bytes still need the hash check.
+  differ, and with `actual=unreadable` when the file cannot be read at all — a copy replaced by a
+  FIFO would otherwise block that read. A copy that does sit in a root-writable folder drops
+  `sys.path[0]` before importing the standard library, so a `json.py` or `socket.py` beside it cannot
+  be imported in its place, but that only protects the imports: the copy's own bytes still need the
+  hash check.
 - **A forged ledger record.** `watch/state.json` is in the shared folder too. A record that says a
   wake or a notify already ran suppresses that step, and the tool prints `WATCH_SKIP … wake_already`
   or `notify_already` so the suppression is visible; `--state PATH` keeps the ledger where the root
   cannot write it, which is the only way to make the record trustworthy.
-- **A path replaced by a folder.** Any name in that folder can be a directory instead of a file:
-  `in.jsonl`, `out.jsonl`, `.agent-read`, a `listen/` marker, the ledger. Each one then reads as
-  empty — no lines, no waiter, no record — and `watch`, `wait` and `reply` keep running rather than
-  dying on it, but not silently: a path that exists and cannot be read prints
-  `dots: cannot read <path> (…)` once on stderr (`treated as no lines`), while a missing file is the
-  normal case and stays quiet. A read marker that cannot be written prints
+- **A path replaced by something that is not a file.** Any name in that folder can be a directory, a
+  FIFO or a socket instead of a file: `in.jsonl`, `out.jsonl`, `.agent-read`, a `listen/` marker, the
+  ledger. Each one then reads as empty — no lines, no waiter, no record — and `watch`, `wait` and
+  `reply` keep running rather than dying or blocking on it, but not silently: a path that exists and
+  cannot be read prints `dots: cannot read <path> (…)` once on stderr (`treated as no lines`, and
+  `(not a regular file)` for a FIFO), while a missing file is the normal case and stays quiet. The
+  tool stats every such path before opening it, because opening a FIFO for reading blocks until a
+  writer appears; a mail line it cannot append is refused with `dots: cannot append to <path>: it is
+  not a regular file` and exit 2 rather than hung, and the temp file `write_atomic` writes is opened
+  non-blocking for the same reason. A read marker that cannot be written prints
   `dots: cannot mark … read (…)` once and the mail stays unread; a ledger that cannot be written
   prints `dots: cannot write the ledger …` once and says `every run rings again until it is
   writable`, which is the safe direction. A ledger record that is not an object is dropped, so that

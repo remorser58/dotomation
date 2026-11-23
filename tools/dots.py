@@ -88,7 +88,7 @@ import sys
 if __name__ == "__main__" and sys.path:
     del sys.path[0]
 
-import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, subprocess, time
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, stat, subprocess, time
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -169,20 +169,34 @@ def token(name, value):
 
 READ_WARNED = set()
 
+def regular(path):
+    """False for a path that is not a regular file. Opening a FIFO for reading blocks until a writer
+    appears, so the readers here refuse one before they touch it; a missing path returns True and the
+    open below reports it the normal way."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return True
+
 def unreadable(path, exc):
-    """One stderr line per path that exists but cannot be read — a folder where a file belongs, a file
-    with no read permission. A missing file is the normal case and stays silent. The caller reads the
-    path as no lines either way, and the set keeps a once-a-second poll from repeating the line."""
+    """One stderr line per path that exists but cannot be read — a folder or a FIFO where a file
+    belongs, a file with no read permission. A missing file is the normal case and stays silent. The
+    caller reads the path as no lines either way, and the set keeps a once-a-second poll from repeating
+    the line; a read that succeeds clears the entry, so a path that breaks again is reported again."""
     if path in READ_WARNED:
         return
     READ_WARNED.add(path)
-    print(f"dots: cannot read {path} ({exc.__class__.__name__}); treated as no lines", file=sys.stderr)
+    name = exc if isinstance(exc, str) else exc.__class__.__name__
+    print(f"dots: cannot read {path} ({name}); treated as no lines", file=sys.stderr)
 
 def jsonl(path):
     """Lines of one JSONL file, skipping any line that is not a JSON object. A path the root made
-    unreadable — a folder where the file should be, a file with no read permission — reads as no
-    lines, never as a crash, and says so once on stderr: every reader here runs on shapes the root
-    can write, so a silent empty read would be a claim this tool cannot make."""
+    unreadable — a folder or a FIFO where the file should be, a file with no read permission — reads as
+    no lines, never as a crash and never as a block, and says so once on stderr: every reader here runs
+    on shapes the root can write, so a silent empty read would be a claim this tool cannot make."""
+    if not regular(path):
+        unreadable(path, "not a regular file")
+        return []
     out = []
     try:
         with open(path, encoding="utf-8") as fh:
@@ -194,9 +208,12 @@ def jsonl(path):
                 if isinstance(obj, dict):
                     out.append(obj)
     except FileNotFoundError:
-        pass
+        READ_WARNED.discard(path)
+        return out
     except OSError as exc:
         unreadable(path, exc)
+        return out
+    READ_WARNED.discard(path)
     return out
 
 def v1_lines(path):
@@ -215,21 +232,32 @@ def legacy_t(path):
     return best
 
 def load_json(path):
+    if not regular(path):
+        unreadable(path, "not a regular file")
+        return None
     try:
         with open(path, encoding="utf-8") as fh:
             obj = json.load(fh)
+        READ_WARNED.discard(path)
         return obj if isinstance(obj, dict) else None
     except (FileNotFoundError, ValueError):
+        READ_WARNED.discard(path)
         return None
     except OSError as exc:
         unreadable(path, exc)
         return None
 
 def marker(path):
+    if not regular(path):
+        unreadable(path, "not a regular file")
+        return None
     try:
         with open(path, encoding="utf-8") as fh:
-            return fh.read().strip() or None
+            text = fh.read().strip() or None
+        READ_WARNED.discard(path)
+        return text
     except FileNotFoundError:
+        READ_WARNED.discard(path)
         return None
     except OSError as exc:
         unreadable(path, exc)
@@ -287,14 +315,25 @@ def waiting_on(box):
     return [m for m in jsonl(os.path.join(box, "in.jsonl")) if owes_answer(m, answered)]
 
 def write_atomic(path, data):
+    """Replace `path` with `data` through a temp file beside it. The temp name is opened non-blocking
+    on purpose: a FIFO planted at that name would otherwise hold the open until a reader appears, and
+    a failed open is reported as the OSError the callers already handle."""
     tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK, 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(data)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
 
+def appendable(path):
+    """Refuse a path that is not a regular file before appending: opening a FIFO for writing blocks
+    until a reader appears, and a mail line that cannot be written must fail loudly, not hang."""
+    if not regular(path):
+        die(f"cannot append to {path}: it is not a regular file")
+
 def append_line(path, obj):
+    appendable(path)
     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
     with open(path, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
@@ -305,6 +344,7 @@ def append_line(path, obj):
 def append_unique(path, msg):
     """Append one mail line, drawing another id if that mailbox already used this one.
     The check runs under the same lock as the write, so two senders cannot pick the same id."""
+    appendable(path)
     with open(path, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         seen = {m.get("id") for m in jsonl(path) if isinstance(m.get("id"), str)}
@@ -1067,10 +1107,16 @@ def watch_once(expected, wake, notify, delays, st_path, src):
          f"state={src['state']}:{st_path}"]), flush=True)
     if expected:
         path = os.path.abspath(__file__)
-        with open(path, "rb") as fh:
-            actual = hashlib.sha256(fh.read()).hexdigest()
+        actual = None
+        if regular(path):   # a copy the root replaced with a FIFO would block this read, not fail it
+            try:
+                with open(path, "rb") as fh:
+                    actual = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                actual = None
         if actual != expected:
-            print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual} path={path}", flush=True)
+            print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual or 'unreadable'} "
+                  f"path={path}", flush=True)
     cfg = config()
     st = load_state(st_path)
     seen = set()
@@ -1330,10 +1376,11 @@ def init(a):
     path = os.path.join(base, "dots.json")
     data = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     current = None
-    try:
-        current = open(path, encoding="utf-8").read()
-    except FileNotFoundError:
-        pass
+    if regular(path):   # a FIFO or a folder at dots.json would block the read, not fail it
+        try:
+            current = open(path, encoding="utf-8").read()
+        except OSError:
+            current = None
     if current != data:
         write_atomic(path, data)
     print(f"INIT base={base}")
