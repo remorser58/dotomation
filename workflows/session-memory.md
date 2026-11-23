@@ -1,10 +1,10 @@
 # Session memory: what each agent is doing, readable without the dot
 
-On 2026-11-23 (KST) the owner asked to see each dot sub-agent's session the way a project main session sees its own. The dot's sub-agent threads cannot be read from outside the dot, so each agent keeps a short memory file on Osaka next to its live records. The main session, the coordinator and the owner's lead read it directly, and talk to the agent through [direct mail](direct-mail.md) where that is set up. The root does not relay any of it. The owner approved this for REM17 and REV18.
+The dot's sub-agent threads cannot be read from outside the dot, so each agent keeps a short memory file on `local` next to its live records, and readers see its current state the way a project main session sees its own session. The main session, the coordinator and the owner's lead read it directly, and talk to the agent through [direct mail](direct-mail.md) where that is set up. The root does not relay any of it. The owner approves this per dot.
 
 ## Where it lives
 
-`~/CodeProjects/.dots-ops/memory/<DOT>/<agentId>.json` on Osaka, one file per agent, beside `live/<DOT>/<agentId>.jsonl`. `<agentId>` is the same id the agent uses in its live records, roster slot and mail folder.
+`<work root>/.dots-ops/memory/<DOT>/<agentId>.json` on `local`, one file per agent, beside `live/<DOT>/<agentId>.jsonl`. `<agentId>` is the same id the agent uses in its live records, roster slot and mail folder.
 
 - **One writer.** Only that agent writes its file. It rewrites the whole file each time; nobody else edits, truncates or deletes it.
 - **Same moments as the live record.** The agent rewrites its memory whenever it appends a live line: `start`, each material step and at least every 15 minutes while working, `blocked` and `done`. The memory's `t`, `task`, `state` and `host` equal the line written with it.
@@ -24,7 +24,7 @@ On 2026-11-23 (KST) the owner asked to see each dot sub-agent's session the way 
 | `decisions` | `{t, text}` choices the agent made on this task, oldest first. A choice reserved for the owner or the coordinator is asked for, not recorded here as made. |
 | `blockers` | Open blockers, each naming the missing fact or capability. Empty when none; never empty while `state` is `blocked`. |
 
-No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text, as in every other Osaka record.
+No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text, as in every other record in the shared folder.
 
 ## One call per step
 
@@ -40,11 +40,11 @@ One tick replaces three separate calls (append the line, rewrite the memory, rea
 - **Main session.** Before sending a `task` or `review`, read the agent's memory. A question the memory already answers does not need a message. If `doing` shows the agent is on something else, say which work comes first in the message itself; the agent answers in its outbox.
 - **Coordinator.** Read the board each round with the roster. A `MEMO-BEHIND` or `NO-MEMO` flag on a working agent is a missing record, handled like a missing live line. A stall is still judged from the live line, not from the memory.
 - **Replacement after a stall or VM reset.** The coordinator briefs the replacement with the previous agent's memory file path and its last live lines. The replacement reads them, then reads the actual target (branch, SHA, file) before any mutation and continues from the last confirmed step only. It starts its own memory under its own id; it never writes the previous agent's file.
-- **Lead and owner.** `dots.py board` over `ssh osaka` is the one-call status view.
+- **Lead and owner.** `dots.py board` through the approved route to `local` is the one-call status view.
 
 ## What it is not
 
 - It is the agent's own summary, like the live record. It is not a `submit`, a `check`, gate evidence or a closure, and it does not prove the agent did what `doing` says. [Monitoring](monitoring.md) still compares claims with real tool activity.
 - When the memory and the live log disagree, the newer live line is the record; the board shows `MEMO-BEHIND`.
 - It is not a message route. A `next` that mentions another agent does not reach that agent; mail or the native exchange does.
-- It is files on the shared Osaka folder: no service, watcher, scheduler, hook, dashboard or telemetry. The route grants nothing; the owner's 2026-11-23 approval above is the only grant.
+- It is files in the shared folder on `local`: no service, watcher, scheduler, hook, dashboard or telemetry. The route grants nothing; the owner's approval for that dot is the only grant.

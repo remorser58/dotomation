@@ -18,8 +18,8 @@ Python 3.9 or newer, standard library only. `ssh` is used for a remote ledger or
 
 | Source | Where | What it establishes |
 |---|---|---|
-| Live records | `~/CodeProjects/.dots-ops/live/<DOT>/*.jsonl` and `roster.json` on Osaka | What each agent says it is doing, and when it last said it |
-| Daemon requests | `~/wgpt-daemon/data/app.log` (account 18), `~/wgpt-daemon-17/data/app.log` (account 17) on Osaka; `~/Library/Application Support/web-gpt-agent-rem17/app.log` (17) and `web-gpt-agent-rem-daemon/app.log` (18) on the Mac mini | How many `POST mcp/core` requests that account actually made in the last 15 and 60 minutes |
+| Live records | `<work root>/.dots-ops/live/<DOT>/*.jsonl` and `roster.json` on `local` | What each agent says it is doing, and when it last said it |
+| Daemon requests | The Web GPT Agent daemon `app.log` of each account in the config's `activity` list, on `local` or on a host reached with `ssh` | How many `POST mcp/core` requests that account actually made in the last 15 and 60 minutes |
 | Evidence | GitHub through `gh api` | Whether the cited pull request, commit, issue, comment or run exists and is in the state the note claims |
 
 Only the last 256 KiB of each file is read, so a multi-gigabyte daemon log costs the same as a small one. A byte tail that starts mid-line drops that line instead of inventing one. Every `ssh` and `gh` call has a timeout, and a failed source becomes a `DOTS_ERROR` line rather than a wrong answer.
@@ -53,12 +53,12 @@ A request count is not a result. It does not show what was run, whether a gate p
 
 ## Config
 
-`tools/dots-monitor.owner.json` is the owner's config and holds no secrets: host names, paths, account numbers and repository names only. `tools/dots-monitor.example.json` is the template for another machine. Copy either next to the tool, or pass `--config PATH`. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
+`tools/dots-monitor.example.json` is the template, and an instance keeps its own filled-in copy outside this repository: host names, paths, account numbers and repository names only, no secrets. Copy the template to that file and pass it with `--config PATH`; without a config the tool falls back to its built-in default. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
 
 ```json
 {
-  "ledger": {"host": "osaka", "root": "~/CodeProjects/.dots-ops/live", "dots": ["REM17", "REV18"]},
-  "activity": [{"dot": "REM17", "host": "osaka", "label": "osaka", "path": "~/wgpt-daemon-17/data/app.log"}],
+  "ledger": {"host": "local", "root": "<work root>/.dots-ops/live", "dots": ["DOT-A", "DOT-B"]},
+  "activity": [{"dot": "DOT-A", "host": "local", "label": "local", "path": "~/.local/state/web-gpt-agent/app.log"}],
   "github": {"enabled": true, "repos": ["owner/repo"], "max_lookups": 60}
 }
 ```
@@ -70,16 +70,16 @@ A request count is not a result. It does not show what was run, whether a gate p
 `watch` prints one line per change and nothing when nothing changed, so a line-filter monitor can key on the prefix:
 
 ```text
-DOTS_STALLED REV18 yomanchi-23-engine from=WORKING state=step age=34m evidence=resolved task="issue #23" note="..."
-DOTS_QUIET REM17 rem-ops-ultra from=WORKING state=step age=6m evidence=resolved task=REM17-RESEARCH+DRAFTS/r1 note="..."
-DOTS_WORKING REM17 kice_item_owner from=UNPROVEN state=start age=4s evidence=resolved task=KICE-REMORSEKIM-62438-Q29-MATCH/r2 note="..."
+DOTS_STALLED DOT-A example-23-engine from=WORKING state=step age=34m evidence=resolved task="issue #23" note="..."
+DOTS_QUIET DOT-A example-ultra from=WORKING state=step age=6m evidence=resolved task=DOT-A-RESEARCH+DRAFTS/r1 note="..."
+DOTS_WORKING DOT-A example_item_owner from=UNPROVEN state=start age=4s evidence=resolved task=EXAMPLE-62438-Q29-MATCH/r2 note="..."
 DOTS_BLOCKED, DOTS_DONE, DOTS_UNPROVEN, DOTS_LEGACY, DOTS_NO_RECORD: same fields
-DOTS_NEW_AGENT REM17 remorswarm_drafts class=WORKING evidence=local role=구현 task=REM17-DRAFTS/r1
-DOTS_ACTIVE REV18 - calls_15m=15          # dot went from no tool request in 15 minutes to calling tools
-DOTS_IDLE REV18 - calls_15m=0             # no tool request in the last 15 minutes any more
-DOTS_ERROR - - source=activity detail="exit 255: ssh: connect to host osaka port 22: Connection refused"
+DOTS_NEW_AGENT DOT-A example_drafts class=WORKING evidence=local role=구현 task=DOT-A-DRAFTS/r1
+DOTS_ACTIVE DOT-B - calls_15m=15          # dot went from no tool request in 15 minutes to calling tools
+DOTS_IDLE DOT-B - calls_15m=0             # no tool request in the last 15 minutes any more
+DOTS_ERROR - - source=activity detail="exit 255: ssh: connect to host example-host port 22: Connection refused"
 DOTS_RECOVERED - - source=activity
-DOTS_DOT REM17 - calls_15m=16             # first scan only, one per dot
+DOTS_DOT DOT-A - calls_15m=16             # first scan only, one per dot
 ```
 
 `DOTS_MONITOR started ...` opens the stream. `--json` prints one JSON object per line with the same `event` name.
@@ -87,7 +87,7 @@ DOTS_DOT REM17 - calls_15m=16             # first scan only, one per dot
 ## Boundaries
 
 - Read-only: the remote side runs only `wc -c` and `tail -c` over the configured files. The tool never appends, edits, renames or deletes a record, and writes nothing on any host it reads; output goes to the reader's terminal. The `ssh` host is passed after `--`, so a config value cannot become an `ssh` option.
-- Framing: every section marker in the remote dump carries a random nonce chosen for that run, so a record, note or log line that contains `==END` or `==DOT REV18` stays file content and cannot move lines into another file or dot.
+- Framing: every section marker in the remote dump carries a random nonce chosen for that run, so a record, note or log line that contains `==END` or `==DOT DOT-A` stays file content and cannot move lines into another file or dot.
 - Agent ids: a roster slot's `agent` and a live file's name must match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`, like a record's `agent`. Anything else is dropped and counted in a `DOTS_ERROR roster` or `DOTS_ERROR ledger` line; the dropped text itself is never printed.
 - A configured dot whose live directory is missing on a reachable host is `DOTS_ERROR ledger`, not an empty table.
 - Not resident: `watch` is a foreground command the reader starts and stops. Nothing installs, schedules or restarts it.

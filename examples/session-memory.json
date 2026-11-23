@@ -1,15 +1,15 @@
 {
   "description": "Synthetic session memory (memory-v1) for one dot sub-agent, with the live line written at the same moment. Ids, paths, SHAs and times are invented. The memory is the whole content of memory/<DOT>/<agentId>.json; the live line is the newest line of live/<DOT>/<agentId>.jsonl. Negative cases are in examples/edge-cases.md.",
-  "file": "memory/REV18/example-android.json",
+  "file": "memory/DOT-A/example-android.json",
   "memory": {
     "v": 1,
     "t": "2026-11-23T02:20:00Z",
-    "dot": "REV18",
+    "dot": "DOT-A",
     "agent": "example-android",
-    "project": "yomanchi",
+    "project": "example-project",
     "task": "issue #90",
     "state": "step",
-    "host": "mini",
+    "host": "local",
     "goal": "Cancelling during any account write keeps the previous account state (gates G1-G3 from the coordinator brief).",
     "doing": "Sent result m-20261123T022000Z-2c3d for 89abcde; waiting for the main session's review.",
     "next": "On a FAIL, fix the named gate on the same branch and send a new result that supersedes this one.",
@@ -19,5 +19,5 @@
     ],
     "blockers": []
   },
-  "live_line": {"t": "2026-11-23T02:20:00Z", "agent": "example-android", "role": "구현", "model": "requested gpt-6.2-astra xhigh; runtime does not display effective", "project": "yomanchi", "task": "issue #90", "state": "step", "host": "mini", "note": "Second-write cancel fix committed and submitted; 431 tests, 0 failures.", "evidence": "mail:example-android/m-20261123T022000Z-2c3d"}
+  "live_line": {"t": "2026-11-23T02:20:00Z", "agent": "example-android", "role": "구현", "model": "requested gpt-6.2-astra xhigh; runtime does not display effective", "project": "example-project", "task": "issue #90", "state": "step", "host": "local", "note": "Second-write cancel fix committed and submitted; 431 tests, 0 failures.", "evidence": "mail:example-android/m-20261123T022000Z-2c3d"}
 }

@@ -26,7 +26,7 @@
     },
     "project": {
       "$ref": "#/$defs/line",
-      "description": "Recommended: kice, remorswarm or yomanchi."
+      "description": "Recommended: the project id the lane belongs to."
     },
     "task": {
       "$ref": "#/$defs/line"
@@ -41,7 +41,7 @@
     },
     "host": {
       "$ref": "#/$defs/line",
-      "description": "Recommended: vm, osaka, mini or macbook — the host actually used, confirmed by hostname."
+      "description": "Recommended: vm or local — the host actually used, confirmed by hostname."
     },
     "note": {
       "$ref": "#/$defs/line"

@@ -6,9 +6,9 @@ Verification: read the final skill, match the worked conversation to the schema,
 
 ## The one exception: `tools/dots_monitor.py`
 
-The owner asked for a way to see whether REV, REM and their sub-agents are actually working, and self-reports alone cannot show that. That one request, and only that one, is an exception to the rule above:
+The owner asked for a way to see whether a dot and its sub-agents are actually working, and self-reports alone cannot show that. That one request, and only that one, is an exception to the rule above:
 
-- **What it is.** One read-only Python 3 file, `tools/dots_monitor.py` ([monitoring](workflows/monitoring.md)), with its standard-library test `tools/test_dots_monitor.py` and two JSON configs holding host names, paths, account numbers and repository names only. It reads the live records, the Web GPT Agent daemon request log of each dot's account, and GitHub references through `gh api`. `watch` is a foreground command the reader starts and stops; nothing schedules or restarts it.
+- **What it is.** One read-only Python 3 file, `tools/dots_monitor.py` ([monitoring](workflows/monitoring.md)), with its standard-library test `tools/test_dots_monitor.py` and one JSON config template, `tools/dots-monitor.example.json`, holding host names, paths, account numbers and repository names only. An instance keeps its filled-in config outside this repository. It reads the live records, the Web GPT Agent daemon request log of each dot's account, and GitHub references through `gh api`. `watch` is a foreground command the reader starts and stops; nothing schedules or restarts it.
 - **Still not part of this repository:** no install step, no package or dependency, no service, daemon, scheduler, hook, plugin, account, credential or telemetry. Standard library only, plus `ssh` and `gh` as existing CLIs the reader already has.
 - **Read-only everywhere.** It never appends, edits, deletes or renames a record and never writes to a host it reads; the remote side runs only `wc -c` and `tail -c` over the configured files. It never messages a dot and never assigns work: it reports, and a coordinator still decides.
 - **Bounded and redacted.** Every subprocess has a timeout, every file read is a byte tail, and anything that looks like a token is redacted before display.

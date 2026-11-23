@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:dots-superkit:memory-v1",
   "title": "dots-superkit/memory-v1",
-  "description": "The whole content of memory/<DOT>/<agentId>.json on Osaka: one agent's current session memory, rewritten whole by that agent only, at the same moments it appends a live record. Shape only. It summarizes the agent's own state; it is not evidence that a gate passed, not a submission and not a closure. Who writes it, when and how readers use it are in workflows/session-memory.md. Exactly these fields, all required, no extras.",
+  "description": "The whole content of memory/<DOT>/<agentId>.json in the shared folder on `local`: one agent's current session memory, rewritten whole by that agent only, at the same moments it appends a live record. Shape only. It summarizes the agent's own state; it is not evidence that a gate passed, not a submission and not a closure. Who writes it, when and how readers use it are in workflows/session-memory.md. Exactly these fields, all required, no extras.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -18,7 +18,7 @@
     },
     "dot": {
       "$ref": "#/$defs/token",
-      "description": "REM17 or REV18: the live/<DOT> folder the agent writes to."
+      "description": "One dot id: the live/<DOT> folder the agent writes to."
     },
     "agent": {
       "$ref": "#/$defs/token",
