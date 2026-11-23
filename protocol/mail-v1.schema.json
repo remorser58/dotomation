@@ -65,7 +65,7 @@
       "items": {
         "$ref": "#/$defs/line"
       },
-      "description": "Exact references: rev/* branch, full commit SHA, path, link, or supersedes:<message id>."
+      "description": "Exact references: rev/* branch, full commit SHA, mini:<workspace path>, path, link, gate:<ID>, or supersedes:<message id>."
     }
   },
   "required": [

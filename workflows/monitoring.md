@@ -43,6 +43,8 @@ The 30 minutes are `thresholds.stall_minutes` (or `--stall-minutes`); the legend
 
 `EVIDENCE` is one of `resolved` (the reference exists), `stale` (a cited pull-request head SHA is no longer that pull request's head or merge commit; a `done` on it is `UNPROVEN`), `local` (a bare label such as `MATCH-CHECK`, not checkable), `unresolved` (GitHub says it does not exist), `unknown` (not checked: no `gh`, network failure, or the lookup budget ran out), or `missing`.
 
+On a [direct mail](direct-mail.md) task, a `done` or `step` that cites a SHA not yet published to GitHub is `UNPROVEN` by design until the main session publishes it. For that window, read the agent's newest `result` and the main session's `review` or `answer` in `mail/<agentId>/` to tell a pending handover from bad evidence.
+
 ## What the activity counts do and do not prove
 
 They are per **account and host**, not per agent. A dot whose account is calling tools is really working; the count cannot say which sub-agent made the call. That is why the class needs both halves: the record names the agent and the task, the request count shows the account was alive at that time. Two dots on the same account share the count; the config keeps them separate by log path.

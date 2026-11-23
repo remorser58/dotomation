@@ -1,8 +1,8 @@
 # Direct mail: a project's main session and a dot's sub-agents
 
-On 2026-11-23 (KST) the owner asked that a project's main session talk with a dot's sub-agents directly, not through the dot root, and that sub-agents hand code over through an Osaka repository instead of GitHub. The main session is an agent session that lives outside Dots, such as the Yomanchi OMP session on the MacBook. The root stops relaying this traffic. It still summons agents and keeps the roster, and the only thing it does here is wake an idle agent when asked.
+On 2026-11-23 (KST) the owner asked that a project's main session talk with a dot's sub-agents directly, not through the dot root, and that sub-agents hand code over without GitHub. The main session is an agent session that runs outside Dots, such as the Yomanchi OMP session on the MacBook. The root no longer relays this traffic. It still summons agents, and the coordinator still keeps the roster and closes tasks. On the mail path the root does exactly two things: it wakes an idle agent when the main session rings the doorbell, and it reads the mail folder read-only for status and closure.
 
-Current instance: project `yomanchi`, dot `REV18`, main session `yomanchi-main`, outgoing repository `/home/ubuntu/repos/Yomanchi-rev-out.git`.
+Current instance: project `yomanchi`, dot `REV18`, main session `yomanchi-main`, Osaka outgoing repository `/home/ubuntu/repos/Yomanchi-rev-out.git`, Mac mini root `/Volumes/SanDisk2TB/m4mini/CodeProjects/yomanchi-rev18`.
 
 ## Where it lives
 
@@ -12,11 +12,13 @@ All on Osaka, under `~/CodeProjects/.dots-ops/<project>/`:
 |---|---|---|
 | `mail/<agentId>/in.jsonl` | the main session only | messages to that agent |
 | `mail/<agentId>/out.jsonl` | that agent only | messages to the main session |
-| `mail/<agentId>/.agent-read` | that agent only | id of the last `in.jsonl` message it has read |
-| `mail/<agentId>/.main-read` | the main session only | id of the last `out.jsonl` message it has read |
+| `mail/<agentId>/.agent-read` | that agent only | the `id` of the last `in.jsonl` line it has read |
+| `mail/<agentId>/.main-read` | the main session only | the `id` of the last `out.jsonl` line it has read |
 | `mail/README.md` | the instance owner | short guide for that instance |
 
-`<agentId>` is the same id the agent uses in its live records and in the roster. Each line is append-only: no one edits or deletes a line, and a correction is a new line. The instance may keep a helper next to the folder, such as `mail.py`, that appends a valid line, lists unread messages and moves a read marker. A hand-written append of a line that matches the schema has the same effect. The helper belongs to the instance and is not part of this kit.
+`<agentId>` is the same id the agent uses in its live records and in the roster. Lines are append-only: no one edits or deletes a line, and a correction is a new line. A read marker names a line, not a point in time. The unread messages are the lines after the line it names, in file order; ids are never compared with each other.
+
+A Dots agent reads and appends these files through the approved route to Osaka for its account ([hosts](hosts.md#approved-routes)); for REV18 that is the `webgptagent_OCI_Osaka` connector, including when the agent's workspace is on the Mac mini. The main session runs outside Dots and uses its own access to Osaka. The instance keeps a helper, `mail.py`, next to the folder. It appends a valid line, lists unread messages and moves a read marker. It is instance setup the owner asked for, not part of this repository. A hand-written line that matches the schema has the same effect.
 
 ## One line: mail-v1
 
@@ -31,39 +33,42 @@ All on Osaka, under `~/CodeProjects/.dots-ops/<project>/`:
 | `kind` | Main session to agent: `task`, `question`, `answer`, `review`, `note`. Agent to main session: `ack`, `answer`, `question`, `result`, `block`, `note`. |
 | `re` | The `id` of the message this answers, or `null`. Every message an agent sends carries `re`. A new question from the agent uses the last message it received. |
 | `text` | Plain text. No secrets, credentials, tokens, personal identifiers or raw logs. |
-| `refs` | Exact references: a branch, a full commit SHA, a path, a link, or `supersedes:<id>`. |
+| `refs` | Exact references: a `rev/*` branch, a full commit SHA, `mini:<workspace path>`, a path, a link, `gate:<ID>`, or `supersedes:<message id>`. |
 
 ## How it maps to the handoff rules
 
-Direct mail is the addressed message and reply route that [direct exchanges](../.agents/skills/dots-superkit/SKILL.md#direct-exchanges-not-another-queue) allows for an approved worker surface. All the event rules still apply:
+Direct mail is the addressed message and reply route that [direct exchanges](../.agents/skills/dots-superkit/SKILL.md#direct-exchanges-not-another-queue) allows for an approved worker surface. For the tasks it carries, the main session is the named verifier. The handoff event rules apply as follows:
 
-- `re` is `reply_to`. A message is never authorization to widen scope, and a decision that belongs to the owner goes to the owner through the main session.
+- **Gates.** The coordinator's brief to the agent holds the mandatory gate list. The agent's first message on a task is an `ack` that copies each gate ID and its pass condition, one `gate:<ID>` per gate in `refs`, so the main session checks against the same list. A main-session `task` that adds work inside the assignment names any new gate the same way. A message never removes a gate.
+- `re` is `reply_to`. A message is never authorization to widen scope. A decision that belongs to the owner goes to the owner through the main session.
 - `task` from the main session is a follow-up inside the agent's current assignment. New work still starts as an issue the dot's coordinator assigns. After the assignment, the main session and the agent talk directly.
-- `result` is a **submit**: the exact `rev/*` branch and full commit SHA in the rev-out repository, the checks the agent ran with their observed results, and what it did not check. A replacement is a new `result` with `supersedes:<previous result id>` in `refs`. The agent's own tests are writer self-tests, not independent review.
-- `review` from the main session is a **check**: it is tied to one result id and SHA, and it says what to fix when something fails.
+- `result` is a **submit**. It names the exact target: the `rev/*` branch and full commit SHA, plus `mini:<workspace path>` when the commit stays on the Mac mini. It also lists the checks the agent ran with their observed results, and what it did not check. A replacement is a new `result` with `supersedes:<previous result id>` in `refs`. The agent's own tests are writer self-tests, not independent review.
+- `review` from the main session is a **check**. It answers one `result` id and SHA. It gives one verdict per gate, `gate:<ID> PASS|FAIL|NOT_RUN`, with the observed output or its location, and the reason for each FAIL or NOT_RUN. For a FAIL it tells the agent what to fix.
+- `answer` that accepts a `result` is the final check. It gives PASS for every gate on that SHA, names the SHA the main session published, and names the pull request. A rejection is a `review` with at least one FAIL. A rejection never closes anything.
+- **Coordinator receipt.** The coordinator reads `mail/<agentId>/` read-only. That copy covers the submit chain and the verdicts, so the agent does not have to send the coordinator a second copy. The direct agent-to-main-session leg is still the one that counts.
+- **Close.** Only the coordinator closes, under the [close rule](../.agents/skills/dots-superkit/SKILL.md#events-and-evidence). It closes only after an accepting `answer` on the newest `result`. Before closing, it reads that answer's per-gate verdicts and the published target, and confirms there is no open `block`, pause or newer owner direction. After a rejection the task stays open, and the coordinator records which gate failed.
 - `block` names the missing fact or capability and the next safe step. A message is never a resume after an owner pause.
-- The main session decides acceptance for the project. The dot's coordinator closes the dot-internal task once the main session's `answer` accepts or rejects a named result. That `answer` names the published SHA and the pull request, or gives the reason for rejection.
 
-## Delivering code: the rev-out repository
+## Delivering code
 
-- Commit on `rev/<topic>-<date>` and push only that branch to the project's rev-out repository on Osaka. The repository accepts `refs/heads/rev/*` only and refuses `loop/*`, `main`, `release/*` and tags. It borrows objects from the read-only mirror, so a push adds only the new objects.
-  - From an Osaka workspace: `git push ~/repos/<Repo>-rev-out.git rev/<topic>-<date>`.
-  - From a Mac mini workspace: `git push osaka:/home/ubuntu/repos/<Repo>-rev-out.git rev/<topic>-<date>`.
+- **Workspace on Osaka:** commit on `rev/<topic>-<date>` and push only that branch to the project's rev-out repository with `git push ~/repos/<Repo>-rev-out.git rev/<topic>-<date>`. The repository accepts `refs/heads/rev/*` only and refuses `loop/*`, `main`, `release/*` and tags. It borrows objects from the read-only mirror, so a push adds only the new objects.
+- **Workspace on the Mac mini:** commit on `rev/<topic>-<date>` inside the approved Mac mini root and push nowhere. The `result` names `mini:<absolute workspace path>`, the branch and the full SHA. The main session fetches that exact commit from the workspace on the Mac mini. The Mac mini has no approved write route to Osaka for code, so do not use `ssh osaka` or `git push osaka:` from there.
 - Then send a `result`.
-- Do not push to GitHub and do not open a pull request for this project. That includes the GitHub connector route. The main session fetches the exact SHA, verifies it in its own environment, pushes that same SHA to GitHub `rev/<topic>-<date>` and opens the pull request.
-- Owner approval: on 2026-11-23 the owner approved this route for Yomanchi. Assigned REV sub-agents may commit and push `rev/*` branches to `Yomanchi-rev-out.git` on Osaka. Every other commit, push, merge or external write still needs its own approval.
+- Sub-agents on this route do not push to GitHub or open pull requests for the project, and that includes the GitHub connector. The main session fetches the exact SHA, verifies it in its own environment, pushes that same SHA to GitHub `rev/<topic>-<date>` and opens the pull request.
+- **Approval.** On 2026-11-23 the owner approved this for Yomanchi. Assigned REV sub-agents may commit `rev/*` branches in their approved workspaces and push them, from Osaka, to `Yomanchi-rev-out.git` on Osaka. Every other commit, push, merge or external write still needs its own approval. Another project uses this route only after the owner approves it for that project.
 
 ## Reading cadence and the doorbell
 
 - An agent reads its inbox whenever it appends a live record, which is at least every 15 minutes while working, and again before `done`. It answers every message it receives with a message carrying `re`, even if the answer is only an `ack`.
-- An idle agent cannot read. If a message stays unread for 20 minutes and the agent has no newer live line, the main session sends the dot root one line asking it to wake that agent to read its inbox. The main session sends one doorbell per message.
-- The root wakes the agent and nothing more. It does not read the mail aloud, summarize it or answer for the agent. The coordinator may read the mail folder for status, read-only.
+- An idle agent cannot read. The main session checks its sent messages whenever it reads its own inbox. No watcher does this. A message needs a doorbell when all three hold: no `out.jsonl` line answers it with `re`, the agent's newest live line is older than the message, and 20 minutes have passed since `t`.
+- **Doorbell:** the main session posts one line in the dot's own chat, which is the root's conversation. The line names the agent and the message id and asks the root to wake that agent to read its inbox, for example `[yomanchi-main → REV] yomanchi-26-android: mail m-20261123T001500Z-4f2a unread for 20+ min; wake it to run mail.py new.` The main session sends one doorbell per message. If the agent still has not read it, the main session takes it to the owner.
+- The root wakes that agent and nothing more. It does not read the mail aloud, summarize it or answer for the agent.
 
 ## Live records and the monitor
 
 - A `step` that concerns mail cites the message as evidence, for example `mail:yomanchi-26-android/m-20261123T001500Z-4f2a`. The [monitor](monitoring.md) treats that as `local`.
-- A `done` cites the `result` id and the full SHA. A SHA that exists only in the rev-out repository does not resolve on GitHub, so the monitor shows `UNPROVEN` until the main session has published that SHA. That is intended: nothing counts as proven before the main session has checked and published it. Do not cite a bare SHA in a `step` line before publication, because the monitor would mark it `UNPROVEN` too.
+- The agent records its own `done`, citing the accepting `answer` id and the published SHA. A SHA that exists only in the rev-out repository or a Mac mini workspace does not resolve on GitHub, so the monitor shows `UNPROVEN` for a `done` or `step` that cites it until the main session publishes it. That is intended: nothing counts as proven before the main session has checked and published it. Cite the mail id, not a bare SHA, until then. When `gh` is unavailable or the monitor runs with `--no-github`, an unchecked SHA reads as `unknown` and a `done` shows `DONE`; see [monitoring](monitoring.md).
 
 ## What this is not
 
-It is files and appends in the shared Osaka folder. It is not a broker, queue service, watcher, scheduler, hook or telemetry. It installs nothing and grants no permission.
+It is files and appends in the shared Osaka folder. It is not a broker, queue service, watcher, scheduler, hook or telemetry, and this repository installs nothing for it. The route itself grants nothing. The only grant is the owner's 2026-11-23 approval above.
