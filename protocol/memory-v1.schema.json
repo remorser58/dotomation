@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dots-superkit:memory-v1",
+  "title": "dots-superkit/memory-v1",
+  "description": "The whole content of memory/<DOT>/<agentId>.json on Osaka: one agent's current session memory, rewritten whole by that agent only, at the same moments it appends a live record. Shape only. It summarizes the agent's own state; it is not evidence that a gate passed, not a submission and not a closure. Who writes it, when and how readers use it are in workflows/session-memory.md. Exactly these fields, all required, no extras.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "t": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$",
+      "description": "RFC 3339 UTC time of this rewrite; the same t as the live record written with it."
+    },
+    "dot": {
+      "$ref": "#/$defs/token",
+      "description": "REM17 or REV18: the live/<DOT> folder the agent writes to."
+    },
+    "agent": {
+      "$ref": "#/$defs/token",
+      "description": "The same id as the agent's live records, roster slot and mail folder."
+    },
+    "project": {
+      "$ref": "#/$defs/line"
+    },
+    "task": {
+      "$ref": "#/$defs/line",
+      "description": "The approved task, the same value as the live record written with this memory."
+    },
+    "state": {
+      "enum": [
+        "start",
+        "step",
+        "blocked",
+        "done"
+      ],
+      "description": "The state of the live record written with this memory."
+    },
+    "host": {
+      "$ref": "#/$defs/line",
+      "description": "The host actually used, as in the live record."
+    },
+    "goal": {
+      "$ref": "#/$defs/short",
+      "description": "What the assignment is for, in the agent's words, within the coordinator's brief."
+    },
+    "doing": {
+      "$ref": "#/$defs/short",
+      "description": "What the agent is doing right now."
+    },
+    "next": {
+      "$ref": "#/$defs/short",
+      "description": "The next concrete step."
+    },
+    "decisions": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "Choices the agent made on this task, oldest first, newest 20 kept. A choice that belongs to the owner or the coordinator is not recorded here as decided.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "t",
+          "text"
+        ],
+        "properties": {
+          "t": {
+            "type": "string",
+            "minLength": 1,
+            "format": "date-time"
+          },
+          "text": {
+            "$ref": "#/$defs/item"
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "Open blockers, each naming the missing fact or capability. Empty when none. Non-empty whenever state is blocked.",
+      "items": {
+        "$ref": "#/$defs/item"
+      }
+    }
+  },
+  "required": [
+    "v",
+    "t",
+    "dot",
+    "agent",
+    "project",
+    "task",
+    "state",
+    "host",
+    "goal",
+    "doing",
+    "next",
+    "decisions",
+    "blockers"
+  ],
+  "if": {
+    "properties": {
+      "state": {
+        "const": "blocked"
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "blockers": {
+        "minItems": 1
+      }
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "line": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "short": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"
+    },
+    "item": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300,
+      "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"
+    }
+  }
+}
