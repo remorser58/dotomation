@@ -255,9 +255,18 @@ wake command ran.
 - **A path replaced by a folder.** Any name in that folder can be a directory instead of a file:
   `in.jsonl`, `out.jsonl`, `.agent-read`, a `listen/` marker, the ledger. Each one then reads as
   empty — no lines, no waiter, no record — and `watch`, `wait` and `reply` keep running rather than
-  dying on it; a read marker that cannot be written prints `dots: cannot mark … read (…)` once on
-  stderr and the mail stays unread. Nothing is repaired, and an unreadable mailbox hides its mail
+  dying on it, but not silently: a path that exists and cannot be read prints
+  `dots: cannot read <path> (…)` once on stderr (`treated as no lines`), while a missing file is the
+  normal case and stays quiet. A read marker that cannot be written prints
+  `dots: cannot mark … read (…)` once and the mail stays unread; a ledger that cannot be written
+  prints `dots: cannot write the ledger …` once and says `every run rings again until it is
+  writable`, which is the safe direction. A ledger record that is not an object is dropped, so that
+  run rings again instead of dying. Nothing is repaired, and an unreadable mailbox hides its mail
   from `watch` the same way a deleted line does.
+- **A line with no usable id.** An owed line whose `id` is missing or not a token can never be
+  woken or answered, and `board` still counts it as `MAIL_WAITING`; `watch` prints
+  `WATCH_ERROR {project} {agent} {id!r} unusable id` on every run instead of skipping it in silence.
+  Fix or delete the line.
 - **A forged listen marker.** A `listen/<agent>.<pid>.json` with a plausible `until` and a live local
   pid looks like a waiter and holds the wake back. It needs `until` inside the next 24 hours; compare
   `ps -p <pid>` with the agent's newest live line when a wait looks too convenient.

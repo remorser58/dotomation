@@ -167,10 +167,22 @@ def token(name, value):
         die(f"bad {name} {value!r}")
     return value
 
+READ_WARNED = set()
+
+def unreadable(path, exc):
+    """One stderr line per path that exists but cannot be read — a folder where a file belongs, a file
+    with no read permission. A missing file is the normal case and stays silent. The caller reads the
+    path as no lines either way, and the set keeps a once-a-second poll from repeating the line."""
+    if path in READ_WARNED:
+        return
+    READ_WARNED.add(path)
+    print(f"dots: cannot read {path} ({exc.__class__.__name__}); treated as no lines", file=sys.stderr)
+
 def jsonl(path):
     """Lines of one JSONL file, skipping any line that is not a JSON object. A path the root made
     unreadable — a folder where the file should be, a file with no read permission — reads as no
-    lines, never as a crash: every reader here runs on shapes the root can write."""
+    lines, never as a crash, and says so once on stderr: every reader here runs on shapes the root
+    can write, so a silent empty read would be a claim this tool cannot make."""
     out = []
     try:
         with open(path, encoding="utf-8") as fh:
@@ -181,8 +193,10 @@ def jsonl(path):
                     continue
                 if isinstance(obj, dict):
                     out.append(obj)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        unreadable(path, exc)
     return out
 
 def v1_lines(path):
@@ -205,14 +219,20 @@ def load_json(path):
         with open(path, encoding="utf-8") as fh:
             obj = json.load(fh)
         return obj if isinstance(obj, dict) else None
-    except (OSError, ValueError):
+    except (FileNotFoundError, ValueError):
+        return None
+    except OSError as exc:
+        unreadable(path, exc)
         return None
 
 def marker(path):
     try:
         with open(path, encoding="utf-8") as fh:
             return fh.read().strip() or None
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        unreadable(path, exc)
         return None
 
 def after(msgs, last):
@@ -989,10 +1009,14 @@ def state_path():
 
 def load_state(path):
     """The watchdog's own ledger: one record per message id, so a restart never rings twice. It is
-    the only thing that can silence a ring, so every suppression it causes is printed."""
+    the only thing that can silence a ring, so every suppression it causes is printed. A record that
+    is not an object — a list, a string, null — is dropped: nothing in it can be read, and dropping
+    it can only make a later run ring again."""
     st = load_json(path) or {}
     msgs = st.get("messages")
-    return {"v": 1, "messages": msgs if isinstance(msgs, dict) else {}}
+    clean = {k: v for k, v in (msgs.items() if isinstance(msgs, dict) else ())
+             if isinstance(k, str) and isinstance(v, dict)}
+    return {"v": 1, "messages": clean}
 
 def save_state(path, st, warn=None):
     """Write the ledger. A path the root made unwritable — a folder where `state.json` should be, a
@@ -1005,7 +1029,7 @@ def save_state(path, st, warn=None):
         if warn is not None and path not in warn:
             warn.add(path)
             print(f"dots: cannot write the ledger {path} ({exc.__class__.__name__}); "
-                  f"a restart may ring twice", file=sys.stderr)
+                  f"every run rings again until it is writable", file=sys.stderr)
 
 def owed_mail():
     """(project, agent, box, message) for every inbox line that still owes an answer, read from the
@@ -1056,6 +1080,9 @@ def watch_once(expected, wake, notify, delays, st_path, src):
     for project, agent, box, m in owed_mail():
         mid = m.get("id")
         if not isinstance(mid, str) or not TOKEN.match(mid):
+            # no id, no ledger record and no wake: say so rather than skip the line in silence,
+            # because board still counts this message as owed mail
+            print(f"WATCH_ERROR {project} {agent} {mid!r} unusable id", flush=True)
             continue
         seen.add(mid)
         rec = st["messages"].setdefault(mid, {})

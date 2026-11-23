@@ -1076,6 +1076,7 @@ class WatchTests(Base):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
         self.assertIn("cannot write the ledger", res.stderr)
+        self.assertIn("every run rings again until it is writable", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
         self.assertEqual(read(target).split(), [mid])
 
@@ -1094,6 +1095,49 @@ class WatchTests(Base):
         res = run(["watch"], self.base)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(f"WATCH_ERROR proj agent-1 {mid} no usable time", res.stdout)
+
+    def test_a_ledger_record_that_is_not_an_object_still_rings(self):
+        # the ledger is the root's to write too: a record that is a list, a string or null has nothing
+        # in it to read, and setdefault on one used to end the run with a traceback
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        ledger = os.path.join(self.base, "watch", "state.json")
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        d.write_atomic(ledger, json.dumps({"v": 1, "messages": {
+            mid: ["not", "a", "record"],
+            "m-20260101T000000Z-bbbb": "x",
+            "m-20260101T000000Z-cccc": None}}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)   # dropping a record re-rings
+        self.assertEqual(read(target).split(), [mid])
+        self.assertEqual(json.loads(read(ledger))["messages"][mid]["project"], "proj")
+
+    def test_an_unusable_id_in_owed_mail_is_reported_not_skipped(self):
+        # board counts this line as owed mail, so watch may not pass over it in silence
+        self.waiting_message(read=False)
+        d.append_line(os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl"),
+                      {"v": 1, "id": ["x"], "t": d.now(), "from": "proj-main", "to": "agent-1",
+                       "task": "issue 1", "kind": "task", "re": None, "text": "hand written", "refs": []})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_ERROR proj agent-1 ['x'] unusable id", res.stdout)
+
+    def test_a_mailbox_that_cannot_be_read_says_so(self):
+        # a chmod 000 inbox is not the same thing as a missing one: empty mail with no trace would be
+        # a claim the tool cannot make
+        self.waiting_message(read=False)
+        inbox = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        os.chmod(inbox, 0)
+        try:
+            res = run(["watch"], self.base)
+        finally:
+            os.chmod(inbox, 0o644)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"dots: cannot read {inbox} (PermissionError); treated as no lines", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
 class InitTests(Base):
     def setUp(self):
