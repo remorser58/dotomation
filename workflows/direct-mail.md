@@ -60,7 +60,7 @@ Direct mail is the addressed message and reply route that [direct exchanges](../
 ## Reading cadence and the doorbell
 
 - An agent reads its inbox whenever it appends a live record, which is at least every 15 minutes while working, and again before `done`. It answers every message it receives with a message carrying `re`, even if the answer is only an `ack`.
-- An idle agent cannot read. The main session checks its sent messages whenever it reads its own inbox. No watcher does this. A message needs a doorbell when all three hold: no `out.jsonl` line answers it with `re`, the agent's newest live line is older than the message, and 20 minutes have passed since `t`.
+- An idle agent cannot read. The main session checks its sent messages whenever it reads its own inbox. No watcher does this. A message needs a doorbell when all four hold: no `out.jsonl` line answers it with `re`, the agent's `.agent-read` marker has not reached it, the agent's newest live line is older than the message, and 20 minutes have passed since `t`. A message the agent has marked read but not yet answered gets no doorbell; the agent is already working from it.
 - **Doorbell:** the main session posts one line in the dot's own chat, which is the root's conversation. The line names the agent and the message id and asks the root to wake that agent to read its inbox, for example `[yomanchi-main → REV] yomanchi-26-android: mail m-20261123T001500Z-4f2a unread for 20+ min; wake it to run mail.py new.` The main session sends one doorbell per message. If the agent still has not read it, the main session takes it to the owner.
 - The root wakes that agent and nothing more. It does not read the mail aloud, summarize it or answer for the agent.
 
