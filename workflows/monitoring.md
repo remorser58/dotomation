@@ -34,7 +34,7 @@ Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mc
 | `QUIET` | Newest record is at most 30 minutes old and no tool request happened since it: the record says working, the account is not calling tools |
 | `STALLED` | Newest record is `start` or `step` and older than 30 minutes, per [live-status](live-status.md#when-to-append); also an agent with only off-format lines whose newest readable timestamp is older than 30 minutes, or that has no readable timestamp at all |
 | `BLOCKED` | Newest record is `blocked`; reported whatever its age |
-| `DONE` | Newest record is `done` and its evidence resolves, or GitHub could not be asked (`unknown`, also printed as `DOTS_ERROR github`). **Without `gh`, or with `--no-github`, every `done` shows as `DONE`**: read the `EVID` column, not the class |
+| `DONE` | Newest record is `done` and its evidence resolves, or GitHub could not be asked (`unknown`, also printed as `DOTS_ERROR github`). **Without `gh`, or with `--no-github`, every `done` that cites a SHA or URL shows as `DONE`; a `done` whose evidence is only a local label stays `UNPROVEN`**: read the `EVID` column, not the class |
 | `UNPROVEN` | A `done` whose evidence is missing, only a local label, `stale`, or cites something that does not exist; a `start` or `step` whose evidence is missing or does not exist. A local label on a `start` or `step` is not checked |
 | `LEGACY` | The agent has only off-format lines and the newest readable timestamp among them is at most 30 minutes old. Shown as unconfirmed, never rewritten, never counted as a step |
 | `NO_RECORD` | A roster slot with no live file |
@@ -42,6 +42,8 @@ Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mc
 The 30 minutes are `thresholds.stall_minutes` (or `--stall-minutes`); the legend under the table prints the value in use.
 
 `EVIDENCE` is one of `resolved` (the reference exists), `stale` (a cited pull-request head SHA is no longer that pull request's head or merge commit; a `done` on it is `UNPROVEN`), `local` (a bare label such as `MATCH-CHECK`, not checkable), `unresolved` (GitHub says it does not exist), `unknown` (not checked: no `gh`, network failure, or the lookup budget ran out), or `missing`.
+
+On a [direct mail](direct-mail.md) task, a `done` or `step` that cites a SHA not yet published to GitHub is `UNPROVEN` by design until the main session publishes it. For that window, read the agent's newest `result` and the main session's `review` or `answer` in `mail/<agentId>/` to tell a pending handover from bad evidence.
 
 ## What the activity counts do and do not prove
 
