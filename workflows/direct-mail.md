@@ -31,7 +31,7 @@ A Dots agent reads and appends these files through the approved route to `local`
 | `from`, `to` | The main session's name and the agent id. One real recipient per message. |
 | `task` | The approved task, the same value the agent's live records use. |
 | `kind` | Main session to agent: `task`, `question`, `answer`, `review`, `note`. Agent to main session: `ack`, `answer`, `question`, `result`, `block`, `note`. |
-| `re` | The `id` of the message this answers, or `null`. Every message an agent sends carries `re`. A new question from the agent uses the last message it received. |
+| `re` | The `id` of the message this answers, or `null`. Every `ack`, `answer` and `note` from an agent carries `re`, because it answers something; a first `result`, `question` or `block` may carry `null` when its `refs` say what it is about. A new question from the agent uses the last message it received. |
 | `text` | Plain text. No secrets, credentials, tokens, personal identifiers or raw logs. |
 | `refs` | Exact references: a `rev/*` branch, a full commit SHA, `local:<workspace path>`, a path, a link, `gate:<ID>`, or `supersedes:<message id>`. |
 
@@ -66,13 +66,34 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 | Main session | `dots.py send <project> <agentId> <kind> <task> [--re ID] [--ref R]...` — text on stdin; `--re` names a message in `in.jsonl` or an agent reply in `out.jsonl`; prints the message id, then the agent's listening status |
 | Main session | `dots.py inbox [project] [agentId]` — agent replies not yet marked read; `dots.py read <project> <agentId> <id>` marks them read |
 | Agent | `dots.py wait <DOT> <agentId> [--timeout SECONDS]` — default 3300 seconds (55 minutes) |
-| Agent | `dots.py reply <project> <agentId> <kind> <task> --re ID [--ref R]...` — text on stdin |
+| Agent | `dots.py reply <project> <agentId> <kind> <task> [--re ID] [--ref R]... [--dot DOT] [--timeout S] [--no-wait]` — text on stdin. A `result`, `question` or `block` stays open and prints the answer; `--no-wait` returns as soon as the line is written |
 
 `send` writes one [mail-v1](../protocol/mail-v1.schema.json) line into `in.jsonl` and `reply` one into `out.jsonl`, exactly as a hand-written line does, so `mail.py` or any reader of the schema reads them unchanged. `from` is the project's main-session id from `dots.json` (`<project>-main` when the config names none). `--re` accepts an id from either file, because the review and answer legs of this route answer the agent's own `result`, which is a line in `out.jsonl`. Delivery then depends on what the agent is doing:
+
+A `result`, `question` or `block` is the last thing an agent says before it has nothing to do, so
+`reply` does not return after writing the line: it continues into the same blocking loop `wait`
+runs, and the main session's `answer` or `review` is printed as that command's own output. The
+agent therefore never ends its turn with an answer sitting unread — the case that once left a
+review waiting hours — and the answer costs no extra call, because the agent's own session was
+already polling that command. `--no-wait` writes the line and returns at once, for an agent that
+must hand over and stop. `ack`, `answer` and `note` never wait: they answer something and the agent
+goes on working.
+
+A first `result` often answers work the dot root gave, which is not a mail line, so `re` is `null`
+there and at least one `--ref` says what the result is about. `--re` stays required for `ack`,
+`answer` and `note`, and every line the tool writes is checked against
+[mail-v1](../protocol/mail-v1.schema.json) before it is appended.
 
 1. **The agent is in `wait`.** The line is printed the moment it lands — typically within a second — and `wait` exits 0. This is the only near-real-time path, and it is what steering means here: the agent is holding one tool call open, so an instruction reaches it mid-task instead of at the end of a step.
 2. **The agent is working.** It sees the line at the top of its next `tick`, printed before the live line under a `MAIL_FIRST ... handle these before your next step` header. A working agent ticks at each material step and at least every 15 minutes, so that is the worst case while it is working.
 3. **The agent is idle.** Nothing reads the file until it runs a command again. `send` prints `LISTENING` with the waiting process, or `NOT_LISTENING last_tick=<age>`. When it is not listening and `dots.json` holds a wake command, `send` runs that command once, prints its exit code, and does not retry. Otherwise it prints the manual doorbell below.
+
+The main session does not have to guess which agents are stuck: `dots.py board` flags
+`MAIL_WAITING` on an agent whose inbox holds a message that still owes an answer while no `wait`
+marker of that agent is alive, and prints the count and the age of the oldest. `MAIL-UNANSWERED` is
+the same mail without that second condition. Both are read from the files; see
+[If the dot root is not trusted](#if-the-dot-root-is-not-trusted) for what the board does with the
+roster.
 
 The wake command is whatever the instance already has to post one line into that dot's chat: an argv list, no shell, `{project}`, `{agent}`, `{id}` and `{dot}` substituted. It is not part of this kit and the kit cannot check that it exists.
 
@@ -93,13 +114,25 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 | `projects` | `id`, plus `main`, the session id that appears as `from` in that project's `in.jsonl`. |
 | `hosts` | `label`, the value a live record's `host` uses, plus what that host is for. `vm` and `local` are always there; `init --host` adds the user's own ([hosts](hosts.md#placement-the-vm-first-then-the-one-local-machine)). |
 | `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
+| `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake did not get the message read. |
+| `watch` | `after_min` (default 10) and `notify_after_min` (default 20), the two delays `watch` uses. Integers, 0 or more; anything else is ignored and the default stays. |
 
 `init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`; there is no other environment variable, and `init` resolves the same folder as every other command. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
 ## Reading cadence and the doorbell
 
 - An agent reads its inbox whenever it appends a live record, which is at least every 15 minutes while working, and again before `done`; `dots.py tick` prints the unread and the read-but-unanswered messages in the same call, unread first. It answers every message it receives with a message carrying `re`, even if the answer is only an `ack`. Before sending a `task` or `review`, the main session reads the agent's session memory, so it does not ask what the memory already answers.
+- `dots.py tick <DOT> <agentId> done` is refused with exit 2 and nothing written while a `task`,
+  `question` or `review` in the inbox has no `out.jsonl` line answering it, and the refusal names
+  each id and prints the exact `reply` command. An agent that has just submitted a review it never
+  answered cannot leave the turn quietly.
 - An agent that is neither in `wait` nor ticking cannot read. The main session checks its sent messages whenever it reads its own inbox. No watcher does this. A message needs a doorbell when all four hold: no `out.jsonl` line answers it with `re`, the agent's `.agent-read` marker has not reached it, the agent's newest live line is older than the message, and 20 minutes have passed since `t`. A message the agent has marked read but not yet answered gets no doorbell; the agent is already working from it. That includes a message `wait` printed: `wait` marks it read the moment it prints it, before the agent acts, so if that agent's session then dies the main session rings no doorbell for it. The 30-minute stall rule in [live status](live-status.md#when-to-append) is what finds that agent, the coordinator checks it directly, and `tick` prints the message again as `MAIL_UNANSWERED` when the agent comes back.
+- The board is the other half of that rule: `dots.py board` flags `MAIL_WAITING` on an agent that
+  owes an answer while no `wait` marker is alive, which is exactly the case the doorbell rule leaves
+  alone — a message a `wait` printed and marked read, whose process then died. Read the flag as "a
+  person has to look", not as "a doorbell is owed": the doorbell goes to a root that may not act,
+  and `dots.py watch` is the fallback that runs a wake and then a notify without waiting for the
+  root to notice.
 - **Doorbell:** the main session posts one line in the dot's own chat, which is the root's conversation. The line names the agent and the message id and asks the root to wake that agent to read its inbox, for example `[<project>-main → <DOT>] <agentId>: mail m-20261123T001500Z-4f2a unread for 20+ min; wake it to read its inbox (dots.py wait <DOT> <agentId>).` The main session sends one doorbell per message. If the agent still has not read it, the main session takes it to the owner.
 - The root wakes that agent and nothing more. It does not read the mail aloud, summarize it or answer for the agent.
 
@@ -109,6 +142,69 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 - The agent appends `done` when it sends its `result`, as [live status](live-status.md#when-to-append) defines: the output is submitted. That `done` cites the `result` id as `mail:<agentId>/<message id>`, not a bare SHA. The agent then waits; the main session's `review` or `answer` reaches it at its next inbox read or through the doorbell. A `review` with a FAIL reopens the work: the agent appends `step` and later a new `result` and `done`. An accepting `answer` gets one more `done` that cites the `answer` id and the published SHA.
 - A SHA that exists only in the outgoing repository or a workspace does not resolve on GitHub, so the monitor shows `UNPROVEN` for a line that cites it bare until the main session publishes it. That is intended: nothing counts as proven before the main session has checked and published it. A `done` that cites only the mail id reads as `local`, which the monitor also shows as `UNPROVEN`; read `mail/<agentId>/` to tell a pending handover from bad evidence. When `gh` is unavailable or the monitor runs with `--no-github`, an unchecked SHA reads as `unknown` and a `done` shows `DONE`; see [monitoring](monitoring.md).
 
+## If the dot root is not trusted
+
+The dot root is an agent too: it can forget a rule, never paste the brief, misreport the roster, fail
+to wake an agent, or edit the shared folder. Nothing here assumes otherwise. What the tool enforces
+from the files alone:
+
+- **The rules reach the agent without the root.** The first `dots.py` command an agent runs while it
+  has no memory file — `tick`, `reply` or `wait` — prints the agent rules ahead of that command's own
+  output, and `init` prints the same block in the brief. A root that never pastes the brief costs the
+  agent nothing.
+- **An agent cannot go quiet while it owes an answer.** `dots.py tick <DOT> <agentId> done` is
+  refused with exit 2 and nothing written while an inbox line of kind `task`, `question` or `review`
+  has no `out.jsonl` line answering it with `re`. The refusal names each id and prints the exact
+  `reply` command, and that reply stays open and prints the answer, so the way out of the refusal is
+  also the way to keep the turn alive.
+- **Flags come from evidence, not from the roster.** `board` derives `MAIL_WAITING`,
+  `MAIL-UNANSWERED` and `CLAIM-STALE` from the mail folders, the live lines and the listen markers.
+  The roster value is printed as `roster=<state> (the root's claim)`, and `CLAIM-STALE` with its
+  `claim:` line says why that claim contradicts what the agent itself wrote: a `done` or `blocked`
+  line with a message at or after it still unanswered, or a roster `done`/`idle` while the agent's
+  own newest line is `start`/`step`.
+- **The owner can run the watchdog.** `dots.py watch [--loop MINUTES] [--expect-sha256 HEX]` reads
+  the mail folders only. For every message that owes an answer and whose agent holds no wait, it runs
+  the configured `wake` once after `watch.after_min` minutes; if the message is still unread
+  `watch.notify_after_min` minutes after that wake, it runs `notify` once. Its ledger lives in
+  `<base>/watch/state.json`, so a restart never rings twice, and it prints one `WATCH_WAKE`,
+  `WATCH_NOTIFY`, `WATCH_RESOLVED`, `WATCH_TOOL_CHANGED` or `WATCH_ERROR` line per action. `--loop 0`
+  (the default) runs once; a loop sleeps between runs and ends on `SIGTERM`, `SIGHUP` or `SIGINT`. It
+  makes no network and no model call: `wake` and `notify` are argv lists the owner configures, for
+  example `dots.py init --wake-cmd '["ssh","local","dots-post","{project}","{agent}","{id}"]'
+  --notify-cmd '["notify-send","{agent}","{id}","{age}"]'`.
+
+**What it only detects.** The tool cannot make the root honest. A line the root writes looks exactly
+like one an agent wrote, because `from` is a string and nothing signs it. A roster entry is a claim,
+so `board` reports it next to the evidence instead of trusting it. A message that never gets an
+answer stays visible as `MAIL_WAITING`, but nothing in this kit can answer it for the agent.
+
+**The hard limit.** Only the root can restart a sub-agent whose turn has ended. A sub-agent's
+conversation cannot be reopened from outside Dots: the app-server lists no conversation for one, and
+the root's own conversation answers 404. So the last step is always a message to the root, or the
+owner. `watch` says so plainly — `WATCH_ERROR no wake command in dots.json` when nothing is
+configured, `WATCH_NOTIFY` when a wake did not get the mail read — and hands the owner the ids to act
+on. `watch` never claims an agent was woken when no wake command ran.
+
+**Residual risks.**
+
+- **A forged line.** The root can append a plausible `result` or a `done` on an agent's behalf. Read
+  `refs`: a `rev/*` branch and a full SHA the main session can resolve, or a `local:` path it can
+  open, are the only things that make a `result` worth checking, and the live-line history shows
+  whether the steps that lead to it happened.
+- **A swapped tool.** The shared folder is writable by the root, so a `dots.py` kept inside it can be
+  replaced. Keep the tool outside the shared folder and pass `--expect-sha256` with the hash pinned in
+  the root's brief; `WATCH_TOOL_CHANGED expected=… actual=… path=…` prints as soon as the bytes differ.
+- **A deleted message reads as answered.** The ledger knows an id, not the line: a message the root
+  deletes from `in.jsonl` disappears from `watch`'s list and is reported `WATCH_RESOLVED`. Compare the
+  count with `inbox` before believing a resolution you did not cause.
+- **Printed rules are text.** An agent's model can still ignore them. The enforcement with teeth is
+  the `done` refusal and the flags, not the paragraph.
+
 ## What this is not
 
-It is files and appends in the shared folder on `local`, plus one foreground command an agent or the user starts and that ends by itself. It is not a broker, queue service, watcher, scheduler, hook, daemon or telemetry, and this repository installs nothing for it. The route itself grants nothing. The only grant is the owner's approval for that project.
+It is files and appends in the shared folder on `local`, plus one foreground command an agent or the
+user starts and that ends by itself; `watch` is that command too, and its `--loop` is a delay the
+owner chooses, not a service. It is not a broker, queue service, watcher, scheduler, hook, daemon or
+telemetry, and this repository installs nothing for it. The route itself grants nothing. The only
+grant is the owner's approval for that project.

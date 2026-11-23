@@ -6,6 +6,7 @@ No network and no ssh: every case uses a temporary base folder and a bounded tim
 """
 
 import glob
+import hashlib
 import io
 import json
 import os
@@ -44,7 +45,7 @@ def run(args, base, stdin=None, timeout=20):
 
 def spawn(args, base):
     env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.Popen([sys.executable, SCRIPT] + list(args), env=env,
+    return subprocess.Popen([sys.executable, SCRIPT] + list(args), env=env, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -446,9 +447,9 @@ class MailTests(Base):
     def test_send_answers_an_agent_result_id(self):
         mid = self.send(text="do the fix")
         self.assertEqual(self.tick("--took", mid).returncode, 0)
-        res = run(["reply", "proj", "agent-1", "result", "issue 1", "--re", mid], self.base,
+        res = run(["reply", "proj", "agent-1", "result", "issue 1", "--re", mid, "--no-wait"], self.base,
                   stdin="done, rev/x-20261123")
-        result_id = res.stdout.strip()
+        result_id = res.stdout.splitlines()[0]
         self.assertRegex(result_id, ID_RE)
         # the review and answer legs of direct mail answer the agent's own result, in out.jsonl
         review = run(["send", "proj", "agent-1", "review", "issue 1", "--re", result_id,
@@ -483,6 +484,293 @@ class MailTests(Base):
         self.assertNotEqual(ids[1], fixed)  # the second line drew another id instead of colliding
         # a duplicate already on disk cannot hold the read marker: after() resolves to the last one
         self.assertEqual(d.after([{"id": "a"}, {"id": "a"}, {"id": "b"}], "a"), [{"id": "b"}])
+
+
+def board_rows(base):
+    res = run(["board", "--json"], base)
+    assert res.returncode == 0, res.stderr
+    return {r["agent"]: r for r in json.loads(res.stdout)["agents"]}
+
+
+class RulesTests(Base):
+    """The dot root may never paste the brief, so the tool repeats the rules by itself."""
+
+    def test_the_first_agent_command_prints_the_rules_before_its_output(self):
+        res = self.tick()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("AGENT_RULES", res.stdout)
+        self.assertLess(res.stdout.index("AGENT_RULES"), res.stdout.index("LIVE "))
+        again = self.tick(state="step")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("AGENT_RULES", again.stdout)   # once, not on every command
+
+    def test_a_first_wait_prints_the_rules_too(self):
+        mid = self.send()
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "5"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("AGENT_RULES", res.stdout)
+        self.assertLess(res.stdout.index("AGENT_RULES"), res.stdout.index(mid))
+
+    def test_the_main_session_commands_never_print_the_rules(self):
+        self.send()
+        for args in (["board"], ["inbox"], ["memo", "DOT-A", "agent-1"]):
+            self.assertNotIn("AGENT_RULES", run(args, self.base).stdout, args)
+
+
+class ReplyWaitTests(Base):
+    """reply result|question|block stays open, so the answer is that command's output."""
+
+    def start_reply(self, *args, agent="agent-1", body="done, rev/x-20261123"):
+        p = spawn(["reply", "proj", agent, *args], self.base)
+        p.stdin.write(body)
+        p.stdin.close()
+        self.procs.append(p)
+        return p
+
+    def test_a_result_waits_and_prints_the_answer(self):
+        mid = self.send(text="fix it")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)
+        p = self.start_reply("result", "issue 1", "--re", mid, "--timeout", "30")
+        self.assertTrue(wait_for(lambda: marker_files(self.base), 5.0), "reply never opened a wait marker")
+        out_path = os.path.join(self.base, "proj", "mail", "agent-1", "out.jsonl")
+        result = lines(out_path)[0]   # written before the wait, so the id is here
+        rid = result["id"]
+        answer = run(["send", "proj", "agent-1", "answer", "issue 1", "--re", rid], self.base,
+                     stdin="all gates PASS")
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        aid = answer.stdout.splitlines()[0]
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(out.splitlines()[0], rid)   # the id is still the first line
+        self.assertIn("REPLY waiting for the answer", out)
+        self.assertIn("do not end the turn", out)
+        self.assertIn(aid, out)   # the answer is this command's output
+        self.assertIn("all gates PASS", out)
+        self.assertEqual(marker_files(self.base), [])
+        self.assertEqual((result["kind"], result["re"]), ("result", mid))
+
+    def test_a_result_that_gets_no_answer_exits_three_and_leaves_no_marker(self):
+        p = self.start_reply("result", "issue 1", "--ref", "rev/x", "--dot", "DOT-A", "--timeout", "1")
+        out, err = p.communicate(timeout=20)
+        self.assertEqual(p.returncode, 3, out + err)   # not 0: no answer arrived
+        self.assertIn("WAIT timeout", out)
+        self.assertEqual(marker_files(self.base), [])
+
+    def test_no_wait_returns_at_once(self):
+        started = time.monotonic()
+        res = run(["reply", "proj", "agent-1", "result", "issue 1", "--ref", "rev/x", "--no-wait"],
+                  self.base, stdin="done")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertNotIn("WAIT listening", res.stdout)
+        self.assertEqual(marker_files(self.base), [])
+        self.assertEqual(len(lines(os.path.join(self.base, "proj", "mail", "agent-1", "out.jsonl"))), 1)
+
+    def test_ack_answer_and_note_never_block(self):
+        mid = self.send()
+        for kind in ("ack", "answer", "note"):
+            started = time.monotonic()
+            res = run(["reply", "proj", "agent-1", kind, "issue 1", "--re", mid], self.base, stdin="ok")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertLess(time.monotonic() - started, 5.0, kind)
+            self.assertNotIn("WAIT listening", res.stdout, kind)
+        self.assertEqual(marker_files(self.base), [])
+
+    def test_a_first_result_without_re_is_schema_valid(self):
+        # a result for work the dot root gave answers no mail line: re is null and a ref says what it is
+        res = run(["reply", "proj", "agent-2", "result", "issue 1", "--ref", "rev/x-20261123", "--no-wait"],
+                  self.base, stdin="done")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        msg = lines(os.path.join(self.base, "proj", "mail", "agent-2", "out.jsonl"))[0]
+        self.assertEqual(set(msg), MAIL_KEYS)
+        self.assertIsNone(msg["re"])
+        self.assertEqual(msg["refs"], ["rev/x-20261123"])
+        self.assertEqual(msg["kind"], "result")
+
+    def test_a_refused_reply_writes_nothing(self):
+        out = os.path.join(self.base, "proj", "mail", "agent-1", "out.jsonl")
+        self.assertEqual(run(["reply", "proj", "agent-1", "result", "issue 1"], self.base,
+                             stdin="x").returncode, 2)        # no --re and no --ref
+        self.assertEqual(run(["reply", "proj", "agent-1", "ack", "issue 1"], self.base,
+                             stdin="x").returncode, 2)        # ack needs --re
+        self.assertEqual(run(["reply", "proj", "agent-1", "result", "issue 1", "--re",
+                              "m-20260101T000000Z-0000"], self.base, stdin="x").returncode, 2)
+        self.assertFalse(os.path.exists(out))
+
+    def test_done_is_refused_while_an_answer_is_owed(self):
+        mid = self.send(kind="review", text="G1 FAIL: see the log")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)   # read, still unanswered
+        live = os.path.join(self.base, "live", "DOT-A", "agent-1.jsonl")
+        before = read(live)
+        res = run(["tick", "DOT-A", "agent-1", "done"] + list(TICK) + list(FIRST), self.base)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("done refused", res.stderr)
+        self.assertIn(mid, res.stderr)
+        self.assertIn("reply proj agent-1 result", res.stderr)
+        self.assertEqual(read(live), before)   # nothing was written
+        # answering the review is the way out, and then done is allowed
+        self.assertEqual(run(["reply", "proj", "agent-1", "ack", "issue 1", "--re", mid], self.base,
+                             stdin="fixed").returncode, 0)
+        done = run(["tick", "DOT-A", "agent-1", "done"] + list(TICK) + list(FIRST), self.base)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class BoardEvidenceTests(Base):
+    """Every flag comes from a line an agent or the main session wrote, never from the roster."""
+
+    def test_mail_read_but_unanswered_on_a_silent_agent_is_flagged(self):
+        mid = self.send(kind="review", text="G1 FAIL: see the log")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)   # an abandoned wait leaves this state
+        row = board_rows(self.base)["agent-1"]
+        self.assertIn("MAIL_WAITING", row["flags"])
+        self.assertEqual(row["mail"]["waiting"], 1)
+        self.assertEqual(row["mail"]["unanswered"], 1)
+        text = run(["board"], self.base).stdout
+        self.assertIn("MAIL_WAITING", text)
+        self.assertIn("1 waiting", text)
+
+    def test_an_answered_message_is_not_flagged(self):
+        self.assertEqual(self.tick().returncode, 0)   # the agent's own live line puts it on the board
+        mid = self.send(kind="review", text="G1 FAIL")
+        self.assertEqual(run(["reply", "proj", "agent-1", "ack", "issue 1", "--re", mid], self.base,
+                             stdin="fixed").returncode, 0)
+        row = board_rows(self.base)["agent-1"]
+        self.assertNotIn("MAIL_WAITING", row["flags"])
+        self.assertEqual(row["mail"]["waiting"], 0)
+
+    def test_a_listening_agent_is_not_flagged(self):
+        mid = self.send(kind="review", text="G1 FAIL")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)
+        p = self.start_wait()
+        try:
+            self.assertNotIn("MAIL_WAITING", board_rows(self.base)["agent-1"]["flags"])
+        finally:
+            p.send_signal(signal.SIGTERM)
+            p.communicate(timeout=10)
+
+    def test_a_done_line_with_newer_mail_is_a_stale_claim(self):
+        self.assertEqual(self.tick(state="done").returncode, 0)   # nothing owed yet
+        self.send(kind="task", text="keep going")
+        row = board_rows(self.base)["agent-1"]
+        self.assertIn("CLAIM-STALE", row["flags"])
+        self.assertIn("done", row["claim_stale"])
+        self.assertIn("claim:", run(["board"], self.base).stdout)
+
+    def test_a_roster_claim_of_done_is_shown_as_the_roots_claim(self):
+        self.assertEqual(self.tick().returncode, 0)   # the agent's own line says start
+        d.write_atomic(os.path.join(self.base, "live", "DOT-A", "roster.json"),
+                       json.dumps({"slots": [{"agent": "agent-1", "state": "done"}]}) + "\n")
+        row = board_rows(self.base)["agent-1"]
+        self.assertEqual(row["roster"], "done")   # the root's word, reported as such
+        self.assertIn("CLAIM-STALE", row["flags"])
+        self.assertIn("roster claims done", row["claim_stale"])
+        self.assertIn("(the root's claim)", run(["board"], self.base).stdout)
+
+
+class WatchTests(Base):
+    """The watchdog runs outside the dot and reads only mail, live lines and listen markers."""
+
+    def config_with(self, **kw):
+        path = os.path.join(self.base, "dots.json")
+        cfg = d.load_json(path)
+        cfg.update(kw)
+        d.write_atomic(path, json.dumps(cfg, indent=1) + "\n")
+
+    def recorder(self, name, placeholders=("{id}",)):
+        """An argv that appends one line of its substituted arguments to a file in the base."""
+        target = os.path.join(self.base, name)
+        code = ("import pathlib, sys;"
+                "pathlib.Path(sys.argv[1]).open('a').write(' '.join(sys.argv[2:]) + chr(10))")
+        return target, [sys.executable, "-c", code, target, *placeholders]
+
+    def waiting_message(self, read=True, agent="agent-1", kind="review"):
+        mid = self.send(kind=kind, text="G1 FAIL: see the log", agent=agent)
+        if read:
+            self.assertEqual(self.tick("--took", mid, agent=agent).returncode, 0)
+        return mid
+
+    def test_a_wake_runs_once_for_a_message_nobody_answered(self):
+        mid = self.waiting_message(read=False)
+        target, argv = self.recorder("wake.txt")
+        self.config_with(wake=argv, watch={"after_min": 0, "notify_after_min": 100})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        self.assertIn("exit=0", res.stdout)
+        self.assertEqual(read(target).split(), [mid])
+        again = run(["watch"], self.base)
+        self.assertNotIn("WATCH_WAKE", again.stdout)
+        self.assertEqual(read(target).split(), [mid])   # its ledger kept a restart from ringing twice
+        self.assertEqual(marker_files(self.base), [])   # the watchdog never claims to be a waiter
+
+    def test_a_message_younger_than_the_threshold_is_not_woken(self):
+        self.waiting_message(read=False)
+        target, argv = self.recorder("wake.txt")
+        self.config_with(wake=argv)   # the default after_min is 10 minutes
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("WATCH_WAKE", res.stdout)
+        self.assertFalse(os.path.exists(target))
+
+    def test_a_notify_runs_once_when_the_wake_was_not_read(self):
+        mid = self.waiting_message(read=False)
+        _, wake = self.recorder("wake.txt")
+        target, notify = self.recorder("notify.txt", ("{id}", "{age}"))
+        self.config_with(wake=wake, notify=notify, watch={"after_min": 0, "notify_after_min": 0})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_WAKE", res.stdout)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", res.stdout)
+        self.assertEqual(read(target).split()[0], mid)   # {age} was substituted too
+        self.assertEqual(len(read(target).split()), 2)
+        again = run(["watch"], self.base)
+        self.assertNotIn("WATCH_NOTIFY", again.stdout)
+        self.assertEqual(len(read(target).strip().splitlines()), 1)
+
+    def test_an_answered_message_is_reported_resolved_once(self):
+        mid = self.waiting_message(read=False)
+        _, argv = self.recorder("wake.txt")
+        self.config_with(wake=argv, watch={"after_min": 0, "notify_after_min": 100})
+        self.assertIn("WATCH_WAKE", run(["watch"], self.base).stdout)
+        self.assertEqual(run(["reply", "proj", "agent-1", "ack", "issue 1", "--re", mid], self.base,
+                             stdin="fixed").returncode, 0)
+        res = run(["watch"], self.base)
+        self.assertIn(f"WATCH_RESOLVED proj agent-1 {mid}", res.stdout)
+        self.assertEqual(run(["watch"], self.base).stdout.strip(), "")
+        self.assertEqual(d.load_json(os.path.join(self.base, "watch", "state.json"))["messages"], {})
+
+    def test_a_listening_agent_is_not_woken(self):
+        self.waiting_message(read=True)   # read, so the waiter has nothing to print
+        target, argv = self.recorder("wake.txt")
+        self.config_with(wake=argv, watch={"after_min": 0, "notify_after_min": 100})
+        p = self.start_wait()
+        try:
+            res = run(["watch"], self.base)
+            self.assertNotIn("WATCH_WAKE", res.stdout)
+            self.assertFalse(os.path.exists(target))
+        finally:
+            p.send_signal(signal.SIGTERM)
+            p.communicate(timeout=10)
+
+    def test_the_expected_hash_catches_a_swapped_tool(self):
+        res = run(["watch", "--expect-sha256", "0" * 64], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_TOOL_CHANGED", res.stdout)
+        real = hashlib.sha256(read(SCRIPT).encode()).hexdigest()
+        res = run(["watch", "--expect-sha256", real], self.base)
+        self.assertNotIn("WATCH_TOOL_CHANGED", res.stdout)
+
+    def test_a_missing_wake_command_is_reported_once(self):
+        self.waiting_message(read=False)
+        self.config_with(watch={"after_min": 0})
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_ERROR no wake command", res.stdout)
+        self.assertEqual(res.stdout.count("WATCH_ERROR"), 1)
+
+    def test_a_bad_loop_or_hash_is_refused(self):
+        self.assertEqual(run(["watch", "--loop", "-1"], self.base).returncode, 2)
+        self.assertEqual(run(["watch", "--expect-sha256", "abc"], self.base).returncode, 2)
 
 
 

@@ -26,6 +26,16 @@ Agent with no assigned work (the steering receiver; it does not end its turn):
       printed read, so the same message is not delivered twice. Exits 3 on timeout, 4 when a
       signal ends it. Holds listen/<agent>.<pid>.json while blocking.
 
+Agent handing work back (the reply that holds the answer open):
+  dots.py reply <project> <agent> <ack|answer|question|result|block|note> <task> [--re ID]
+      [--ref R]... [--dot DOT] [--timeout SECONDS] [--no-wait]   text on stdin
+      Prints the id. For a result, question or block it then stays in the same loop `wait` runs,
+      so the main session's answer is printed as this command's output; exit 0 mail, 3 timeout,
+      4 signal. `--no-wait` returns at once (the exception: when the answer cannot arrive in
+      this turn). ack, answer and note return at once. `--re` may be left out only for those
+      three kinds, when the message answers no mail line (a first result for work the dot root
+      gave); at least one --ref is then required. Nothing is written when an input is refused.
+
 Main session outside Dots:
   dots.py send <project> <agent> <kind> <task> [--re ID] [--ref R]...  text on stdin
       Prints the id, then LISTENING or NOT_LISTENING last_tick=<age>; when not listening it runs
@@ -34,12 +44,23 @@ Main session outside Dots:
   dots.py read <project> <agent> <id> mark replies up to that id read
 
 Readers (read-only):
-  dots.py board [DOT...] [--json]   each agent: newest line, age, doing, next, blockers, mail, flags
+  dots.py board [DOT...] [--json]   each agent: newest line, age, doing, next, blockers, mail,
+      flags; MAIL_WAITING marks mail that owes an answer while no wait is open on that agent
   dots.py memo <DOT> <agent>        that agent's memory and its last 3 live lines
+
+Owner side (the dot root is not trusted):
+  dots.py watch [--loop MINUTES] [--expect-sha256 HEX]   --loop 0 (the default) runs once
+      For every inbox line that still owes an answer and whose agent holds no wait: after
+      `watch.after_min` minutes (dots.json, default 10) run the configured `wake` argv once; if it
+      is still unread and unanswered `watch.notify_after_min` minutes (default 20) later, run
+      `notify` once. Its ledger is <base>/watch/state.json, so a restart never rings twice, and it
+      prints one WATCH_WAKE, WATCH_NOTIFY, WATCH_RESOLVED, WATCH_TOOL_CHANGED or WATCH_ERROR line
+      per action. --expect-sha256 compares this file's own bytes each run: the shared folder is
+      writable by the dot root, the command line is not.
 
 Setup (once per machine; idempotent, adds only):
   dots.py init [--base DIR] [--dot ID]... [--project ID=MAIN]... [--host LABEL=PURPOSE]...
-      [--wake-cmd ARGV-JSON] [--yes]
+      [--wake-cmd ARGV-JSON] [--notify-cmd ARGV-JSON] [--yes]
       Interactive when stdin is a terminal, scriptable with the flags otherwise. Writes
       <base>/dots.json, live/<DOT>/, memory/<DOT>/ and <project>/mail/, then prints the brief
       to paste to each dot root. Never deletes or rewrites an existing record or entry.
@@ -50,7 +71,7 @@ another one for this machine and prints the export line to set, because later co
 read the environment first. Every command works without dots.json: the dot and the project are
 read from the folders that exist.
 """
-import argparse, contextlib, datetime, fcntl, glob, json, os, re, secrets, signal, socket, subprocess, sys, time
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, subprocess, sys, time
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -66,7 +87,12 @@ FIELDS = ("t", "agent", "role", "model", "project", "task", "state", "host", "no
 MAIL_FIELDS = ("v", "id", "t", "from", "to", "task", "kind", "re", "text", "refs")
 TO_AGENT = ("task", "question", "answer", "review", "note")
 TO_MAIN = ("ack", "answer", "question", "result", "block", "note")
+NEEDS_ANSWER = ("task", "question", "review")   # an inbox kind that owes an out.jsonl line with re=id
+REPLY_WAITS = ("result", "question", "block")   # an agent's reply that keeps the command open for the answer
 STALL_MIN = 30
+WATCH_DEFAULTS = {"after_min": 10, "notify_after_min": 20}   # dots.json "watch": {...} overrides
+ROSTER_DONE = ("done", "idle", "free", "closed", "finished")  # a claim the live line can disprove
+PLACEHOLDER = re.compile(r"\{(project|agent|id|dot|age)\}")
 MAX_TEXT = 500      # goal, doing, next
 MAX_ITEM = 300      # one decision or blocker
 MAX_DECISIONS = 20  # newest kept; the full history is the live log
@@ -200,6 +226,14 @@ def unread_all(agent):
     """(box, project, message) for every unread line in every mailbox of that agent id."""
     return [(box, project_of(box), m) for box in mailboxes(agent) for m in mail_state(box)["new"]]
 
+def waiting_on(box):
+    """Inbox lines that still owe an answer: kind task, question or review with no out.jsonl line
+    whose `re` is that id. Read state is deliberately ignored — a wait whose session was abandoned
+    marks mail read without anyone handling it, so the answer is still owed."""
+    answered = {m.get("re") for m in jsonl(os.path.join(box, "out.jsonl"))}
+    return [m for m in jsonl(os.path.join(box, "in.jsonl"))
+            if m.get("kind") in NEEDS_ANSWER and m.get("id") not in answered]
+
 def write_atomic(path, data):
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -294,6 +328,20 @@ def tick_locked(a, dot, agent, live_dir):
     mem["blockers"] = blockers
 
     boxes = mailboxes(agent)
+    if line["state"] == "done":
+        owed = [(project_of(box), m) for box in boxes for m in waiting_on(box)]
+        if owed:
+            out = [f"dots: done refused: {agent} still owes an answer to {len(owed)} message(s)"]
+            for project, m in owed:
+                out.append(f"  {m.get('id')} {project} kind={m.get('kind')} task={m.get('task')}")
+            project, m = owed[0]
+            out.append(f"  answer it: python3 {os.path.abspath(__file__)} reply {project} {agent} result "
+                       f"{json.dumps(m.get('task'), ensure_ascii=False)} --re {m.get('id')} "
+                       f"--ref <what it is about>")
+            out.append("  that reply stays open and prints the main session's answer, so it is the way out; "
+                       "nothing was written")
+            print("\n".join(out), file=sys.stderr)
+            sys.exit(2)
     took_box = None
     if a.took:
         took_box = next((b for b in boxes if a.took in [m.get("id") for m in jsonl(os.path.join(b, "in.jsonl"))]), None)
@@ -374,22 +422,56 @@ def board_rows(dots):
             if last and (not mem or mem.get("task") != last["task"]
                          or (parse_t(mem.get("t")) or last_t_min()) < parse_t(last["t"])):
                 flags.append("MEMO-BEHIND" if mem else "NO-MEMO")
-            mail = {"new": 0, "unanswered": 0, "unread_out": 0}
+            mail = {"new": 0, "unanswered": 0, "waiting": 0, "oldest_waiting_min": None, "unread_out": 0}
             boxes = mailboxes(agent)
+            waiting = []
             for box in boxes:
                 st = mail_state(box)
-                for k in mail:
+                for k in ("new", "unanswered", "unread_out"):
                     mail[k] += len(st[k])
+                waiting += waiting_on(box)
+            if waiting:
+                ages = [x for x in (age_min(m.get("t")) for m in waiting) if x is not None]
+                mail["waiting"] = len(waiting)
+                mail["oldest_waiting_min"] = round(max(ages)) if ages else None
             if mail["unanswered"]:
                 flags.append("MAIL-UNANSWERED")
+            # an agent that holds a wait open will read it; one that ended its turn never will
+            if waiting and listen_state(agent) is None:
+                flags.append("MAIL_WAITING")
+            claim = claim_stale(last, waiting, roster.get(agent))
+            if claim:
+                flags.append("CLAIM-STALE")
             rows.append({"dot": dot, "agent": agent, "roster": roster.get(agent),
                          "state": last["state"] if last else None, "t": last["t"] if last else None,
                          "age_min": None if age is None else round(age), "task": last["task"] if last else None,
                          "host": last["host"] if last else None,
                          "doing": (mem or {}).get("doing"), "next": (mem or {}).get("next"),
                          "blockers": (mem or {}).get("blockers") or [], "mail": mail if boxes else None,
-                         "flags": flags})
+                         "claim_stale": claim, "flags": flags})
     return rows, errors
+
+def claim_stale(last, waiting, roster_state):
+    """A claim the evidence disproves, from the files only. The roster is the root's word and is
+    never evidence: this returns a reason string, or None.
+
+    (a) The agent's own newest live line says done or blocked, yet a main-session message newer than
+        that line is still waiting for an answer.
+    (b) The roster claims the slot is done or idle while the agent's own newest live line is start or
+        step, which is the agent working.
+    """
+    if last:
+        t_last = parse_t(last.get("t"))
+        # the message's second may equal the line's: a message at or after the line is still newer
+        newer = [m for m in waiting
+                 if t_last is None or (parse_t(m.get("t")) or t_last) >= t_last]
+        if newer and last.get("state") in ("done", "blocked"):
+            return (f"live {last['state']} at {last.get('t')} but {len(newer)} message(s) newer than that line "
+                    f"still need an answer")
+    if last and last.get("state") in ("start", "step") and isinstance(roster_state, str) \
+            and roster_state.lower() in ROSTER_DONE:
+        return f"roster claims {roster_state} but the agent's own newest live line is {last['state']}"
+    return None
 
 def last_t_min():
     return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
@@ -413,8 +495,10 @@ def board(a):
     for r in rows:
         age = "-" if r["age_min"] is None else f"{r['age_min']}m"
         flags = f"  [{' '.join(r['flags'])}]" if r["flags"] else ""
-        print(f"{r['dot']} {r['agent']}  {r['state'] or '-'} {age} host={r['host'] or '-'} roster={r['roster'] or '-'}"
-              f"  {clip(r['task'], 60)}{flags}")
+        print(f"{r['dot']} {r['agent']}  {r['state'] or '-'} {age} host={r['host'] or '-'} "
+              f"roster={r['roster'] or '-'} (the root's claim)  {clip(r['task'], 60)}{flags}")
+        if r.get("claim_stale"):
+            print(f"    claim: {clip(r['claim_stale'], 140)}")
         if r["doing"] or r["next"]:
             print(f"    doing: {clip(r['doing'])}")
             print(f"    next:  {clip(r['next'])}")
@@ -422,7 +506,10 @@ def board(a):
             print(f"    block: {clip(b)}")
         if r["mail"]:
             m = r["mail"]
-            print(f"    mail:  to agent {m['new']} unread, {m['unanswered']} unanswered; from agent {m['unread_out']} unread")
+            waiting = (f", {m['waiting']} waiting (oldest {age_label(m['oldest_waiting_min'])})"
+                       if m.get("waiting") else "")
+            print(f"    mail:  to agent {m['new']} unread, {m['unanswered']} unanswered{waiting}; "
+                  f"from agent {m['unread_out']} unread")
 
 def memo(a):
     dot, agent = token("DOT", a.dot), token("agent", a.agent)
@@ -590,18 +677,23 @@ def send(a):
     else:
         doorbell(project, agent, msg["id"], dot)
 
-def wake_argv(cfg, project, agent, msg_id, dot):
-    argv = cfg.get("wake")
-    if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)):
+def argv_list(argv):
+    return argv if isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv) else None
+
+def argv_for(argv, values):
+    """Substitute {project} {agent} {id} {dot} {age}; a placeholder with no value is reported, never blanked."""
+    argv = argv_list(argv)
+    if not argv:
         return None, None
-    values = {"project": project, "agent": agent, "id": msg_id, "dot": dot or ""}
-    used = set(re.findall(r"\{(project|agent|id|dot)\}", " ".join(argv)))
-    for name in sorted(used):
-        if name == "dot" and not dot:
+    for name in sorted(set(PLACEHOLDER.findall(" ".join(argv)))):
+        if name == "dot" and not values.get("dot"):
             return None, "dot"
-    def sub(m):
-        return values[m.group(1)]
-    return [re.sub(r"\{(project|agent|id|dot)\}", sub, x) for x in argv], None
+        if name == "age" and values.get("age") is None:
+            return None, "age"
+    return [PLACEHOLDER.sub(lambda m: str(values[m.group(1)]), x) for x in argv], None
+
+def wake_argv(cfg, project, agent, msg_id, dot):
+    return argv_for(cfg.get("wake"), {"project": project, "agent": agent, "id": msg_id, "dot": dot or ""})
 
 def run_wake(argv):
     print(f"WAKE ran {json.dumps(argv, ensure_ascii=False)}", flush=True)
@@ -655,24 +747,55 @@ def reply(a):
         die(f"kind must be one of {list(TO_MAIN)}")
     task = text("task", a.task)
     refs = refs_of(a.ref)
-    if not a.re:
-        die("reply needs --re with the id of the message it answers")
-    re_id = token("re", a.re)
+    re_id = token("re", a.re) if a.re else None
+    waits = a.kind in REPLY_WAITS and not a.no_wait
+    timeout = timeout_of(a) if waits else None
     body = stdin_body()
     box = mail_box(project, agent)
-    if re_id not in [m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))]:
+    if re_id and (not os.path.isdir(box)
+                  or re_id not in [m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))]):
         die(f"--re {re_id} is not in {project}/mail/{agent}/in.jsonl")
+    elif not re_id and a.kind in REPLY_WAITS:
+        # A first result often answers a task the agent got from its dot root, not a mail line,
+        # so `re` is null there; a ref then says what the result is about.
+        if not refs:
+            die(f"a {a.kind} with no --re needs at least one --ref naming what it is about "
+                f"(rev/*, a commit SHA, gate:ID, supersedes:ID)")
+    elif not re_id:
+        die("reply needs --re with the id of the message it answers")
+    dot = None
+    if waits:
+        dot = token("DOT", a.dot) if a.dot else dot_for(agent)
+        if not dot:
+            die(f"no dot for {agent}: pass --dot (no live/ folder names it)")
+    new_box = not os.path.isdir(box)
+    os.makedirs(box, exist_ok=True)   # a first result may be the first line in this mailbox
     msg = mail_line(project, agent, a.kind, task, re_id, refs, body, agent)
     append_unique(os.path.join(box, "out.jsonl"), msg)
-    print(msg["id"])
+    print(msg["id"], flush=True)
+    if new_box:
+        print(f"MAILBOX {project}/{agent} (new folder)", flush=True)
+    if waits:
+        print(f"REPLY waiting for the answer to {msg['id']} (dot={dot}); do not end the turn — this command "
+              f"prints it. On exit 3 tick step and reply again.", flush=True)
+        return wait_loop(dot, agent, timeout)
+    return 0
 
 # ---------------------------------------------------------------- wait
 
+def timeout_of(a):
+    if a.timeout <= 0:
+        die("--timeout must be a positive number of seconds")
+    return a.timeout
+
 def wait(a):
     dot, agent = token("DOT", a.dot), token("agent", a.agent)
-    timeout = a.timeout
-    if timeout <= 0:
-        die("--timeout must be a positive number of seconds")
+    return wait_loop(dot, agent, timeout_of(a))
+
+def wait_loop(dot, agent, timeout):
+    """Print unread mail at once, or block until it lands; the loop `reply` continues into after a
+    result, question or block. Marks what it printed read, so the next call blocks instead of
+    repeating it. 0 mail, 3 timeout, 4 signal. Holds listen/<agent>.<pid>.json while blocking."""
     pending = unread_all(agent)
     if pending:
         print_pending(pending)
@@ -732,6 +855,135 @@ def mark_delivered(pending):
         if isinstance(mid, str) and TOKEN.match(mid):
             write_atomic(os.path.join(box, ".agent-read"), mid + "\n")
 
+# ---------------------------------------------------------------- watch
+
+def watch_cfg(cfg):
+    w = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
+    out = dict(WATCH_DEFAULTS)
+    for k in out:
+        v = w.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            out[k] = v
+    return out
+
+def state_path():
+    return os.path.join(BASE, "watch", "state.json")
+
+def load_state():
+    """The watchdog's own ledger: one record per message id, so a restart never rings twice."""
+    st = load_json(state_path()) or {}
+    msgs = st.get("messages")
+    return {"v": 1, "messages": msgs if isinstance(msgs, dict) else {}}
+
+def save_state(st):
+    os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+    write_atomic(state_path(), json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+
+def owed_mail():
+    """(project, agent, box, message) for every inbox line that owes an answer, read from the mail
+    folders only: no roster, no live line and no dots.json entry decides what is listed."""
+    out = []
+    for box in sorted(glob.glob(os.path.join(BASE, "*", "mail", "*"))):
+        agent = os.path.basename(box)
+        if not (os.path.isdir(box) and TOKEN.match(agent)):
+            continue
+        out += [(project_of(box), agent, box, m) for m in waiting_on(box)]
+    return out
+
+def unread_in(box, mid):
+    return mid in [m.get("id") for m in mail_state(box)["new"]]
+
+def ring(argv, values):
+    """Run one configured command once: (code, None) or (None, why it did not run)."""
+    sub, missing = argv_for(argv, values)
+    if sub is None:
+        return None, f"missing={missing}" if missing else "not_configured"
+    try:
+        return subprocess.run(sub, stdin=subprocess.DEVNULL, timeout=WAKE_TIMEOUT).returncode, None
+    except subprocess.TimeoutExpired:
+        return "timeout", None
+    except OSError as exc:
+        return f"error:{exc.errno}", None
+
+def watch_once(expected):
+    cfg = config()
+    wc = watch_cfg(cfg)
+    if expected:
+        path = os.path.abspath(__file__)
+        with open(path, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        if actual != expected:
+            print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual} path={path}", flush=True)
+    st = load_state()
+    seen = set()
+    no_wake = no_notify = False
+    for project, agent, box, m in owed_mail():
+        mid = m.get("id")
+        if not isinstance(mid, str) or not TOKEN.match(mid):
+            continue
+        seen.add(mid)
+        rec = st["messages"].setdefault(mid, {})
+        rec.setdefault("project", project)
+        rec.setdefault("agent", agent)
+        age = age_min(m.get("t"))
+        if age is None:
+            continue
+        if not rec.get("wake_t") and listen_state(agent) is None and age >= wc["after_min"]:
+            dot = dot_for(agent, cfg)
+            values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
+            code, detail = ring(cfg.get("wake"), values)
+            if detail == "not_configured":
+                if not no_wake:
+                    print("WATCH_ERROR no wake command in dots.json; an ended agent cannot be restarted", flush=True)
+                    no_wake = True
+                continue
+            if code is not None:
+                rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
+                save_state(st)
+            print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
+                  f"exit={detail or code}", flush=True)
+        if not rec.get("wake_t") or rec.get("notify_t"):
+            continue
+        since = age_min(rec["wake_t"])
+        if since is None or since < wc["notify_after_min"] or not unread_in(box, mid):
+            continue
+        dot = rec.get("dot") or dot_for(agent, cfg)
+        values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
+        code, detail = ring(cfg.get("notify"), values)
+        if detail == "not_configured":
+            if not no_notify:
+                print("WATCH_ERROR no notify command in dots.json; the owner is never told", flush=True)
+                no_notify = True
+            continue
+        if code is not None:
+            rec["notify_t"] = now()
+            save_state(st)
+        print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={round(since)}m "
+              f"exit={detail or code}", flush=True)
+    for mid, rec in sorted(st["messages"].items()):
+        if mid in seen:
+            continue
+        del st["messages"][mid]
+        save_state(st)
+        print(f"WATCH_RESOLVED {rec.get('project') or '-'} {rec.get('agent') or '-'} {mid}", flush=True)
+
+def stop_quiet(signum, frame):
+    raise SystemExit(0)
+
+def watch(a):
+    if a.loop < 0:
+        die("--loop takes minutes, 0 to run once")
+    expected = (a.expect_sha256 or "").strip().lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        die("--expect-sha256 takes the 64 hex characters of sha256sum tools/dots.py")
+    for s in SIGNALS:
+        signal.signal(s, stop_quiet)
+    while True:
+        watch_once(expected)
+        if a.loop == 0:
+            return 0
+        time.sleep(a.loop * 60)
+
 # ---------------------------------------------------------------- init
 
 DEFAULT_HOSTS = (
@@ -756,6 +1008,29 @@ def pairs(values, flag):
         out.append((left.strip(), right.strip()))
     return out
 
+def set_cmd(cfg, key, spec, report):
+    """Store one configured argv list (wake or notify) from --KEY-cmd JSON, validating it first."""
+    flag = f"--{key}-cmd"
+    if spec:
+        try:
+            argv = json.loads(spec)
+        except ValueError:
+            die(f"{flag} takes a JSON list of strings; run dots.py init -h for an example")
+        if not (isinstance(argv, list) and 0 < len(argv) <= 32
+                and all(isinstance(x, str) and x.strip() for x in argv)):
+            die(f"{flag} must be a JSON list of 1-32 non-empty strings")
+        if any("\n" in x or "\r" in x for x in argv):
+            die(f"{flag} entries must be one line each")
+        if cfg.get(key) and cfg[key] != argv:
+            report.append(f"INIT {key} (replaced)")
+        elif not cfg.get(key):
+            report.append(f"INIT {key} (set)")
+        else:
+            report.append(f"INIT {key} (kept)")
+        cfg[key] = argv
+    elif cfg.get(key):
+        report.append(f"INIT {key} (kept)")
+
 def init(a):
     tty = sys.stdin.isatty() and not a.yes
     base = os.path.expanduser(a.base) if a.base else default_base()
@@ -776,6 +1051,7 @@ def init(a):
     project_specs = list(a.project)
     host_specs = list(a.host)
     wake_spec = a.wake_cmd or ""
+    notify_spec = a.notify_cmd or ""
     if tty:
         have = ", ".join(configured_dots(cfg)) or "none"
         dot_ids += [x.strip() for x in ask(f"dot ids, comma-separated (have {have}): ").split(",") if x.strip()]
@@ -791,6 +1067,8 @@ def init(a):
             host_specs.append(spec)
         wake_spec = ask("wake command as a JSON argv list with {dot} {agent} {id} {project} (blank for none): ",
                         wake_spec)
+        notify_spec = ask("notify command as a JSON argv list, same placeholders plus {age} (blank for none): ",
+                          notify_spec)
 
     report, dots = [], cfg["dots"]
     known = {d.get("id") for d in dots if isinstance(d, dict)}
@@ -832,24 +1110,8 @@ def init(a):
         labels.add(label)
         report.append(f"INIT host {label} (added)")
 
-    if wake_spec:
-        try:
-            argv = json.loads(wake_spec)
-        except ValueError:
-            die("--wake-cmd must be a JSON list of strings, for example '[\"ssh\",\"box\",\"wake\",\"{agent}\"]'")
-        if not (isinstance(argv, list) and 0 < len(argv) <= 32 and all(isinstance(x, str) and x.strip() for x in argv)):
-            die("--wake-cmd must be a JSON list of 1-32 non-empty strings")
-        if any("\n" in x or "\r" in x for x in argv):
-            die("--wake-cmd entries must be one line each")
-        if cfg.get("wake") and cfg["wake"] != argv:
-            report.append("INIT wake (replaced)")
-        elif not cfg.get("wake"):
-            report.append("INIT wake (set)")
-        else:
-            report.append("INIT wake (kept)")
-        cfg["wake"] = argv
-    elif cfg.get("wake"):
-        report.append("INIT wake (kept)")
+    set_cmd(cfg, "wake", wake_spec, report)
+    set_cmd(cfg, "notify", notify_spec, report)
 
     if not dots:
         die("no dots: pass --dot ID at least once")
@@ -880,6 +1142,35 @@ def init(a):
     print(f"INIT config {path} ({'unchanged' if current == data else 'written'})")
     brief(base, dots, projects, cfg, os.path.abspath(__file__))
 
+def rules_lines(script):
+    """The agent-side rules, printed once by init's brief and again by the first command an agent
+    runs with no memory file. The dot root may never paste the brief, so the tool repeats them."""
+    return [
+        "AGENT_RULES dots-superkit — this is your first command, so the rules are printed once:",
+        f"  every step: python3 {script} tick <DOT> <agentId> <start|step|blocked|done> --task T --host H "
+        f"--note N --evidence E",
+        f"  hand work back: python3 {script} reply <project> <agentId> <result|question|block> <task> --re ID "
+        f"--ref R   (text on stdin); it stays open and prints the main session's answer, so do not end the turn",
+        f"  no assigned work: python3 {script} wait <DOT> <agentId> --timeout 3300   (it marks what it prints read)",
+        "  exit 3: tick step, then run it again. exit 4: a signal ended it, so run it again.",
+        "  tick done is refused while a task, question or review in your inbox has no answer in out.jsonl.",
+    ]
+
+def announce_rules(a):
+    """Before the first output of an agent that has no memory yet, print the rules it must follow.
+    Read from the memory file, not from dots.json or the roster: the root may never pass a brief."""
+    agent = getattr(a, "agent", None)
+    if a.cmd not in ("tick", "reply", "wait") or not isinstance(agent, str) or not TOKEN.match(agent):
+        return
+    dot = getattr(a, "dot", None) or dot_for(agent)
+    if not (isinstance(dot, str) and TOKEN.match(dot)):
+        return
+    if os.path.exists(os.path.join(BASE, "memory", dot, f"{agent}.json")):
+        return
+    for line in rules_lines(os.path.abspath(__file__)):
+        print(line)
+    print(flush=True)
+
 def brief(base, dots, projects, cfg, script):
     names = [d["id"] for d in dots if isinstance(d, dict) and isinstance(d.get("id"), str)]
     main_by = {p["id"]: p.get("main") for p in projects if isinstance(p, dict) and isinstance(p.get("id"), str)}
@@ -890,16 +1181,21 @@ def brief(base, dots, projects, cfg, script):
     print(f"Helper: python3 {script}")
     print(f"Dots: {', '.join(names)}")
     print("Projects: " + (", ".join(f"{k} (main {v})" for k, v in sorted(main_by.items())) or "none"))
-    print("Record every step: python3 " + script + " tick <DOT> <agentId> <state> --task T --host H --note N --evidence E")
-    print("No assigned work: do not end the turn. python3 " + script + " wait <DOT> <agentId> --timeout 3300; "
-          "it marks what it prints read, so the next wait blocks. On exit 3 tick step, then wait again; "
-          "exit 4 means it was interrupted, so wait again.")
+    print("Rules for every agent (the tool also prints them on its first command):")
+    for line in rules_lines(script):
+        print(line)
     print("Main session: python3 " + script + " send <project> <agentId> <kind> <task>  (text on stdin)")
+    print("Watchdog (the owner, not the dot root): python3 " + script + " watch --loop 5 --expect-sha256 <sha256 of "
+          "dots.py>; it wakes and then notifies, and prints WATCH_* lines")
     print(f"Kit pin: dots-superkit/handoff-v1 @ <kit commit SHA>")
     if cfg.get("wake"):
-        print("Wake command: configured (send runs it when no agent is listening)")
+        print("Wake command: configured (send and watch run it when no agent is listening)")
     else:
-        print("Wake command: none (send prints the manual doorbell)")
+        print("Wake command: none (send prints the manual doorbell; watch prints WATCH_ERROR)")
+    if cfg.get("notify"):
+        print("Notify command: configured (watch runs it when a wake did not get the mail read)")
+    else:
+        print("Notify command: none (watch prints WATCH_ERROR when a wake fails)")
 
 class Piped:
     """A reader that stops early (`dots.py send ... | head -1`) must not raise and must not skip
@@ -968,13 +1264,19 @@ def main(argv):
     r.add_argument("project")
     r.add_argument("agent")
     r.add_argument("id")
-    y = sub.add_parser("reply", help="agent: write one message back; text on stdin")
+    y = sub.add_parser("reply", help="agent: write one message back, then hold the answer open")
     y.add_argument("project")
     y.add_argument("agent")
     y.add_argument("kind", help=f"one of {', '.join(TO_MAIN)}")
     y.add_argument("task")
-    y.add_argument("--re", required=True, help="id of the message this answers")
+    y.add_argument("--re", help="id of the message this answers; omitted only for a result, question or "
+                                "block that answers no mail line, which then needs --ref")
     y.add_argument("--ref", action="append", default=[], help="exact reference; repeatable")
+    y.add_argument("--dot", help="dot holding the agent; default: the dot of its newest live line")
+    y.add_argument("--timeout", type=int, default=3300,
+                   help="seconds to wait for the answer (default 3300; exit 3 after this)")
+    y.add_argument("--no-wait", action="store_true",
+                   help="return at once instead of waiting for the answer")
     w = sub.add_parser("wait", help="agent: block until mail arrives; exits 0 with mail, 3 on timeout, 4 on a signal")
     w.add_argument("dot")
     w.add_argument("agent")
@@ -986,10 +1288,17 @@ def main(argv):
     n.add_argument("--project", action="append", default=[], help="ID=MAIN session id; repeatable")
     n.add_argument("--host", action="append", default=[], help="LABEL=PURPOSE beyond vm and local; repeatable")
     n.add_argument("--wake-cmd", help='argv list as JSON, e.g. \'["ssh","box","wake","{agent}"]\'')
+    n.add_argument("--notify-cmd", help='argv list as JSON for the watchdog\'s notify step, same placeholders '
+                                        'plus {age}, e.g. \'["ssh","box","notify","{id}"]\'')
     n.add_argument("--yes", action="store_true", help="no questions; flags only")
+    c = sub.add_parser("watch", help="owner side: wake, then notify, mail that nobody answered")
+    c.add_argument("--loop", type=float, default=0.0, help="minutes between runs; 0 runs once (default 0)")
+    c.add_argument("--expect-sha256", dest="expect_sha256",
+                   help="sha256 of this file; a different file prints WATCH_TOOL_CHANGED")
     a = p.parse_args(argv)
-    code = {"tick": tick, "board": board, "memo": memo, "send": send, "inbox": inbox,
-            "read": read, "reply": reply, "wait": wait, "init": init}[a.cmd](a)
+    announce_rules(a)
+    code = {"tick": tick, "board": board, "memo": memo, "send": send, "inbox": inbox, "read": read,
+            "reply": reply, "wait": wait, "init": init, "watch": watch}[a.cmd](a)
     sys.exit(code or 0)
 
 if __name__ == "__main__":
