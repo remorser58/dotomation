@@ -481,8 +481,11 @@ def age_label(minutes):
     return f"{max(0, int(minutes))}m"
 
 def marker_paths(agent):
-    """Every `wait` marker for that agent: one file per waiting process, so two waiters never collide."""
-    return sorted(glob.glob(os.path.join(BASE, "listen", glob.escape(agent) + ".*.json")))
+    """Every `wait` marker for that agent: one file per waiting process, so two waiters never collide.
+    Only `<agent>.<digits>.json` matches, so a dotted id such as `agent-1.x` never shadows `agent-1`."""
+    exact = re.compile(re.escape(agent) + r"\.[0-9]+\.json\Z")
+    return sorted(p for p in glob.glob(os.path.join(BASE, "listen", glob.escape(agent) + ".*.json"))
+                  if exact.match(os.path.basename(p)))
 
 def marker_live(m):
     """A marker is not listening when its pid is invalid, its process is gone or its `until` has passed.

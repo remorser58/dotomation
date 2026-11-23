@@ -251,6 +251,18 @@ class WaitTests(Base):
                                    "until": "2020-01-01T00:00:01Z", "host": socket.gethostname()}) + "\n")
         self.assertIsNone(d.listen_state("agent-1"))
 
+    def test_a_dotted_agent_id_does_not_count_as_a_listener_for_its_prefix(self):
+        os.makedirs(os.path.join(self.base, "listen"), exist_ok=True)
+        d.write_atomic(os.path.join(self.base, "listen", "agent-1.x.{}.json".format(os.getpid())),
+                       json.dumps({"pid": os.getpid(), "dot": "DOT-A", "since": d.now(),
+                                   "until": d.iso_after(600), "host": socket.gethostname()}) + "\n")
+        self.assertIsNone(d.listen_state("agent-1"))
+        self.assertIsNotNone(d.listen_state("agent-1.x"))
+        res = run(["send", "proj", "agent-1", "task", "issue 1"], self.base, stdin="one")
+        self.assertIn("NOT_LISTENING", res.stdout)
+        # agent-1's send never prunes agent-1.x's live marker
+        self.assertEqual(len(marker_files(self.base)), 1)
+
     def test_bad_ids_are_refused(self):
         self.assertEqual(run(["wait", "DOT-A", "bad id", "--timeout", "1"], self.base).returncode, 2)
         self.assertEqual(run(["wait", "bad dot", "agent-1", "--timeout", "1"], self.base).returncode, 2)
