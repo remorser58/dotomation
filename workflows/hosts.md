@@ -15,6 +15,12 @@ A task that needs the user's machine, a login, a device or a native build belong
 
 The shared Dots folder is `<work root>/.dots-ops/` on `local`, where `<work root>` is the approved work root on that machine. The live records, session memory, mail, task records and handoffs all live under it ([live status](live-status.md), [session memory](session-memory.md), [direct mail](direct-mail.md)).
 
+### Further hosts come from `init`
+
+Two hosts are the default, not the limit. When the user has another computer, `python3 tools/dots.py init --host LABEL=PURPOSE` records it in `<base>/dots.json` with the label a live record's `host` uses and what that computer is for — a machine that only builds and signs, a machine with a device attached, a second desktop. The same command adds a dot and a project. It only adds: a second run reports what it kept and never rewrites an entry, a record or a mail line ([direct mail](direct-mail.md#dotsjson-the-optional-config-for-one-machine)).
+
+An added host is still a host: confirm its hostname, use only a route the owner approved for that account ([approved routes](#approved-routes)), and never move an existing task to it automatically. If a label is missing from `dots.json`, the record uses the hostname the agent confirmed and the board shows that; a label nobody configured is not a route.
+
 ## Approved routes
 
 Two kinds of route reach a host, and only these:

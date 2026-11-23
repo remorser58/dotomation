@@ -1,0 +1,19 @@
+{
+ "description": "Synthetic dots.json, written by `python3 tools/dots.py init` on one machine. Dot ids, project ids, session ids, host labels and the wake command are invented; the wake command stands for whatever CLI the instance already has to post one line into a dot's chat. The shape is described in workflows/direct-mail.md; the file is optional and every command works without it.",
+ "config": {
+  "v": 1,
+  "dots": [
+   {"id": "DOT-A"},
+   {"id": "DOT-B"}
+  ],
+  "projects": [
+   {"id": "example-project", "main": "example-project-main"}
+  ],
+  "hosts": [
+   {"label": "vm", "purpose": "Dots VM: research, read-only analysis, derived work that does not change the canonical copy"},
+   {"label": "local", "purpose": "This computer: canonical writes, the shared folder, long runs, logins, devices, native build"},
+   {"label": "build-box", "purpose": "A second computer used only for native builds and signing"}
+  ],
+  "wake": ["python3", "/work/bin/dot-chat-post", "{dot}", "[example-project-main -> {dot}] {agent}: mail {id} unread; wake it to read its inbox (dots.py wait {dot} {agent})"]
+ }
+}
