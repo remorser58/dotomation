@@ -170,9 +170,9 @@ def token(name, value):
 READ_WARNED = set()
 
 def regular(path):
-    """False for a path that is not a regular file. Opening a FIFO for reading blocks until a writer
-    appears, so the readers here refuse one before they touch it; a missing path returns True and the
-    open below reports it the normal way."""
+    """False for a path that is not a regular file. This is the cheap first check; it cannot be the only
+    one, because the path can be replaced between this stat and the open, so every read goes through
+    open_raw, which opens non-blocking and asks the descriptor what it really holds."""
     try:
         return stat.S_ISREG(os.stat(path).st_mode)
     except OSError:
@@ -189,6 +189,35 @@ def unreadable(path, exc):
     name = exc if isinstance(exc, str) else exc.__class__.__name__
     print(f"dots: cannot read {path} ({name}); treated as no lines", file=sys.stderr)
 
+def open_raw(path):
+    """An open descriptor for reading, or None. O_NONBLOCK is what makes this safe: a FIFO open returns
+    at once instead of waiting for a writer, and the fstat on the descriptor decides what was really
+    opened — the path may be replaced between regular() and this call, and only the descriptor knows
+    what it holds. Anything that is not a regular file is reported and closed, never read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        READ_WARNED.discard(path)
+        return None
+    except OSError as exc:
+        unreadable(path, exc)
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            unreadable(path, "not a regular file")
+            os.close(fd)
+            return None
+    except OSError as exc:
+        os.close(fd)
+        unreadable(path, exc)
+        return None
+    return fd
+
+def open_read(path):
+    """open_raw as a text file, or None."""
+    fd = open_raw(path)
+    return None if fd is None else os.fdopen(fd, encoding="utf-8")
+
 def jsonl(path):
     """Lines of one JSONL file, skipping any line that is not a JSON object. A path the root made
     unreadable — a folder or a FIFO where the file should be, a file with no read permission — reads as
@@ -198,8 +227,11 @@ def jsonl(path):
         unreadable(path, "not a regular file")
         return []
     out = []
+    fh = open_read(path)
+    if fh is None:
+        return out
     try:
-        with open(path, encoding="utf-8") as fh:
+        with fh:
             for ln in fh:
                 try:
                     obj = json.loads(ln)
@@ -207,10 +239,7 @@ def jsonl(path):
                     continue
                 if isinstance(obj, dict):
                     out.append(obj)
-    except FileNotFoundError:
-        READ_WARNED.discard(path)
-        return out
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         unreadable(path, exc)
         return out
     READ_WARNED.discard(path)
@@ -235,33 +264,36 @@ def load_json(path):
     if not regular(path):
         unreadable(path, "not a regular file")
         return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            obj = json.load(fh)
-        READ_WARNED.discard(path)
-        return obj if isinstance(obj, dict) else None
-    except (FileNotFoundError, ValueError):
-        READ_WARNED.discard(path)
+    fh = open_read(path)
+    if fh is None:
         return None
-    except OSError as exc:
+    try:
+        with fh:
+            obj = json.load(fh)
+    except (OSError, UnicodeDecodeError) as exc:
         unreadable(path, exc)
         return None
+    except ValueError:   # not JSON: no config, which is the same as none written
+        READ_WARNED.discard(path)
+        return None
+    READ_WARNED.discard(path)
+    return obj if isinstance(obj, dict) else None
 
 def marker(path):
     if not regular(path):
         unreadable(path, "not a regular file")
         return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read().strip() or None
-        READ_WARNED.discard(path)
-        return text
-    except FileNotFoundError:
-        READ_WARNED.discard(path)
+    fh = open_read(path)
+    if fh is None:
         return None
-    except OSError as exc:
+    try:
+        with fh:
+            text = fh.read().strip() or None
+    except (OSError, UnicodeDecodeError) as exc:
         unreadable(path, exc)
         return None
+    READ_WARNED.discard(path)
+    return text
 
 def after(msgs, last):
     """Lines after the marker id. A duplicate id already on disk resolves to its last occurrence,
@@ -326,16 +358,30 @@ def write_atomic(path, data):
         os.fsync(fh.fileno())
     os.replace(tmp, path)
 
-def appendable(path):
-    """Refuse a path that is not a regular file before appending: opening a FIFO for writing blocks
-    until a reader appears, and a mail line that cannot be written must fail loudly, not hang."""
+def append_fd(path):
+    """A descriptor to append one line through, or exit 2. O_NONBLOCK on top of O_APPEND is what makes
+    this safe: a FIFO renamed onto the path after the stat above returns at once instead of holding the
+    open until a reader appears, and the fstat on the descriptor says what was really opened. A path
+    that is not a real file is refused before a byte is written, so a line can never be lost into one."""
     if not regular(path):
         die(f"cannot append to {path}: it is not a regular file")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o666)
+    except OSError as exc:
+        die(f"cannot append to {path}: {exc.strerror or exc}")
+    try:
+        real = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        real = False
+    if not real:
+        os.close(fd)
+        die(f"cannot append to {path}: it is not a regular file")
+    return fd
 
 def append_line(path, obj):
-    appendable(path)
+    fd = append_fd(path)
     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
-    with open(path, "ab") as fh:
+    with os.fdopen(fd, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.write(data)
         fh.flush()
@@ -344,8 +390,8 @@ def append_line(path, obj):
 def append_unique(path, msg):
     """Append one mail line, drawing another id if that mailbox already used this one.
     The check runs under the same lock as the write, so two senders cannot pick the same id."""
-    appendable(path)
-    with open(path, "ab") as fh:
+    fd = append_fd(path)
+    with os.fdopen(fd, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         seen = {m.get("id") for m in jsonl(path) if isinstance(m.get("id"), str)}
         while msg["id"] in seen:
@@ -1108,9 +1154,10 @@ def watch_once(expected, wake, notify, delays, st_path, src):
     if expected:
         path = os.path.abspath(__file__)
         actual = None
-        if regular(path):   # a copy the root replaced with a FIFO would block this read, not fail it
+        fd = open_raw(path)   # O_NONBLOCK: a copy swapped for a FIFO returns here, not in open
+        if fd is not None:
             try:
-                with open(path, "rb") as fh:
+                with os.fdopen(fd, "rb") as fh:
                     actual = hashlib.sha256(fh.read()).hexdigest()
             except OSError:
                 actual = None
@@ -1376,10 +1423,12 @@ def init(a):
     path = os.path.join(base, "dots.json")
     data = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     current = None
-    if regular(path):   # a FIFO or a folder at dots.json would block the read, not fail it
+    fh = open_read(path)   # O_NONBLOCK: a FIFO or a folder at dots.json returns here, not in open
+    if fh is not None:
         try:
-            current = open(path, encoding="utf-8").read()
-        except OSError:
+            with fh:
+                current = fh.read()
+        except (OSError, UnicodeDecodeError):
             current = None
     if current != data:
         write_atomic(path, data)

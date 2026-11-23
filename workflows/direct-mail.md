@@ -259,11 +259,15 @@ wake command ran.
   ledger. Each one then reads as empty — no lines, no waiter, no record — and `watch`, `wait` and
   `reply` keep running rather than dying or blocking on it, but not silently: a path that exists and
   cannot be read prints `dots: cannot read <path> (…)` once on stderr (`treated as no lines`, and
-  `(not a regular file)` for a FIFO), while a missing file is the normal case and stays quiet. The
-  tool stats every such path before opening it, because opening a FIFO for reading blocks until a
-  writer appears; a mail line it cannot append is refused with `dots: cannot append to <path>: it is
-  not a regular file` and exit 2 rather than hung, and the temp file `write_atomic` writes is opened
-  non-blocking for the same reason. A read marker that cannot be written prints
+  `(not a regular file)` for a FIFO), while a missing file is the normal case and stays quiet. A
+  stat before the open is not enough on its own, because the root can rename a FIFO onto the path
+  between the two, so every read also opens with `O_NONBLOCK` — a FIFO open returns at once instead
+  of waiting for a writer — and then asks the descriptor what it holds: only a regular file is read,
+  and a FIFO that wins that race is reported as unreadable rather than read as empty. Appending has
+  the same hole, so a mail line goes through a descriptor opened the same way: a FIFO that wins that
+  race is refused with `dots: cannot append to <path>: it is not a regular file` and exit 2 instead
+  of taking the line, and the temp file `write_atomic` writes is opened non-blocking for the same
+  reason. A read marker that cannot be written prints
   `dots: cannot mark … read (…)` once and the mail stays unread; a ledger that cannot be written
   prints `dots: cannot write the ledger …` once and says `every run rings again until it is
   writable`, which is the safe direction. A ledger record that is not an object is dropped, so that

@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -430,6 +431,18 @@ class MailTests(Base):
         self.assertEqual(run(["read", "proj", "agent-1", reply_id], self.base).returncode, 0)
         self.assertIn("MAIL none", run(["inbox"], self.base).stdout)
         self.assertEqual(d.marker(os.path.join(self.base, "proj", "mail", "agent-1", ".main-read")), reply_id)
+
+    def test_a_fifo_in_place_of_the_inbox_is_refused_on_append(self):
+        # appending is the other direction: opening a FIFO for writing blocks until a reader appears, so
+        # the sender refuses the path instead of hanging, and writes no partial line
+        self.send(text="first")
+        inbox = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        os.unlink(inbox)
+        os.mkfifo(inbox)
+        res = run(["send", "proj", "agent-1", "note", "issue 1"], self.base, stdin="second", timeout=8)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn(f"cannot append to {inbox}: it is not a regular file", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
     def test_reply_needs_a_message_it_answers(self):
         self.assertEqual(run(["reply", "proj", "agent-1", "ack", "issue 1", "--re",
@@ -1187,8 +1200,96 @@ class WatchTests(Base):
 
 class ReadWarningTests(unittest.TestCase):
     """A path that cannot be read is reported once, and once more if it breaks again after working."""
+    def test_an_append_that_wins_the_race_is_refused_not_blocked(self):
+        # the append side has the same gap: stat says file, then the FIFO lands before the open
+        with tempfile.TemporaryDirectory() as tmp:
+            real = d.regular
+            d.regular = lambda _path: True
+            try:
+                # no reader yet: a blocking open would hang here, a non-blocking one fails loudly
+                path = os.path.join(tmp, "in.jsonl")
+                os.mkfifo(path)
+                err = io.StringIO()
+                def append_it(target):
+                    with redirect_stderr(err), self.assertRaises(SystemExit) as exit_:
+                        d.append_line(target, {"id": "x"})
+                    self.assertEqual(exit_.exception.code, 2)
+                worker = threading.Thread(target=append_it, args=(path,), daemon=True)
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), "the append blocked on the FIFO")
+                self.assertIn("cannot append to", err.getvalue())
+
+                # a reader attached: the open now succeeds, and only the descriptor check stops the
+                # line from being written into the pipe instead of a file
+                other = os.path.join(tmp, "out.jsonl")
+                os.mkfifo(other)
+                reader = os.open(other, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    err = io.StringIO()
+                    append_it(other)
+                    self.assertIn("it is not a regular file", err.getvalue())
+                    self.assertEqual(os.read(reader, 64), b"")   # nothing reached the pipe
+                finally:
+                    os.close(reader)
+            finally:
+                d.regular = real
+            self.assertEqual(sorted(os.listdir(tmp)), ["in.jsonl", "out.jsonl"])   # still pipes
+
+
+    def test_a_fifo_that_wins_the_race_is_refused_not_read(self):
+        # regular() and the open are two syscalls, so the path can be swapped in between. The descriptor
+        # is what decides: with regular() forced to say yes, a FIFO is still refused at once
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "in.jsonl")
+            os.mkfifo(path)
+            real = d.regular
+            d.regular = lambda _path: True
+            try:
+                err = io.StringIO()
+                got = []
+                def read_both():   # a blocked open would never return, so the read runs off the main thread
+                    with redirect_stderr(err):
+                        got.append(d.jsonl(path))
+                        got.append(d.marker(path))
+                worker = threading.Thread(target=read_both, daemon=True)
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), "the open blocked on the FIFO")
+                self.assertEqual(got, [[], None])
+            finally:
+                d.regular = real
+            self.assertIn("(not a regular file)", err.getvalue())
+
+    def test_write_atomic_does_not_block_on_a_fifo_at_its_temp_name(self):
+        # the temp name is predictable, so the root can plant a FIFO there; the open is non-blocking and
+        # the OSError reaches the caller, which already handles it
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "state.json")
+            code = ("import os, sys; sys.path.insert(0, %r); import dots as d;"
+                    " os.mkfifo(sys.argv[1] + '.tmp.' + str(os.getpid()));"
+                    " d.write_atomic(sys.argv[1], 'x\\n')" % HERE)
+            p = subprocess.run([sys.executable, "-c", code, target], capture_output=True, text=True,
+                               timeout=10, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)   # a block would time out instead
+            self.assertIn("OSError", p.stderr)
+            self.assertFalse(os.path.exists(target))
+
+    def test_a_file_that_is_not_utf8_is_reported_not_raised(self):
+        # a mailbox file the root filled with bytes is still a shape the tool must survive
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "in.jsonl")
+            with open(path, "wb") as fh:
+                fh.write(b"\xff\xfe{}\n")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(d.jsonl(path), [])
+                self.assertIsNone(d.marker(path))
+            self.assertIn("UnicodeDecodeError", err.getvalue())
 
     def test_a_path_that_recovers_and_breaks_again_is_reported_again(self):
+        # a folder where a file belongs reads as no lines; a good read clears the warning, so a second
+        # break is reported again instead of staying silent
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "in.jsonl")
             os.makedirs(path)          # a folder where a file belongs reads as no lines
