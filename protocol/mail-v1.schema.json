@@ -52,7 +52,7 @@
           "type": "null"
         }
       ],
-      "description": "Id of the message this answers. Required (non-null) on every message an agent sends."
+      "description": "Id of the message this line answers. Non-null on every line that answers one: an ack, answer or note always, and a result, question or block too. Null only on a first result, question or block that answers no mail line, and then refs names what it is about."
     },
     "text": {
       "type": "string",
