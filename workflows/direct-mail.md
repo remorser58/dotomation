@@ -103,9 +103,9 @@ roster.
 
 The wake command is whatever the instance already has to post one line into that dot's chat: an argv list, no shell, `{project}`, `{agent}`, `{id}` and `{dot}` substituted. It is not part of this kit and the kit cannot check that it exists.
 
-While `wait` blocks it holds one marker per waiting process, `<base>/listen/<agentId>.<pid>.json` — `{pid, dot, since, until, host}` — and removes only its own on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker counts as listening only with a `until` still in the future and no more than 24 hours out, and with its process still alive here; a marker whose process is gone, whose `until` has passed or which names a date a day or more away counts as not listening, so a waiter that died — or one that was never there — never looks alive. A marker written on another host is judged by `until` alone: a pid there says nothing here, so without a usable `until` it proves nothing. `wait` refuses a `--timeout` over a day for that reason. `wait` prints unread mail at once and exits 0 if anything is already unread; otherwise it blocks. It exits 3 with one line on timeout and 4 when a signal ends it, so an interrupted call is never mistaken for a delivery.
+While `wait` blocks it holds one marker per waiting process, `<base>/listen/<agentId>.<pid>.json` — `{pid, dot, since, until, host}` — and removes only its own on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker counts as listening only with a `until` still in the future and no more than 24 hours out, judged with one hour of slack because the waiter's clock may run ahead of the reader's, and with its process still alive here; a marker whose process is gone, whose `until` has passed or which names a date a day or more away counts as not listening, so a waiter that died — or one that was never there — never looks alive. A marker written on another host is judged by `until` alone: a pid there says nothing here, so without a usable `until` it proves nothing. `wait` refuses a `--timeout` over a day for that reason. `wait` prints unread mail at once and exits 0 if anything is already unread; otherwise it blocks. It exits 3 with one line on timeout and 4 when a signal ends it, so an interrupted call is never mistaken for a delivery.
 
-**An agent with no assigned work does not end its turn.** It runs `wait` with a long timeout and, if its own tool returns early with the session still running, keeps polling that session. `wait` moves the same `.agent-read` marker `tick --took` moves, so the lines it printed count as delivered: the loop is wait, handle, wait, and the same instruction is never printed twice. On exit 3 it ticks `step` and waits again; on exit 4 a signal ended it, so it waits again. This is the loop that lets a main session steer an agent the root never wakes.
+**An agent with no assigned work does not end its turn.** It runs `wait` with a long timeout and, if its own tool returns early with the session still running, keeps polling that session. `wait` moves the same `.agent-read` marker `tick --took` moves, so the lines it printed count as delivered: the loop is wait, handle, wait, and the same instruction is never printed twice. A line whose `id` cannot be marked delivered — a hand-written one with a bad id — prints once and stays quiet for the rest of that command, so it cannot flood the poll. On exit 3 it ticks `step` and waits again; on exit 4 a signal ended it, so it waits again. This is the loop that lets a main session steer an agent the root never wakes.
 
 **What it costs.** The wait is one blocking command and spends nothing by itself, but the agent's session polls it: each poll is one model call, at most one every five minutes. An agent waiting for an hour therefore makes about a dozen calls while it has nothing to do. Each poll also re-reads that agent's inboxes from disk, which is local CPU and disk rather than model calls. Keep the timeout long enough to be useful and let the coordinator release an agent that is no longer needed; an agent left waiting for a day spends a day of calls.
 
@@ -179,27 +179,39 @@ from the files alone:
   line with a message at or after it still unanswered, or a roster `done`/`idle` while the agent's
   own newest line is `start`/`step`.
 - **The owner can run the watchdog.** `dots.py watch [--loop MINUTES] [--expect-sha256 HEX]
-  [--wake-cmd ARGV] [--notify-cmd ARGV] [--after-min N] [--notify-after-min N] [--state PATH]` reads
-  the mail folders only. For every message that owes an answer and whose agent holds no live wait
-  marker, it runs the wake argv once after `after_min` minutes; if the message is still unanswered
-  `notify_after_min` minutes after that wake, it runs the notify argv once. A message counts as owed
-  until an `out.jsonl` line answers it, read or not: a `.agent-read` marker that reached it prints
-  `WATCH_STUCK … read=yes unanswered=yes` once and the notify runs anyway, because that marker lives
-  in the same folder as the mail. Its ledger defaults to `<base>/watch/state.json`, so a restart never
-  rings twice, and `--state PATH` keeps it outside the folder the root writes. The ledger may only
-  add a line: every step it suppresses prints `WATCH_SKIP … reason=wake_already|notify_already`, and
-  the rest are `WATCH_CONFIG`, `WATCH_WAKE`, `WATCH_NOTIFY`, `WATCH_STUCK`, `WATCH_RESOLVED`,
-  `WATCH_TOOL_CHANGED` and `WATCH_ERROR`. The flags win over `dots.json` for the reason above, and
-  `WATCH_CONFIG` names the source of each value on every run. `--loop 0` (the default) runs once; a
-  loop sleeps between runs and ends on `SIGTERM`, `SIGHUP` or `SIGINT`. It makes no network and no
-  model call: the two commands are argv lists the owner configures, for example `dots.py watch
+  [--wake-cmd ARGV] [--notify-cmd ARGV] [--after-min N] [--notify-after-min N] [--state PATH]` trusts
+  five things, four of them in the folder the root writes: the mail folders (what owes an answer),
+  the `listen/` markers (whether a wake runs), the `live/` lines (for `{dot}`), `dots.json` (every
+  value no flag overrides) and its own ledger. `--state PATH` moves the ledger out of that folder,
+  and the four flags pin the values `dots.json` would otherwise set. For every message that owes an
+  answer and whose agent holds no live wait marker, it runs the wake argv once after `after_min`
+  minutes; if the message is still unanswered `notify_after_min` minutes after that wake, it runs the
+  notify argv once. A message counts as owed until an `out.jsonl` line answers it, read or not: a
+  `.agent-read` marker that reached it prints `WATCH_STUCK … read=yes unanswered=yes` once and the
+  notify runs anyway, because that marker lives in the same folder as the mail. An owed line always
+  has an age — its own `t`, else the moment the ledger first saw it — so an unparseable or future `t`
+  cannot hide a message, and `WATCH_ERROR … no usable time` is the last resort. The ledger records
+  that first sight, so a line deleted before its first ring still ends as `WATCH_RESOLVED`; the cost
+  is one `WATCH_RESOLVED` per answered message. Its ledger defaults to `<base>/watch/state.json`, so
+  a restart never rings twice, and `--state PATH` keeps it outside the folder the root writes. The
+  ledger may only add a line: every step it suppresses prints
+  `WATCH_SKIP … reason=wake_already|notify_already`, and the rest are `WATCH_CONFIG`, `WATCH_WAKE`,
+  `WATCH_NOTIFY`, `WATCH_STUCK`, `WATCH_HELD`, `WATCH_RESOLVED`, `WATCH_TOOL_CHANGED` and
+  `WATCH_ERROR`. The flags win over `dots.json` for the reason above, and `WATCH_CONFIG` names the
+  source of each value on every run. `--loop 0` (the default) runs once; a loop sleeps between runs
+  and ends on `SIGTERM`, `SIGHUP` or `SIGINT`. It makes no network and no model call: the two
+  commands are argv lists the owner configures, for example `dots.py watch
   --loop 5 --wake-cmd '["ssh","local","dots-post","{project}","{agent}","{id}"]'
   --notify-cmd '["notify-send","{agent}","{id}","{age}"]'`.
-- **A wait marker proves a waiter only within a day.** `listen/<agent>.<pid>.json` needs a `until`
-  that is still in the future and no more than 24 hours out; a marker without one, with a past one or
-  with a date years away is not a waiter, and a marker written on another host is judged by `until`
-  alone. The one case the tool cannot separate is a marker that names a live local pid and a
-  plausible `until`: check `ps -p <pid>` and the agent's newest live line before believing it.
+- **A wait marker holds the wake, and `WATCH_HELD` says so.** `listen/<agent>.<pid>.json` needs a
+  `until` still in the future and no more than 24 hours out, judged with one hour of slack because
+  the waiter's clock may run ahead of the reader's; a marker without one, with a past one or with a
+  date years away is not a waiter, and a marker written on another host is judged by `until` alone.
+  A live marker suppresses the wake but not the report: a real waiter prints unread mail and marks
+  it read within a second, so owed mail still unread past `after_min` contradicts it, and
+  `WATCH_HELD {project} {agent} {id} age=… pid=… host=… until=… read=…` prints on every run. That is
+  the one case the tool cannot settle by itself: check `ps -p <pid>` and the agent's newest live
+  line before believing the marker.
 
 **What it only detects.** The tool cannot make the root honest. A line the root writes looks exactly
 like one an agent wrote, because `from` is a string and nothing signs it. A roster entry is a claim,

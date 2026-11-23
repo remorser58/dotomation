@@ -117,6 +117,7 @@ MAX_BLOCKERS = 10
 POLL_S = 1.0        # wait's mailbox poll; a message lands within about a second
 WAKE_TIMEOUT = 25   # one wake command, once, never retried; under the connector's 30 s exec yield
 LISTEN_MAX_S = 86400  # a listen marker that claims a longer wait than this is not evidence of a waiter
+LISTEN_SLACK_S = 3600  # the reader's clock may lag the waiter's, so that cap is judged with slack
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                     r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY"
@@ -601,10 +602,13 @@ def marker_live(m):
     The cap matters as much as the rule: the folder is writable by the dot root, so a marker naming a
     live local pid and a date far in the future would otherwise look like a waiter forever. A marker
     that names a live local pid and a plausible `until` is indistinguishable from a real waiter — the
-    process has to be looked at, and that is stated in workflows/direct-mail.md."""
+    process has to be looked at, and that is stated in workflows/direct-mail.md. The cap carries an
+    hour of slack because the waiter's clock may run ahead of the reader's: a waiter holding the
+    longest allowed timeout must not be judged dead by a reader whose clock is a few minutes behind."""
     until = parse_t(m.get("until"))
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    if until is None or until <= now_utc or until > now_utc + datetime.timedelta(seconds=LISTEN_MAX_S):
+    if until is None or until <= now_utc \
+            or until > now_utc + datetime.timedelta(seconds=LISTEN_MAX_S + LISTEN_SLACK_S):
         return False
     pid = m.get("pid")
     if not isinstance(pid, int) or pid <= 0:
@@ -827,11 +831,26 @@ def wait_loop(dot, agent, timeout, expect=None):
 
     With `expect`, the id of the reply that is waiting, only a message whose `re` is that id ends the
     wait: any other mail is printed and marked delivered on the way, because a note or a question is
-    not the answer, and mail already unread when the reply started must not end it either."""
+    not the answer, and mail already unread when the reply started must not end it either.
+
+    `shown` holds what this process has already printed. A line whose id cannot be marked delivered —
+    a hand-written one with a bad id — would otherwise print again on every poll, once a second."""
+    shown = set()
+
+    def fresh(pending):
+        out = []
+        for box, project, m in pending:
+            key = (box, json.dumps(m, sort_keys=True, ensure_ascii=False))
+            if key in shown:
+                continue
+            shown.add(key)
+            out.append((box, project, m))
+        return out
+
     def answer_arrived(pending):
         return bool(pending) if expect is None else any(m.get("re") == expect for _box, _proj, m in pending)
 
-    pending = unread_all(agent)
+    pending = fresh(unread_all(agent))
     if pending:
         print_pending(pending)
         mark_delivered(pending)
@@ -855,7 +874,7 @@ def wait_loop(dot, agent, timeout, expect=None):
         deadline = time.monotonic() + timeout
         while True:
             time.sleep(POLL_S)
-            pending = unread_all(agent)
+            pending = fresh(unread_all(agent))
             if pending:
                 print_pending(pending)
                 mark_delivered(pending)
@@ -994,6 +1013,7 @@ def watch_once(expected, wake, notify, delays, st_path, src):
     cfg = config()
     st = load_state(st_path)
     seen = set()
+    dirty = False
     no_wake = no_notify = False
     for project, agent, box, m in owed_mail():
         mid = m.get("id")
@@ -1003,13 +1023,28 @@ def watch_once(expected, wake, notify, delays, st_path, src):
         rec = st["messages"].setdefault(mid, {})
         rec.setdefault("project", project)
         rec.setdefault("agent", agent)
-        age = age_min(m.get("t"))
-        if age is None:
+        if not rec.get("seen_t"):
+            # the ledger remembers the first sight of an owed line, so one deleted before its first
+            # ring still ends as WATCH_RESOLVED instead of vanishing
+            rec["seen_t"] = now()
+            dirty = True
+        # an unparseable or future `t` must not hide a message: fall back to when it was first seen
+        ages = [a for a in (age_min(m.get("t")), age_min(rec.get("seen_t"))) if a is not None]
+        if not ages:
+            print(f"WATCH_ERROR {project} {agent} {mid} no usable time t={m.get('t')!r} "
+                  f"seen_t={rec.get('seen_t')!r}", flush=True)
             continue
-        silent = listen_state(agent) is None
+        age = max(ages)
+        held = listen_state(agent)
         dot = dot_for(agent, cfg)
         values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
-        if silent and age >= delays["after_min"]:
+        if held and age >= delays["after_min"]:
+            # a marker holds the wake back. A real waiter prints and marks unread mail within POLL_S,
+            # so owed mail still unread past after_min contradicts it: say who holds it, every run.
+            print(f"WATCH_HELD {project} {agent} {mid} age={round(age)}m pid={held.get('pid')} "
+                  f"host={held.get('host') or '-'} until={held.get('until') or '-'} "
+                  f"read={'no' if unread_in(box, mid) else 'yes'}", flush=True)
+        if held is None and age >= delays["after_min"]:
             if rec.get("wake_t"):
                 # the ledger, not the evidence, is why no wake runs: say so, then go on to notify
                 print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={rec['wake_t']} "
@@ -1053,6 +1088,8 @@ def watch_once(expected, wake, notify, delays, st_path, src):
             save_state(st_path, st)
         print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={round(since)}m "
               f"read={'no' if unread_in(box, mid) else 'yes'} exit={detail or code}", flush=True)
+    if dirty:
+        save_state(st_path, st)   # first sight is a ledger write: a vanished line must resolve, not vanish
     for mid, rec in sorted(st["messages"].items()):
         if mid in seen:
             continue
@@ -1258,7 +1295,8 @@ def rules_lines(script):
         f"  hand work back: python3 {script} reply <project> <agentId> <result|question|block> <task> --re ID "
         f"--ref R   (text on stdin); it stays open and prints the main session's answer, so do not end the turn",
         f"  no assigned work: python3 {script} wait <DOT> <agentId> --timeout 3300   (it marks what it prints read)",
-        "  exit 3: tick step, then run it again. exit 4: a signal ended it, so run it again.",
+        "  exit 3 or 4, from wait or reply: tick step, then run wait again; a reply is already written, "
+        "so running reply again would write the result twice.",
         "  tick done is refused while a task, question or review in your inbox has no answer in out.jsonl.",
     ]
 
@@ -1303,9 +1341,9 @@ def brief(base, dots, projects, cfg, script):
     else:
         print("Wake command: none (send prints the manual doorbell; watch prints WATCH_ERROR)")
     if cfg.get("notify"):
-        print("Notify command: configured (watch runs it when a wake did not get the mail read)")
+        print("Notify command: configured (watch runs it when a woken agent has still not answered)")
     else:
-        print("Notify command: none (watch prints WATCH_ERROR when a wake fails)")
+        print("Notify command: none (watch prints WATCH_ERROR when a notify is due and no command is set)")
 
 class Piped:
     """A reader that stops early (`dots.py send ... | head -1`) must not raise and must not skip
