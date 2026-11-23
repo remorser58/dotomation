@@ -239,11 +239,16 @@ def jsonl(path):
     no lines, never as a crash and never as a block, and says so once on stderr: every reader here runs
     on shapes the root can write, so a silent empty read would be a claim this tool cannot make.
 
+    A line ends at \\n, \\r\\n or a bare \\r, which is what a text-mode read used to accept and what a
+    hand-written mailbox may contain: splitlines() is the only splitter that keeps all three, so a
+    file that ends its lines in \\r is read, not silently called empty.
+
     Decoding is per line on purpose. A mailbox is bytes the root can append to, and one byte that is
-    not UTF-8 must cost that one line: the bytes are split on b"\\n" first and each line decoded on
-    its own, so damage cannot swallow the good lines after it, and the skipped count is printed once
-    per change (skipped_lines). Decoding the stream instead would drop everything from the bad byte to
-    the next buffer boundary, which is a silent loss of mail a later `watch` never rings."""
+    not UTF-8 must cost that one line: each line is decoded on its own, so damage cannot swallow the
+    good lines after it, and the skipped count is printed once per change (skipped_lines). Decoding
+    the stream instead would drop everything from the bad byte to the next buffer boundary, which is a
+    silent loss of mail a later `watch` never rings. The whole file is read here and this function
+    returns every parsed line anyway, so the copy costs no more than the list it builds."""
     if not regular(path):
         unreadable(path, "not a regular file")
         return []
@@ -254,7 +259,7 @@ def jsonl(path):
     skipped = 0
     try:
         with os.fdopen(fd, "rb") as raw:
-            for bline in raw:
+            for bline in raw.read().splitlines():
                 try:
                     ln = bline.decode("utf-8")
                 except UnicodeDecodeError:

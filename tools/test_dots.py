@@ -406,6 +406,26 @@ class TickTests(Base):
         self.assertIn(f"skipped 1 line in {os.path.join(box, 'in.jsonl')}", res.stderr)
         self.assertNotIn("treated as no lines", res.stderr)   # the file itself is readable
 
+    def test_a_mailbox_whose_lines_end_in_cr_is_read(self):
+        # a hand-written mailbox may end its lines in a bare \r, which a text-mode read used to accept.
+        # Splitting bytes on b"\n" alone made the whole file one unparseable line: zero messages, and no
+        # warning, because the file was readable. Mail that exists must never read as no mail
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        os.makedirs(box, exist_ok=True)
+
+        def mail_line(mid, text):
+            return json.dumps({"v": 1, "id": mid, "t": d.now(), "from": "proj-main", "to": "agent-1",
+                               "task": "issue 1", "kind": "task", "re": None, "text": text,
+                               "refs": []})
+        lines_ = [mail_line(f"m-20260101T000000Z-000{i}", "cr line ending") for i in range(2)]
+        with open(os.path.join(box, "in.jsonl"), "wb") as fh:
+            fh.write("\r".join(lines_).encode() + b"\r")
+        res = self.tick()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.count("MAIL_NEW"), 2, res.stdout)
+        self.assertEqual(res.stdout.count("cr line ending"), 2, res.stdout)
+        self.assertNotIn("cannot read", res.stderr)   # the file was read, not called unreadable
+
     def test_refused_tick_writes_nothing(self):
         live = os.path.join(self.base, "live", "DOT-A", "agent-1.jsonl")
         res = run(["tick", "DOT-A", "agent-1", "start"] + list(TICK) +
