@@ -43,8 +43,8 @@ Lines already in the folder may use `timestamp` instead of `t`, miss a field, or
 
 - `start` when taking up the brief, before the first workspace mutation.
 - `step` at each material step, and at least every 15 minutes while working. A long tool run gets a `step` before it and a `step` after it.
-- Each time it appends a line, the agent also rewrites its own [session memory](session-memory.md) with the same `t`, `task`, `state` and `host`. The instance helper `dots.py tick` does both in one call.
-- An agent assigned to a project main session also reads its [direct mail](direct-mail.md) inbox each time it appends a line, and cites a message it acts on as `mail:<agentId>/<message id>`.
+- Each time it appends a line, the agent also rewrites its own [session memory](session-memory.md) with the same `t`, `task`, `state` and `host`. The helper [`dots.py`](../tools/dots.py) `tick` does both in one call and prints unread [direct mail](direct-mail.md#steering-send-wait-reply) first, before the live line, so a new instruction steers the agent before its next step.
+- An agent with no assigned work does not end its turn: it holds `dots.py wait` open and appends a `step` each time that wait times out, until the coordinator releases it ([direct mail](direct-mail.md#steering-send-wait-reply)). A wait that is blocking is not a stall; the stall clock still runs from the newest line, so the agent's own timeout keeps it fresh. `wait` exits 3 on that timeout and 4 when a signal ends it, and in both cases the agent starts another wait; the lines it printed are already marked read, so nothing is handled twice.
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules. A later `review` that reopens the work is answered with a new `step`; on [direct mail](direct-mail.md) an accepting `answer` gets one more `done`.
 
