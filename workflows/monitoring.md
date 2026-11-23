@@ -7,9 +7,9 @@ It is one read-only file. No service, no install, no hook, no credential, no tel
 ## Run it
 
 ```bash
-python3 tools/dots_monitor.py snapshot            # human table
-python3 tools/dots_monitor.py snapshot --json     # same data as JSON
-python3 tools/dots_monitor.py watch --interval 60 # one line per change
+python3 tools/dots_monitor.py --config <instance config> snapshot            # human table
+python3 tools/dots_monitor.py --config <instance config> snapshot --json     # same data as JSON
+python3 tools/dots_monitor.py --config <instance config> watch --interval 60 # one line per change
 ```
 
 Python 3.9 or newer, standard library only. `ssh` is used for a remote ledger or remote daemon log; `gh` is used to resolve evidence. A missing `gh` degrades evidence to `unknown` and is reported as `DOTS_ERROR`, not silently ignored. `snapshot` exits `0` when every source answered and `2` when at least one source failed, including a live directory missing for a configured dot. `watch` prints the failure as a `DOTS_ERROR` line, keeps running, and exits `0` on Ctrl-C.
@@ -53,7 +53,7 @@ A request count is not a result. It does not show what was run, whether a gate p
 
 ## Config
 
-`tools/dots-monitor.example.json` is the template, and an instance keeps its own filled-in copy outside this repository: host names, paths, account numbers and repository names only, no secrets. Copy the template to that file and pass it with `--config PATH`; without a config the tool falls back to its built-in default. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
+`tools/dots-monitor.example.json` is the template, and an instance keeps its own filled-in copy outside this repository: host names, paths, account numbers and repository names only, no secrets. Copy the template to that file and pass it with `--config PATH`, before the subcommand as in [Run it](#run-it); without a config the tool falls back to the template's placeholder dots and reports each one as `DOTS_ERROR ... live directory missing`. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
 
 ```json
 {
@@ -92,7 +92,7 @@ DOTS_DOT DOT-A - calls_15m=16             # first scan only, one per dot
 - A configured dot whose live directory is missing on a reachable host is `DOTS_ERROR ledger`, not an empty table.
 - Not resident: `watch` is a foreground command the reader starts and stops. Nothing installs, schedules or restarts it.
 - It is not a coordinator. It reports; a coordinator still decides to reassign a stalled slot or to close a task.
-- It does not contact a dot. Nothing here sends a message to a REV or REM chat, and nothing assigns work.
+- It does not contact a dot. Nothing here sends a message to a dot's chat, and nothing assigns work.
 - It prints no secret. Values are redacted before display, in the table, in `--json` output and in `watch` lines and JSON events; the JSON paths redact every string of the document recursively. Covered: GitHub tokens, `sk-` keys, `token=`/`api_key=` pairs, MCP path tokens, and any long mixed-case alphanumeric run. Commit SHAs and hyphenated task ids survive.
 - Legacy lines are shown, counted and left exactly as written, because the log is append-only.
 - Tests: `python3 tools/test_dots_monitor.py` — stdlib `unittest`, synthetic fixtures, a fake transport and a fake `gh`; no network. One test runs the generated dump scripts with the local `/bin/sh` against a temporary directory.
