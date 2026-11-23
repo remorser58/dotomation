@@ -49,14 +49,22 @@ Readers (read-only):
   dots.py memo <DOT> <agent>        that agent's memory and its last 3 live lines
 
 Owner side (the dot root is not trusted):
-  dots.py watch [--loop MINUTES] [--expect-sha256 HEX]   --loop 0 (the default) runs once
-      For every inbox line that still owes an answer and whose agent holds no wait: after
-      `watch.after_min` minutes (dots.json, default 10) run the configured `wake` argv once; if it
-      is still unread and unanswered `watch.notify_after_min` minutes (default 20) later, run
-      `notify` once. Its ledger is <base>/watch/state.json, so a restart never rings twice, and it
-      prints one WATCH_WAKE, WATCH_NOTIFY, WATCH_RESOLVED, WATCH_TOOL_CHANGED or WATCH_ERROR line
-      per action. --expect-sha256 compares this file's own bytes each run: the shared folder is
+  dots.py watch [--loop MINUTES] [--expect-sha256 HEX] [--wake-cmd ARGV] [--notify-cmd ARGV]
+      [--after-min N] [--notify-after-min N] [--state PATH]   --loop 0 (the default) runs once
+      For every inbox line that still owes an answer and whose agent holds no live wait marker:
+      after `after_min` minutes run the wake argv once; if the line is still unanswered
+      `notify_after_min` minutes later, run the notify argv once. A message counts as owed until
+      an out.jsonl line answers it, read or not: a read marker adds WATCH_STUCK, it never silences
+      the notify. Every run starts with one WATCH_CONFIG line naming the source of each value
+      (`argv`, `dots.json`, `default`), and the flags win, because dots.json sits in the folder the
+      dot root writes. The ledger defaults to <base>/watch/state.json; --state keeps it elsewhere.
+      The ledger may only add a line: a record that suppresses a step prints WATCH_SKIP. Other
+      lines are WATCH_WAKE, WATCH_NOTIFY, WATCH_STUCK, WATCH_RESOLVED, WATCH_TOOL_CHANGED and
+      WATCH_ERROR. --expect-sha256 compares this file's own bytes each run: the shared folder is
       writable by the dot root, the command line is not.
+      A marker counts as a waiter only with a `until` between now and a day out, so a marker naming
+      a live local pid with a plausible `until` is the one case the tool cannot tell from a real
+      wait; workflows/direct-mail.md says how to check it.
 
 Setup (once per machine; idempotent, adds only):
   dots.py init [--base DIR] [--dot ID]... [--project ID=MAIN]... [--host LABEL=PURPOSE]...
@@ -71,7 +79,16 @@ another one for this machine and prints the export line to set, because later co
 read the environment first. Every command works without dots.json: the dot and the project are
 read from the folders that exist.
 """
-import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, subprocess, sys, time
+import sys
+
+# Run as a script, sys.path[0] is the folder this file sits in — and the tool may be copied into a
+# folder the dot root can write. A sibling `json.py` or `socket.py` there would shadow the standard
+# library before any check could run, so drop that entry before the imports below. Imported as a
+# module, sys.path[0] belongs to the importer and is left alone.
+if __name__ == "__main__" and sys.path:
+    del sys.path[0]
+
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, subprocess, time
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -99,6 +116,7 @@ MAX_DECISIONS = 20  # newest kept; the full history is the live log
 MAX_BLOCKERS = 10
 POLL_S = 1.0        # wait's mailbox poll; a message lands within about a second
 WAKE_TIMEOUT = 25   # one wake command, once, never retried; under the connector's 30 s exec yield
+LISTEN_MAX_S = 86400  # a listen marker that claims a longer wait than this is not evidence of a waiter
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                     r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY"
@@ -506,10 +524,11 @@ def board(a):
             print(f"    block: {clip(b)}")
         if r["mail"]:
             m = r["mail"]
-            waiting = (f", {m['waiting']} waiting (oldest {age_label(m['oldest_waiting_min'])})"
+            waiting = (f"; {m['waiting']} waiting (oldest {age_label(m['oldest_waiting_min'])})"
                        if m.get("waiting") else "")
-            print(f"    mail:  to agent {m['new']} unread, {m['unanswered']} unanswered{waiting}; "
-                  f"from agent {m['unread_out']} unread")
+            # the old line stays an exact prefix: an external reader that greps it keeps working
+            print(f"    mail:  to agent {m['new']} unread, {m['unanswered']} unanswered; "
+                  f"from agent {m['unread_out']} unread{waiting}")
 
 def memo(a):
     dot, agent = token("DOT", a.dot), token("agent", a.agent)
@@ -575,13 +594,20 @@ def marker_paths(agent):
                   if exact.match(os.path.basename(p)))
 
 def marker_live(m):
-    """A marker is not listening when its pid is invalid, its process is gone or its `until` has passed.
-    A marker written on another host is judged by `until` alone: a pid there means nothing here."""
+    """A marker is not listening when its `until` is missing, past or implausibly far away, when its
+    pid is invalid, or when its own process here is gone. A marker written on another host is judged
+    by `until` alone, because its pid says nothing here: with no usable `until` it proves nothing.
+
+    The cap matters as much as the rule: the folder is writable by the dot root, so a marker naming a
+    live local pid and a date far in the future would otherwise look like a waiter forever. A marker
+    that names a live local pid and a plausible `until` is indistinguishable from a real waiter — the
+    process has to be looked at, and that is stated in workflows/direct-mail.md."""
+    until = parse_t(m.get("until"))
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    if until is None or until <= now_utc or until > now_utc + datetime.timedelta(seconds=LISTEN_MAX_S):
+        return False
     pid = m.get("pid")
     if not isinstance(pid, int) or pid <= 0:
-        return False
-    until = parse_t(m.get("until"))
-    if until is not None and until < datetime.datetime.now(datetime.timezone.utc):
         return False
     if m.get("host") and m["host"] != socket.gethostname():
         return True
@@ -777,8 +803,8 @@ def reply(a):
         print(f"MAILBOX {project}/{agent} (new folder)", flush=True)
     if waits:
         print(f"REPLY waiting for the answer to {msg['id']} (dot={dot}); do not end the turn — this command "
-              f"prints it. On exit 3 tick step and reply again.", flush=True)
-        return wait_loop(dot, agent, timeout)
+              f"prints it. On exit 3 tick step and wait again: the result is already written.", flush=True)
+        return wait_loop(dot, agent, timeout, expect=msg["id"])
     return 0
 
 # ---------------------------------------------------------------- wait
@@ -786,21 +812,31 @@ def reply(a):
 def timeout_of(a):
     if a.timeout <= 0:
         die("--timeout must be a positive number of seconds")
+    if a.timeout > LISTEN_MAX_S:
+        die(f"--timeout takes at most {LISTEN_MAX_S} seconds (a day); a longer wait is restarted, not held")
     return a.timeout
 
 def wait(a):
     dot, agent = token("DOT", a.dot), token("agent", a.agent)
     return wait_loop(dot, agent, timeout_of(a))
 
-def wait_loop(dot, agent, timeout):
+def wait_loop(dot, agent, timeout, expect=None):
     """Print unread mail at once, or block until it lands; the loop `reply` continues into after a
     result, question or block. Marks what it printed read, so the next call blocks instead of
-    repeating it. 0 mail, 3 timeout, 4 signal. Holds listen/<agent>.<pid>.json while blocking."""
+    repeating it. 0 mail, 3 timeout, 4 signal. Holds listen/<agent>.<pid>.json while blocking.
+
+    With `expect`, the id of the reply that is waiting, only a message whose `re` is that id ends the
+    wait: any other mail is printed and marked delivered on the way, because a note or a question is
+    not the answer, and mail already unread when the reply started must not end it either."""
+    def answer_arrived(pending):
+        return bool(pending) if expect is None else any(m.get("re") == expect for _box, _proj, m in pending)
+
     pending = unread_all(agent)
     if pending:
         print_pending(pending)
         mark_delivered(pending)
-        return 0
+        if answer_arrived(pending):
+            return 0
     if not os.path.isdir(os.path.join(BASE, "live", dot)):
         print(f"dots: no live/{dot} folder; waiting anyway", file=sys.stderr)
     listen_dir = os.path.join(BASE, "listen")
@@ -823,7 +859,8 @@ def wait_loop(dot, agent, timeout):
             if pending:
                 print_pending(pending)
                 mark_delivered(pending)
-                return 0
+                if answer_arrived(pending):
+                    return 0
             if time.monotonic() >= deadline:
                 print(f"WAIT timeout dot={dot} agent={agent} after={timeout}s unread=0", flush=True)
                 return 3
@@ -858,30 +895,66 @@ def mark_delivered(pending):
 # ---------------------------------------------------------------- watch
 
 def watch_cfg(cfg):
+    """The two delays, and where each came from: dots.json's own `watch` object, else the default."""
     w = cfg.get("watch") if isinstance(cfg.get("watch"), dict) else {}
-    out = dict(WATCH_DEFAULTS)
-    for k in out:
+    out, src = {}, {}
+    for k, default in WATCH_DEFAULTS.items():
         v = w.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-            out[k] = v
-    return out
+            out[k], src[k] = v, "dots.json"
+        else:
+            out[k], src[k] = default, "default"
+    return out, src
+
+def watch_settings(a, cfg):
+    """Effective watchdog settings; the command line wins over dots.json, which sits in the folder the
+    dot root writes. Returns (wake argv, notify argv, delays, state path, sources) where every source
+    is `argv`, `dots.json`, `default` or `none`."""
+    wake = notify = None
+    src = {}
+    for key in ("wake", "notify"):
+        spec = getattr(a, f"{key}_cmd", None)
+        if spec is not None:
+            argv = cli_argv(spec, f"--{key}-cmd")
+            src[key] = "argv"
+        else:
+            argv = cfg.get(key) if argv_list(cfg.get(key)) else None
+            src[key] = "dots.json" if argv else "none"
+        if key == "wake":
+            wake = argv
+        else:
+            notify = argv
+    delays, dsrc = watch_cfg(cfg)
+    for key in WATCH_DEFAULTS:
+        v = getattr(a, key, None)
+        if v is not None:
+            if v < 0:
+                die(f"--{key.replace('_', '-')} takes minutes, 0 or more")
+            delays[key], src[key] = v, "argv"
+        else:
+            src[key] = dsrc[key]
+    path = os.path.abspath(os.path.expanduser(a.state)) if a.state else state_path()
+    src["state"] = "argv" if a.state else "default"
+    return wake, notify, delays, path, src
 
 def state_path():
     return os.path.join(BASE, "watch", "state.json")
 
-def load_state():
-    """The watchdog's own ledger: one record per message id, so a restart never rings twice."""
-    st = load_json(state_path()) or {}
+def load_state(path):
+    """The watchdog's own ledger: one record per message id, so a restart never rings twice. It is
+    the only thing that can silence a ring, so every suppression it causes is printed."""
+    st = load_json(path) or {}
     msgs = st.get("messages")
     return {"v": 1, "messages": msgs if isinstance(msgs, dict) else {}}
 
-def save_state(st):
-    os.makedirs(os.path.dirname(state_path()), exist_ok=True)
-    write_atomic(state_path(), json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+def save_state(path, st):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_atomic(path, json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
 
 def owed_mail():
-    """(project, agent, box, message) for every inbox line that owes an answer, read from the mail
-    folders only: no roster, no live line and no dots.json entry decides what is listed."""
+    """(project, agent, box, message) for every inbox line that still owes an answer, read from the
+    mail folders only: no roster, no live line and no dots.json entry decides what is listed. A line
+    is owed until an out.jsonl line answers it, whether or not it was marked read."""
     out = []
     for box in sorted(glob.glob(os.path.join(BASE, "*", "mail", "*"))):
         agent = os.path.basename(box)
@@ -905,16 +978,21 @@ def ring(argv, values):
     except OSError as exc:
         return f"error:{exc.errno}", None
 
-def watch_once(expected):
-    cfg = config()
-    wc = watch_cfg(cfg)
+def watch_once(expected, wake, notify, delays, st_path, src):
+    print("WATCH_CONFIG " + " ".join(
+        [f"wake={src['wake']}:{json.dumps(wake, ensure_ascii=False)}" if wake else "wake=none",
+         f"notify={src['notify']}:{json.dumps(notify, ensure_ascii=False)}" if notify else "notify=none",
+         f"after_min={src['after_min']}:{delays['after_min']}",
+         f"notify_after_min={src['notify_after_min']}:{delays['notify_after_min']}",
+         f"state={src['state']}:{st_path}"]), flush=True)
     if expected:
         path = os.path.abspath(__file__)
         with open(path, "rb") as fh:
             actual = hashlib.sha256(fh.read()).hexdigest()
         if actual != expected:
             print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual} path={path}", flush=True)
-    st = load_state()
+    cfg = config()
+    st = load_state(st_path)
     seen = set()
     no_wake = no_notify = False
     for project, agent, box, m in owed_mail():
@@ -928,43 +1006,58 @@ def watch_once(expected):
         age = age_min(m.get("t"))
         if age is None:
             continue
-        if not rec.get("wake_t") and listen_state(agent) is None and age >= wc["after_min"]:
-            dot = dot_for(agent, cfg)
-            values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
-            code, detail = ring(cfg.get("wake"), values)
-            if detail == "not_configured":
-                if not no_wake:
-                    print("WATCH_ERROR no wake command in dots.json; an ended agent cannot be restarted", flush=True)
-                    no_wake = True
-                continue
-            if code is not None:
-                rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
-                save_state(st)
-            print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
-                  f"exit={detail or code}", flush=True)
-        if not rec.get("wake_t") or rec.get("notify_t"):
+        silent = listen_state(agent) is None
+        dot = dot_for(agent, cfg)
+        values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
+        if silent and age >= delays["after_min"]:
+            if rec.get("wake_t"):
+                # the ledger, not the evidence, is why no wake runs: say so, then go on to notify
+                print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={rec['wake_t']} "
+                      f"wake_age_min={rec.get('wake_age_min', '-')}", flush=True)
+            else:
+                code, detail = ring(wake, values)
+                if detail == "not_configured":
+                    if not no_wake:
+                        print("WATCH_ERROR no wake command; an ended agent cannot be restarted", flush=True)
+                        no_wake = True
+                else:
+                    if code is not None:
+                        rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
+                        save_state(st_path, st)
+                    print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
+                          f"exit={detail or code}", flush=True)
+        if not rec.get("wake_t"):
             continue
         since = age_min(rec["wake_t"])
-        if since is None or since < wc["notify_after_min"] or not unread_in(box, mid):
+        if since is None or since < delays["notify_after_min"]:
             continue
-        dot = rec.get("dot") or dot_for(agent, cfg)
-        values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
-        code, detail = ring(cfg.get("notify"), values)
+        # A message is owed until it is answered, read or not. A read marker lives in the same folder
+        # as the mail, so it can add a visible event here, never silence this one.
+        if not unread_in(box, mid) and not rec.get("stuck_t"):
+            rec["stuck_t"] = now()
+            save_state(st_path, st)
+            print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
+                  f"wake_t={rec['wake_t']}", flush=True)
+        if rec.get("notify_t"):
+            print(f"WATCH_SKIP {project} {agent} {mid} reason=notify_already notify_t={rec['notify_t']}",
+                  flush=True)
+            continue
+        code, detail = ring(notify, values)
         if detail == "not_configured":
             if not no_notify:
-                print("WATCH_ERROR no notify command in dots.json; the owner is never told", flush=True)
+                print("WATCH_ERROR no notify command; the owner is never told", flush=True)
                 no_notify = True
             continue
         if code is not None:
             rec["notify_t"] = now()
-            save_state(st)
+            save_state(st_path, st)
         print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={round(since)}m "
-              f"exit={detail or code}", flush=True)
+              f"read={'no' if unread_in(box, mid) else 'yes'} exit={detail or code}", flush=True)
     for mid, rec in sorted(st["messages"].items()):
         if mid in seen:
             continue
         del st["messages"][mid]
-        save_state(st)
+        save_state(st_path, st)
         print(f"WATCH_RESOLVED {rec.get('project') or '-'} {rec.get('agent') or '-'} {mid}", flush=True)
 
 def stop_quiet(signum, frame):
@@ -976,10 +1069,11 @@ def watch(a):
     expected = (a.expect_sha256 or "").strip().lower()
     if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
         die("--expect-sha256 takes the 64 hex characters of sha256sum tools/dots.py")
+    wake, notify, delays, st_path, src = watch_settings(a, config())
     for s in SIGNALS:
         signal.signal(s, stop_quiet)
     while True:
-        watch_once(expected)
+        watch_once(expected, wake, notify, delays, st_path, src)
         if a.loop == 0:
             return 0
         time.sleep(a.loop * 60)
@@ -1008,19 +1102,23 @@ def pairs(values, flag):
         out.append((left.strip(), right.strip()))
     return out
 
+def cli_argv(spec, flag):
+    """One argv list from a --*-cmd JSON argument. `init` and `watch` share the same rule."""
+    try:
+        argv = json.loads(spec)
+    except ValueError:
+        die(f"{flag} takes a JSON list of strings; run dots.py init -h for an example")
+    if not (isinstance(argv, list) and 0 < len(argv) <= 32
+            and all(isinstance(x, str) and x.strip() for x in argv)):
+        die(f"{flag} must be a JSON list of 1-32 non-empty strings")
+    if any("\n" in x or "\r" in x for x in argv):
+        die(f"{flag} entries must be one line each")
+    return argv
+
 def set_cmd(cfg, key, spec, report):
     """Store one configured argv list (wake or notify) from --KEY-cmd JSON, validating it first."""
-    flag = f"--{key}-cmd"
     if spec:
-        try:
-            argv = json.loads(spec)
-        except ValueError:
-            die(f"{flag} takes a JSON list of strings; run dots.py init -h for an example")
-        if not (isinstance(argv, list) and 0 < len(argv) <= 32
-                and all(isinstance(x, str) and x.strip() for x in argv)):
-            die(f"{flag} must be a JSON list of 1-32 non-empty strings")
-        if any("\n" in x or "\r" in x for x in argv):
-            die(f"{flag} entries must be one line each")
+        argv = cli_argv(spec, f"--{key}-cmd")
         if cfg.get(key) and cfg[key] != argv:
             report.append(f"INIT {key} (replaced)")
         elif not cfg.get(key):
@@ -1142,6 +1240,14 @@ def init(a):
     print(f"INIT config {path} ({'unchanged' if current == data else 'written'})")
     brief(base, dots, projects, cfg, os.path.abspath(__file__))
 
+def tool_memory(dot, agent):
+    """True when this agent already has the memory file `tick` would have written: v1, its own name,
+    and the three text fields a first task requires. A file that merely exists is not enough — the
+    folder is writable by the dot root, and a stub there must not swallow the rules banner."""
+    mem = load_json(os.path.join(BASE, "memory", dot, f"{agent}.json"))
+    return bool(mem and mem.get("v") == 1 and mem.get("agent") == agent
+                and mem.get("task") and mem.get("goal") and mem.get("doing") and mem.get("next"))
+
 def rules_lines(script):
     """The agent-side rules, printed once by init's brief and again by the first command an agent
     runs with no memory file. The dot root may never paste the brief, so the tool repeats them."""
@@ -1165,7 +1271,7 @@ def announce_rules(a):
     dot = getattr(a, "dot", None) or dot_for(agent)
     if not (isinstance(dot, str) and TOKEN.match(dot)):
         return
-    if os.path.exists(os.path.join(BASE, "memory", dot, f"{agent}.json")):
+    if tool_memory(dot, agent):
         return
     for line in rules_lines(os.path.abspath(__file__)):
         print(line)
@@ -1185,8 +1291,12 @@ def brief(base, dots, projects, cfg, script):
     for line in rules_lines(script):
         print(line)
     print("Main session: python3 " + script + " send <project> <agentId> <kind> <task>  (text on stdin)")
-    print("Watchdog (the owner, not the dot root): python3 " + script + " watch --loop 5 --expect-sha256 <sha256 of "
-          "dots.py>; it wakes and then notifies, and prints WATCH_* lines")
+    print("Watchdog (the owner, not the dot root): python3 " + script + " watch --loop 5 --expect-sha256 "
+          "<sha256 of dots.py> --wake-cmd '<argv JSON>' --notify-cmd '<argv JSON>' --after-min 10 "
+          "--notify-after-min 20 --state ~/.dots-ops-watch.json")
+    print("  Pass the commands on the watch command line, not only in dots.json: that file sits in the "
+          "folder the dot root writes, the owner's own command line does not. Every run prints one "
+          "WATCH_CONFIG line saying where each value came from.")
     print(f"Kit pin: dots-superkit/handoff-v1 @ <kit commit SHA>")
     if cfg.get("wake"):
         print("Wake command: configured (send and watch run it when no agent is listening)")
@@ -1295,6 +1405,16 @@ def main(argv):
     c.add_argument("--loop", type=float, default=0.0, help="minutes between runs; 0 runs once (default 0)")
     c.add_argument("--expect-sha256", dest="expect_sha256",
                    help="sha256 of this file; a different file prints WATCH_TOOL_CHANGED")
+    c.add_argument("--wake-cmd", dest="wake_cmd",
+                   help='argv list as JSON; wins over dots.json (which the dot root can write), '
+                        'e.g. \'["ssh","box","wake","{agent}"]\'')
+    c.add_argument("--notify-cmd", dest="notify_cmd",
+                   help='argv list as JSON for the notify step, same placeholders plus {age}; wins over dots.json')
+    c.add_argument("--after-min", dest="after_min", type=int,
+                   help="minutes a message waits unanswered before the wake (wins over dots.json; default 10)")
+    c.add_argument("--notify-after-min", dest="notify_after_min", type=int,
+                   help="minutes after the wake before the notify (wins over dots.json; default 20)")
+    c.add_argument("--state", help="ledger path; keep it outside the shared folder (default <base>/watch/state.json)")
     a = p.parse_args(argv)
     announce_rules(a)
     code = {"tick": tick, "board": board, "memo": memo, "send": send, "inbox": inbox, "read": read,

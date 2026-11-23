@@ -515,6 +515,16 @@ class RulesTests(Base):
         self.send()
         for args in (["board"], ["inbox"], ["memo", "DOT-A", "agent-1"]):
             self.assertNotIn("AGENT_RULES", run(args, self.base).stdout, args)
+    def test_a_stub_memory_does_not_swallow_the_rules(self):
+        # the memory folder is writable by the dot root, so a file that merely exists must not count:
+        # only the memory `tick` would have written silences the banner
+        path = os.path.join(self.base, "memory", "DOT-A", "agent-1.json")
+        d.write_atomic(path, "{}\n")
+        res = self.tick()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("AGENT_RULES", res.stdout)
+        self.assertEqual(d.load_json(path)["agent"], "agent-1")   # tick wrote the real one over it
+        self.assertNotIn("AGENT_RULES", self.tick(state="step").stdout)
 
 
 class ReplyWaitTests(Base):
@@ -575,6 +585,24 @@ class ReplyWaitTests(Base):
             self.assertLess(time.monotonic() - started, 5.0, kind)
             self.assertNotIn("WAIT listening", res.stdout, kind)
         self.assertEqual(marker_files(self.base), [])
+
+    def test_only_the_answer_to_this_reply_ends_the_wait(self):
+        # a note or a question that arrives while the reply waits is printed, but it is not the answer
+        mid = self.send(text="fix it")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)
+        self.send(kind="note", task="issue 1", text="a note left unread")
+        p = self.start_reply("result", "issue 1", "--re", mid, "--timeout", "30")
+        self.assertTrue(wait_for(lambda: marker_files(self.base), 5.0), "reply never opened a wait marker")
+        rid = lines(os.path.join(self.base, "proj", "mail", "agent-1", "out.jsonl"))[0]["id"]
+        time.sleep(2.0)
+        self.assertIsNone(p.poll(), "mail that is not the answer ended the wait")
+        answer = run(["send", "proj", "agent-1", "answer", "issue 1", "--re", rid], self.base,
+                     stdin="all gates PASS")
+        aid = answer.stdout.splitlines()[0]
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn(aid, out)
+        self.assertIn("all gates PASS", out)
 
     def test_a_first_result_without_re_is_schema_valid(self):
         # a result for work the dot root gave answers no mail line: re is null and a ref says what it is
@@ -736,8 +764,8 @@ class WatchTests(Base):
                              stdin="fixed").returncode, 0)
         res = run(["watch"], self.base)
         self.assertIn(f"WATCH_RESOLVED proj agent-1 {mid}", res.stdout)
-        self.assertEqual(run(["watch"], self.base).stdout.strip(), "")
-        self.assertEqual(d.load_json(os.path.join(self.base, "watch", "state.json"))["messages"], {})
+        # the config line is printed every run, so "nothing happened" is the empty tail after it
+        self.assertEqual(run(["watch"], self.base).stdout.strip().splitlines()[1:], [])
 
     def test_a_listening_agent_is_not_woken(self):
         self.waiting_message(read=True)   # read, so the waiter has nothing to print
@@ -772,7 +800,108 @@ class WatchTests(Base):
         self.assertEqual(run(["watch", "--loop", "-1"], self.base).returncode, 2)
         self.assertEqual(run(["watch", "--expect-sha256", "abc"], self.base).returncode, 2)
 
+    def test_the_command_line_beats_a_hostile_dots_json(self):
+        # dots.json sits in the folder the dot root writes: a changed wake, a huge delay and a notify
+        # that never fires are all one edit away, so the owner's own flags decide, and say so
+        mid = self.waiting_message(read=False)
+        target, argv = self.recorder("wake.txt")
+        ntarget, notify = self.recorder("notify.txt", ("{id}", "{age}"))
+        self.config_with(wake=["/usr/bin/true"], notify=["/usr/bin/true"],
+                         watch={"after_min": 100000, "notify_after_min": 100000})
+        res = run(["watch", "--wake-cmd", json.dumps(argv), "--notify-cmd", json.dumps(notify),
+                   "--after-min", "0", "--notify-after-min", "0"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", res.stdout)
+        self.assertEqual(read(target).split(), [mid])   # the owner's wake, not dots.json's
+        self.assertEqual(read(ntarget).split()[0], mid)
+        config = [ln for ln in res.stdout.splitlines() if ln.startswith("WATCH_CONFIG")][0]
+        for part in ("wake=argv:", "notify=argv:", "after_min=argv:0", "notify_after_min=argv:0"):
+            self.assertIn(part, config)
 
+    def test_the_ledger_cannot_hide_a_ring(self):
+        # the ledger lives in the same folder, so a forged record may only add a visible line
+        mid = self.waiting_message(read=False)
+        target, wake = self.recorder("wake.txt")
+        ntarget, notify = self.recorder("notify.txt", ("{id}", "{age}"))
+        self.config_with(wake=wake, notify=notify, watch={"after_min": 0, "notify_after_min": 0})
+        ledger = os.path.join(self.base, "watch", "state.json")
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        old = d.iso_after(-3600)
+        d.write_atomic(ledger, json.dumps({"v": 1, "messages": {mid: {
+            "project": "proj", "agent": "agent-1", "wake_t": old, "notify_t": old}}}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_SKIP proj agent-1 {mid} reason=wake_already", res.stdout)
+        self.assertIn(f"WATCH_SKIP proj agent-1 {mid} reason=notify_already", res.stdout)
+        self.assertNotIn("WATCH_WAKE", res.stdout)
+        self.assertFalse(os.path.exists(target))
+        # a record with only a wake behind it still lets the notify run: the ledger may not end the
+        # escalation halfway, so the owner is told even when the wake step is suppressed
+        d.write_atomic(ledger, json.dumps({"v": 1, "messages": {mid: {
+            "project": "proj", "agent": "agent-1", "wake_t": old}}}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertIn("reason=wake_already", res.stdout)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", res.stdout)
+        self.assertEqual(read(ntarget).split()[0], mid)
+        # --state keeps the ledger outside the folder the dot root writes
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        path = os.path.join(outside.name, "ledger.json")
+        res = run(["watch", "--state", path, "--after-min", "0", "--notify-after-min", "0"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"state=argv:{path}", res.stdout)
+        self.assertEqual(set(d.load_json(path)["messages"]), {mid})
+        self.assertEqual(set(d.load_json(ledger)["messages"]), {mid})   # the default ledger is untouched
+
+    def forget(self):
+        """Drop the watchdog's ledger, so the next run is a first run again."""
+        path = os.path.join(self.base, "watch", "state.json")
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def test_a_marker_without_until_or_far_in_the_future_is_not_a_waiter(self):
+        mid = self.waiting_message(read=True)   # read, so no real waiter has anything to print
+        target, wake = self.recorder("wake.txt")
+        self.config_with(wake=wake, watch={"after_min": 0, "notify_after_min": 100})
+        marker = os.path.join(self.base, "listen", "agent-1.999.json")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        d.write_atomic(marker, json.dumps({"pid": 1, "host": "elsewhere"}) + "\n")   # no until
+        res = run(["watch"], self.base)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+        self.assertIn("MAIL_WAITING", board_rows(self.base)["agent-1"]["flags"])
+        os.unlink(target)
+        self.forget()
+        d.write_atomic(marker, json.dumps({"pid": 1, "host": "elsewhere",
+                                           "until": "2099-01-01T00:00:00Z"}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)   # a decade is not a wait
+        os.unlink(target)
+        self.forget()
+        d.write_atomic(marker, json.dumps({"pid": 1, "host": "elsewhere",
+                                           "until": d.iso_after(300)}) + "\n")
+        res = run(["watch"], self.base)
+        self.assertNotIn("WATCH_WAKE", res.stdout)   # a foreign waiter with a real until is believed
+        self.assertFalse(os.path.exists(target))
+
+    def test_a_forged_read_marker_is_reported_and_the_notify_still_runs(self):
+        # .agent-read lives in the same folder as the mail, so it may add an event, never silence one
+        mid = self.waiting_message(read=False)
+        _, wake = self.recorder("wake.txt")
+        ntarget, notify = self.recorder("notify.txt", ("{id}", "{age}"))
+        self.config_with(wake=wake, notify=notify, watch={"after_min": 0, "notify_after_min": 100})
+        self.assertIn("WATCH_WAKE", run(["watch"], self.base).stdout)   # the notify is not due yet
+        self.assertFalse(os.path.exists(ntarget))
+        d.write_atomic(os.path.join(self.base, "proj", "mail", "agent-1", ".agent-read"), mid + "\n")
+        res = run(["watch", "--notify-after-min", "0"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"WATCH_STUCK proj agent-1 {mid}", res.stdout)
+        self.assertIn("read=yes unanswered=yes", res.stdout)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", res.stdout)
+        self.assertIn("read=yes", res.stdout)
+        self.assertEqual(read(ntarget).split()[0], mid)   # the owner was told anyway
+        again = run(["watch", "--notify-after-min", "0"], self.base)
+        self.assertNotIn("WATCH_STUCK", again.stdout)   # once, not on every run
 
 class InitTests(Base):
     def setUp(self):
@@ -925,5 +1054,22 @@ class WithoutConfigTests(Base):
         self.assertEqual(run(["memo", "DOT-A", "agent-1"], self.base).returncode, 0)
 
 
+class ScriptHijackTests(unittest.TestCase):
+    """The tool may be copied into a folder the dot root writes, so a sibling module must not win."""
+
+    def test_a_sibling_module_cannot_hijack_the_stdlib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = os.path.join(tmp, "dots.py")
+            with open(tool, "w", encoding="utf-8") as fh:
+                fh.write(read(SCRIPT))
+            with open(os.path.join(tmp, "json.py"), "w", encoding="utf-8") as fh:
+                fh.write("print('HIJACKED')\nraise SystemExit(9)\n")
+            base = os.path.join(tmp, "shared")
+            os.makedirs(os.path.join(base, "live", "DOT-A"))
+            env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
+            res = subprocess.run([sys.executable, tool, "board"], env=env, capture_output=True,
+                                 text=True, timeout=20)
+            self.assertNotEqual(res.returncode, 9, res.stdout + res.stderr)
+            self.assertNotIn("HIJACKED", res.stdout + res.stderr)
 if __name__ == "__main__":
     unittest.main()

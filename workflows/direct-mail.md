@@ -59,7 +59,7 @@ Direct mail is the addressed message and reply route that [direct exchanges](../
 
 ## Steering: send, wait, reply
 
-An agent's conversation cannot be read or written from outside the dot, so a new instruction from the main session is a file the agent reaches through its own approved route, plus a command the agent runs that returns as soon as that file changes. `tools/dots.py` in this kit does both ([session memory](session-memory.md#one-call-per-step)); run it from a checkout, or copy it beside the shared folder. Its `init` command writes `<base>/dots.json` and creates `live/<DOT>/`, `memory/<DOT>/` and `<project>/mail/`, then prints the brief to paste to each dot root ([quick start](../README.md#빠른-시작-로컬-한-대)).
+An agent's conversation cannot be read or written from outside the dot, so a new instruction from the main session is a file the agent reaches through its own approved route, plus a command the agent runs that returns as soon as that file changes. `tools/dots.py` in this kit does both ([session memory](session-memory.md#one-call-per-step)); run it from a checkout, or copy it beside the shared folder — a copy there drops `sys.path[0]` before importing the standard library, so a `json.py` beside it cannot be imported in its place. Its `init` command writes `<base>/dots.json` and creates `live/<DOT>/`, `memory/<DOT>/` and `<project>/mail/`, then prints the brief to paste to each dot root ([quick start](../README.md#빠른-시작-로컬-한-대)).
 
 | Side | Command |
 |---|---|
@@ -79,6 +79,12 @@ already polling that command. `--no-wait` writes the line and returns at once, f
 must hand over and stop. `ack`, `answer` and `note` never wait: they answer something and the agent
 goes on working.
 
+Only the answer to that line ends the wait: it stays open until a message whose `re` is the reply's
+own id arrives, so a note, a question or mail that was already unread when the command started is
+printed and marked delivered on the way but does not end it. On exit 3 the reply has not arrived —
+the message itself is already written, so the agent ticks `step` and runs `wait` again instead of
+writing the result twice.
+
 A first `result` often answers work the dot root gave, which is not a mail line, so `re` is `null`
 there and at least one `--ref` says what the result is about. `--re` stays required for `ack`,
 `answer` and `note`, and every line the tool writes is checked against
@@ -97,7 +103,7 @@ roster.
 
 The wake command is whatever the instance already has to post one line into that dot's chat: an argv list, no shell, `{project}`, `{agent}`, `{id}` and `{dot}` substituted. It is not part of this kit and the kit cannot check that it exists.
 
-While `wait` blocks it holds one marker per waiting process, `<base>/listen/<agentId>.<pid>.json` — `{pid, dot, since, until, host}` — and removes only its own on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker whose process is gone, or whose `until` has passed, counts as not listening, so a waiter that died never looks alive. A marker written on another host is judged by `until` alone: a pid there says nothing here. `wait` prints unread mail at once and exits 0 if anything is already unread; otherwise it blocks. It exits 3 with one line on timeout and 4 when a signal ends it, so an interrupted call is never mistaken for a delivery.
+While `wait` blocks it holds one marker per waiting process, `<base>/listen/<agentId>.<pid>.json` — `{pid, dot, since, until, host}` — and removes only its own on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker counts as listening only with a `until` still in the future and no more than 24 hours out, and with its process still alive here; a marker whose process is gone, whose `until` has passed or which names a date a day or more away counts as not listening, so a waiter that died — or one that was never there — never looks alive. A marker written on another host is judged by `until` alone: a pid there says nothing here, so without a usable `until` it proves nothing. `wait` refuses a `--timeout` over a day for that reason. `wait` prints unread mail at once and exits 0 if anything is already unread; otherwise it blocks. It exits 3 with one line on timeout and 4 when a signal ends it, so an interrupted call is never mistaken for a delivery.
 
 **An agent with no assigned work does not end its turn.** It runs `wait` with a long timeout and, if its own tool returns early with the session still running, keeps polling that session. `wait` moves the same `.agent-read` marker `tick --took` moves, so the lines it printed count as delivered: the loop is wait, handle, wait, and the same instruction is never printed twice. On exit 3 it ticks `step` and waits again; on exit 4 a signal ended it, so it waits again. This is the loop that lets a main session steer an agent the root never wakes.
 
@@ -114,8 +120,14 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 | `projects` | `id`, plus `main`, the session id that appears as `from` in that project's `in.jsonl`. |
 | `hosts` | `label`, the value a live record's `host` uses, plus what that host is for. `vm` and `local` are always there; `init --host` adds the user's own ([hosts](hosts.md#placement-the-vm-first-then-the-one-local-machine)). |
 | `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
-| `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake did not get the message read. |
+| `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake ran and the message is still unanswered. |
 | `watch` | `after_min` (default 10) and `notify_after_min` (default 20), the two delays `watch` uses. Integers, 0 or more; anything else is ignored and the default stays. |
+
+Every value here is a suggestion, not a setting: `dots.json` sits in the folder the dot root can
+write, so `watch` takes the same four from its own command line and the command line wins —
+`--wake-cmd`, `--notify-cmd`, `--after-min`, `--notify-after-min`, plus `--state` for the ledger
+path. Each run prints one `WATCH_CONFIG` line naming where every value came from (`argv`,
+`dots.json` or `default`), so a config that changed under the owner is visible as a changed line.
 
 `init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`; there is no other environment variable, and `init` resolves the same folder as every other command. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
@@ -149,9 +161,12 @@ to wake an agent, or edit the shared folder. Nothing here assumes otherwise. Wha
 from the files alone:
 
 - **The rules reach the agent without the root.** The first `dots.py` command an agent runs while it
-  has no memory file — `tick`, `reply` or `wait` — prints the agent rules ahead of that command's own
-  output, and `init` prints the same block in the brief. A root that never pastes the brief costs the
-  agent nothing.
+  has no memory file of its own — `tick`, `reply` or `wait` — prints the agent rules ahead of that
+  command's own output, and `init` prints the same block in the brief. A file that merely exists is
+  not enough: the banner is skipped only for a memory the tool itself would have written (`v` 1, that
+  agent's own name, and the task, goal, doing and next a first task requires), so a stub in the
+  root-writable memory folder cannot swallow it. A root that never pastes the brief costs the agent
+  nothing.
 - **An agent cannot go quiet while it owes an answer.** `dots.py tick <DOT> <agentId> done` is
   refused with exit 2 and nothing written while an inbox line of kind `task`, `question` or `review`
   has no `out.jsonl` line answering it with `re`. The refusal names each id and prints the exact
@@ -163,28 +178,47 @@ from the files alone:
   `claim:` line says why that claim contradicts what the agent itself wrote: a `done` or `blocked`
   line with a message at or after it still unanswered, or a roster `done`/`idle` while the agent's
   own newest line is `start`/`step`.
-- **The owner can run the watchdog.** `dots.py watch [--loop MINUTES] [--expect-sha256 HEX]` reads
-  the mail folders only. For every message that owes an answer and whose agent holds no wait, it runs
-  the configured `wake` once after `watch.after_min` minutes; if the message is still unread
-  `watch.notify_after_min` minutes after that wake, it runs `notify` once. Its ledger lives in
-  `<base>/watch/state.json`, so a restart never rings twice, and it prints one `WATCH_WAKE`,
-  `WATCH_NOTIFY`, `WATCH_RESOLVED`, `WATCH_TOOL_CHANGED` or `WATCH_ERROR` line per action. `--loop 0`
-  (the default) runs once; a loop sleeps between runs and ends on `SIGTERM`, `SIGHUP` or `SIGINT`. It
-  makes no network and no model call: `wake` and `notify` are argv lists the owner configures, for
-  example `dots.py init --wake-cmd '["ssh","local","dots-post","{project}","{agent}","{id}"]'
+- **The owner can run the watchdog.** `dots.py watch [--loop MINUTES] [--expect-sha256 HEX]
+  [--wake-cmd ARGV] [--notify-cmd ARGV] [--after-min N] [--notify-after-min N] [--state PATH]` reads
+  the mail folders only. For every message that owes an answer and whose agent holds no live wait
+  marker, it runs the wake argv once after `after_min` minutes; if the message is still unanswered
+  `notify_after_min` minutes after that wake, it runs the notify argv once. A message counts as owed
+  until an `out.jsonl` line answers it, read or not: a `.agent-read` marker that reached it prints
+  `WATCH_STUCK … read=yes unanswered=yes` once and the notify runs anyway, because that marker lives
+  in the same folder as the mail. Its ledger defaults to `<base>/watch/state.json`, so a restart never
+  rings twice, and `--state PATH` keeps it outside the folder the root writes. The ledger may only
+  add a line: every step it suppresses prints `WATCH_SKIP … reason=wake_already|notify_already`, and
+  the rest are `WATCH_CONFIG`, `WATCH_WAKE`, `WATCH_NOTIFY`, `WATCH_STUCK`, `WATCH_RESOLVED`,
+  `WATCH_TOOL_CHANGED` and `WATCH_ERROR`. The flags win over `dots.json` for the reason above, and
+  `WATCH_CONFIG` names the source of each value on every run. `--loop 0` (the default) runs once; a
+  loop sleeps between runs and ends on `SIGTERM`, `SIGHUP` or `SIGINT`. It makes no network and no
+  model call: the two commands are argv lists the owner configures, for example `dots.py watch
+  --loop 5 --wake-cmd '["ssh","local","dots-post","{project}","{agent}","{id}"]'
   --notify-cmd '["notify-send","{agent}","{id}","{age}"]'`.
+- **A wait marker proves a waiter only within a day.** `listen/<agent>.<pid>.json` needs a `until`
+  that is still in the future and no more than 24 hours out; a marker without one, with a past one or
+  with a date years away is not a waiter, and a marker written on another host is judged by `until`
+  alone. The one case the tool cannot separate is a marker that names a live local pid and a
+  plausible `until`: check `ps -p <pid>` and the agent's newest live line before believing it.
 
 **What it only detects.** The tool cannot make the root honest. A line the root writes looks exactly
 like one an agent wrote, because `from` is a string and nothing signs it. A roster entry is a claim,
 so `board` reports it next to the evidence instead of trusting it. A message that never gets an
 answer stays visible as `MAIL_WAITING`, but nothing in this kit can answer it for the agent.
 
+The `done` refusal and the flags are built for a root that forgets, not for one that lies. A forged
+`out.jsonl` line answering the id clears the refusal and `MAIL_WAITING` with it, because an answer is
+an answer whichever session wrote it; a forged `in.jsonl` line, or a deleted answer, re-arms both on
+the next read. Read `refs` and the live-line history when it matters, and treat a clean board as "no
+file says work is owed", not as "the work was done".
+
 **The hard limit.** Only the root can restart a sub-agent whose turn has ended. A sub-agent's
 conversation cannot be reopened from outside Dots: the app-server lists no conversation for one, and
 the root's own conversation answers 404. So the last step is always a message to the root, or the
-owner. `watch` says so plainly — `WATCH_ERROR no wake command in dots.json` when nothing is
-configured, `WATCH_NOTIFY` when a wake did not get the mail read — and hands the owner the ids to act
-on. `watch` never claims an agent was woken when no wake command ran.
+owner. `watch` says so plainly — `WATCH_ERROR no wake command; an ended agent cannot be restarted`
+when nothing is configured, `WATCH_NOTIFY … read=no|yes` when the wake ran and the message is still
+unanswered — and hands the owner the ids to act on. `watch` never claims an agent was woken when no
+wake command ran.
 
 **Residual risks.**
 
@@ -193,8 +227,21 @@ on. `watch` never claims an agent was woken when no wake command ran.
   open, are the only things that make a `result` worth checking, and the live-line history shows
   whether the steps that lead to it happened.
 - **A swapped tool.** The shared folder is writable by the root, so a `dots.py` kept inside it can be
-  replaced. Keep the tool outside the shared folder and pass `--expect-sha256` with the hash pinned in
-  the root's brief; `WATCH_TOOL_CHANGED expected=… actual=… path=…` prints as soon as the bytes differ.
+  replaced. Keep the tool outside the shared folder and pass `--expect-sha256` on the owner's own
+  `watch` command line — not in the root's brief, which the root writes — with the hash of the file
+  the owner reviewed; `WATCH_TOOL_CHANGED expected=… actual=… path=…` prints as soon as the bytes
+  differ. A copy that does sit in a root-writable folder drops `sys.path[0]` before importing the
+  standard library, so a `json.py` or `socket.py` beside it cannot be imported in its place, but that
+  only protects the imports: the copy's own bytes still need the hash check.
+- **A forged ledger record.** `watch/state.json` is in the shared folder too. A record that says a
+  wake or a notify already ran suppresses that step, and the tool prints `WATCH_SKIP … wake_already`
+  or `notify_already` so the suppression is visible; `--state PATH` keeps the ledger where the root
+  cannot write it, which is the only way to make the record trustworthy.
+- **A forged listen marker.** A `listen/<agent>.<pid>.json` with a plausible `until` and a live local
+  pid looks like a waiter and holds the wake back. It needs `until` inside the next 24 hours; compare
+  `ps -p <pid>` with the agent's newest live line when a wait looks too convenient.
+- **A forged `.agent-read`.** Marking a message read adds `WATCH_STUCK … read=yes unanswered=yes` once
+  and the notify still runs: the read marker can make the watchdog noisier, never quieter.
 - **A deleted message reads as answered.** The ledger knows an id, not the line: a message the root
   deletes from `in.jsonl` disappears from `watch`'s list and is reported `WATCH_RESOLVED`. Compare the
   count with `inbox` before believing a resolution you did not cause.
