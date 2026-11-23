@@ -5,11 +5,13 @@ Run with: cd tools && python3 -m unittest test_dots -q
 No network and no ssh: every case uses a temporary base folder and a bounded timeout.
 """
 
+import glob
 import io
 import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -46,13 +48,20 @@ def spawn(args, base):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def wait_for(path, seconds=5.0):
+def wait_for(target, seconds=5.0):
+    """True once the path exists, or once the callable returns true."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if os.path.exists(path):
+        if target() if callable(target) else os.path.exists(target):
             return True
         time.sleep(0.02)
     return False
+
+
+def marker_files(base, agent="agent-1"):
+    """Every `wait` marker for that agent: one file per waiting process."""
+    folder = os.path.join(base, "listen")
+    return sorted(glob.glob(os.path.join(folder, f"{agent}.*.json"))) if os.path.isdir(folder) else []
 
 
 def lines(path):
@@ -101,8 +110,6 @@ class Base(unittest.TestCase):
             "v": 1, "dots": [], "projects": [], "hosts": []}
         if project not in [p.get("id") for p in cfg["projects"]]:
             cfg["projects"].append({"id": project, "main": main})
-        if os.path.basename(os.path.dirname(os.path.dirname(self.base))):
-            pass
         d.write_atomic(os.path.join(self.base, "dots.json"), json.dumps(cfg, indent=1) + "\n")
 
     def send(self, agent="agent-1", kind="task", task="issue 1", text="do it", project="proj", refs=()):
@@ -119,7 +126,7 @@ class Base(unittest.TestCase):
     def start_wait(self, agent="agent-1", dot="DOT-A", timeout=30):
         p = spawn(["wait", dot, agent, "--timeout", str(timeout)], self.base)
         self.procs.append(p)
-        self.assertTrue(wait_for(os.path.join(self.base, "listen", f"{agent}.json"), 5.0),
+        self.assertTrue(wait_for(lambda: marker_files(self.base, agent), 5.0),
                         "wait never wrote its listening marker")
         return p
 
@@ -142,7 +149,7 @@ class WaitTests(Base):
         self.assertIn(mid, out)
         self.assertIn("MAIL_NEW", out)
         self.assertIn("WAIT mail=1", out)
-        self.assertFalse(os.path.exists(os.path.join(self.base, "listen", "agent-1.json")))
+        self.assertEqual(marker_files(self.base), [])
 
     def test_wait_returns_at_once_on_unread_mail(self):
         mid = self.send(text="already here")
@@ -152,7 +159,17 @@ class WaitTests(Base):
         self.assertLess(time.monotonic() - started, 3.0)
         self.assertIn(mid, res.stdout)
         self.assertNotIn("WAIT listening", res.stdout)
-        self.assertFalse(os.path.exists(os.path.join(self.base, "listen", "agent-1.json")))
+        self.assertEqual(marker_files(self.base), [])
+
+    def test_delivered_mail_is_marked_read_so_the_next_wait_blocks(self):
+        mid = self.send(text="steer once")
+        self.assertEqual(run(["wait", "DOT-A", "agent-1", "--timeout", "30"], self.base).returncode, 0)
+        self.assertEqual(d.marker(os.path.join(self.base, "proj", "mail", "agent-1", ".agent-read")), mid)
+        # the documented loop is wait -> act -> wait; the same line must not come back
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "2"], self.base)
+        self.assertEqual(res.returncode, 3, res.stdout)
+        self.assertNotIn(mid, res.stdout)
+        self.assertIn("WAIT timeout", res.stdout)
 
     def test_wait_times_out_with_exit_three_and_no_marker(self):
         started = time.monotonic()
@@ -162,23 +179,37 @@ class WaitTests(Base):
         tail = res.stdout.strip().splitlines()[-1]
         self.assertTrue(tail.startswith("WAIT timeout"), tail)
         self.assertIn("unread=0", tail)
-        self.assertFalse(os.path.exists(os.path.join(self.base, "listen", "agent-1.json")))
+        self.assertEqual(marker_files(self.base), [])
 
-    def test_sigterm_removes_the_marker(self):
+    def test_sigterm_removes_the_marker_and_exits_four(self):
         p = self.start_wait()
         p.send_signal(signal.SIGTERM)
         p.communicate(timeout=10)
-        self.assertFalse(os.path.exists(os.path.join(self.base, "listen", "agent-1.json")))
+        self.assertEqual(p.returncode, 4)  # not 0: no mail was delivered
+        self.assertEqual(marker_files(self.base), [])
 
     def test_marker_records_pid_dot_until_and_host(self):
         p = self.start_wait()
-        marker = d.load_json(os.path.join(self.base, "listen", "agent-1.json"))
+        marker = d.load_json(marker_files(self.base)[0])
         self.assertEqual(marker["pid"], p.pid)
         self.assertEqual(marker["dot"], "DOT-A")
         self.assertIsNotNone(d.parse_t(marker["until"]))
         self.assertTrue(marker["host"])
         p.send_signal(signal.SIGTERM)
         p.communicate(timeout=10)
+
+    def test_two_waiters_keep_their_own_marker(self):
+        first = self.start_wait()
+        second = self.start_wait()
+        self.assertTrue(wait_for(lambda: len(marker_files(self.base)) == 2, 5.0), marker_files(self.base))
+        second.send_signal(signal.SIGTERM)
+        second.communicate(timeout=10)
+        # the survivor still owns a marker, so send does not fall through to the wake command
+        self.assertEqual(len(marker_files(self.base)), 1)
+        res = run(["send", "proj", "agent-1", "task", "issue 1"], self.base, stdin="two")
+        self.assertIn("LISTENING", res.stdout)
+        first.communicate(timeout=10)
+        self.assertEqual(marker_files(self.base), [])
 
     def test_send_reports_listening_then_not_listening_after_a_stale_marker(self):
         p = self.start_wait()
@@ -187,27 +218,43 @@ class WaitTests(Base):
         self.assertIn("pid=", res.stdout)
         p.communicate(timeout=10)
         self.take(res.stdout.splitlines()[0])
-        # a marker whose pid is gone counts as not listening
-        d.write_atomic(os.path.join(self.base, "listen", "agent-1.json"),
+        # a marker of this host whose pid is gone counts as not listening
+        d.write_atomic(os.path.join(self.base, "listen", "agent-1.999999.json"),
                        json.dumps({"pid": 999999, "dot": "DOT-A", "since": d.now(),
-                                   "until": d.iso_after(600), "host": "test"}) + "\n")
+                                   "until": d.iso_after(600), "host": socket.gethostname()}) + "\n")
         res = run(["send", "proj", "agent-1", "task", "issue 1"], self.base, stdin="two")
         self.assertIn("NOT_LISTENING", res.stdout)
         self.assertIn("last_tick=", res.stdout)
         self.assertIn("DOORBELL", res.stdout)
+        self.assertEqual(marker_files(self.base), [])  # send pruned the dead marker
+
+    def test_a_marker_from_another_host_is_judged_by_until_not_by_its_pid(self):
+        os.makedirs(os.path.join(self.base, "listen"), exist_ok=True)
+        path = os.path.join(self.base, "listen", "agent-1.999999.json")
+        # a foreign pid says nothing here: while `until` is ahead, that agent is listening
+        d.write_atomic(path, json.dumps({"pid": 999999, "dot": "DOT-A", "since": d.now(),
+                                         "until": d.iso_after(600), "host": "the-other-vm"}) + "\n")
+        self.assertIsNotNone(d.listen_state("agent-1"))
+        # ... even when the number happens to be a live pid on this machine
+        d.write_atomic(path, json.dumps({"pid": os.getpid(), "dot": "DOT-A", "since": d.now(),
+                                         "until": d.iso_after(600), "host": "the-other-vm"}) + "\n")
+        self.assertIsNotNone(d.listen_state("agent-1"))
+        # a foreign marker whose `until` has passed is not listening
+        d.write_atomic(path, json.dumps({"pid": os.getpid(), "dot": "DOT-A", "since": "2020-01-01T00:00:00Z",
+                                         "until": "2020-01-01T00:00:01Z", "host": "the-other-vm"}) + "\n")
+        self.assertIsNone(d.listen_state("agent-1"))
 
     def test_a_past_until_counts_as_not_listening(self):
         os.makedirs(os.path.join(self.base, "listen"), exist_ok=True)
-        d.write_atomic(os.path.join(self.base, "listen", "agent-1.json"),
+        d.write_atomic(os.path.join(self.base, "listen", "agent-1.1234.json"),
                        json.dumps({"pid": os.getpid(), "dot": "DOT-A", "since": "2020-01-01T00:00:00Z",
-                                   "until": "2020-01-01T00:00:01Z", "host": "test"}) + "\n")
+                                   "until": "2020-01-01T00:00:01Z", "host": socket.gethostname()}) + "\n")
         self.assertIsNone(d.listen_state("agent-1"))
 
     def test_bad_ids_are_refused(self):
         self.assertEqual(run(["wait", "DOT-A", "bad id", "--timeout", "1"], self.base).returncode, 2)
         self.assertEqual(run(["wait", "bad dot", "agent-1", "--timeout", "1"], self.base).returncode, 2)
         self.assertEqual(run(["wait", "DOT-A", "agent-1", "--timeout", "0"], self.base).returncode, 2)
-
 
 class WakeTests(Base):
     def test_wake_argv_runs_once_with_placeholders(self):
@@ -248,6 +295,28 @@ class WakeTests(Base):
         res = run(["send", "proj", "agent-1", "task", "issue 1"], self.base, stdin="go")
         self.assertIn("WAKE not_run missing=dot", res.stdout)
         self.assertIn("DOORBELL", res.stdout)
+
+    def test_a_closed_reader_does_not_skip_the_wake_command(self):
+        target = os.path.join(self.base, "wake.txt")
+        cfg = d.load_json(os.path.join(self.base, "dots.json"))
+        cfg["dots"] = [{"id": "DOT-A"}]
+        cfg["wake"] = [sys.executable, "-c",
+                       "import sys, time, pathlib; time.sleep(0.3); pathlib.Path(sys.argv[1]).write_text('ran')",
+                       target]
+        d.write_atomic(os.path.join(self.base, "dots.json"), json.dumps(cfg, indent=1) + "\n")
+        p = subprocess.Popen([sys.executable, SCRIPT, "send", "proj", "agent-1", "task", "issue 1"],
+                             env=dict(os.environ, DOTS_OPS_BASE=self.base, PYTHONDONTWRITEBYTECODE="1"),
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        p.stdin.write("go")
+        p.stdin.close()
+        self.assertRegex(p.stdout.readline().strip(), ID_RE)  # the id only; then the reader goes away
+        p.stdout.close()
+        err = p.stderr.read()
+        p.wait(timeout=20)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(os.path.exists(target))
 
 
 class TickTests(Base):
@@ -362,6 +431,47 @@ class MailTests(Base):
         leak = run(["send", "proj", "agent-1", "task", "issue 1"], self.base,
                    stdin="token sk-" + "a" * 24)
         self.assertEqual(leak.returncode, 2)
+    def test_send_answers_an_agent_result_id(self):
+        mid = self.send(text="do the fix")
+        self.assertEqual(self.tick("--took", mid).returncode, 0)
+        res = run(["reply", "proj", "agent-1", "result", "issue 1", "--re", mid], self.base,
+                  stdin="done, rev/x-20261123")
+        result_id = res.stdout.strip()
+        self.assertRegex(result_id, ID_RE)
+        # the review and answer legs of direct mail answer the agent's own result, in out.jsonl
+        review = run(["send", "proj", "agent-1", "review", "issue 1", "--re", result_id,
+                      "--ref", "gate:G1 FAIL"], self.base, stdin="G1 FAIL: see the log")
+        self.assertEqual(review.returncode, 0, review.stderr)
+        answer = run(["send", "proj", "agent-1", "answer", "issue 1", "--re", result_id], self.base,
+                     stdin="all gates PASS")
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        inbox = lines(os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl"))
+        self.assertEqual([m["re"] for m in inbox[1:]], [result_id, result_id])
+        # an id in neither file is still refused, and nothing is written
+        bad = run(["send", "proj", "agent-1", "review", "issue 1", "--re", "m-20260101T000000Z-0000"],
+                  self.base, stdin="x")
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(len(lines(os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl"))), len(inbox))
+
+    def test_ids_stay_unique_inside_one_mailbox(self):
+        path = os.path.join(self.base, "proj", "mail", "agent-1", "in.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fixed = "m-20261123T034500Z-1a2b"
+        real = d.new_id
+        d.new_id = lambda: fixed
+        try:
+            d.append_unique(path, d.mail_line("proj", "agent-1", "task", "t", None, [], "one", "proj-main"))
+        finally:
+            d.new_id = real
+        again = d.mail_line("proj", "agent-1", "task", "t", None, [], "two", "proj-main")
+        again["id"] = fixed
+        d.append_unique(path, again)
+        ids = [m["id"] for m in lines(path)]
+        self.assertEqual(ids[0], fixed)
+        self.assertNotEqual(ids[1], fixed)  # the second line drew another id instead of colliding
+        # a duplicate already on disk cannot hold the read marker: after() resolves to the last one
+        self.assertEqual(d.after([{"id": "a"}, {"id": "a"}, {"id": "b"}], "a"), [{"id": "b"}])
+
 
 
 class InitTests(Base):
@@ -437,6 +547,50 @@ class InitTests(Base):
                               "--wake-cmd", "not json"], self.base).returncode, 2)
         self.assertEqual(run(["init", "--yes", "--base", self.base, "--dot", "DOT-A",
                               "--host", "no-separator"], self.base).returncode, 2)
+
+    def test_a_refused_init_creates_nothing(self):
+        nested = os.path.join(self.base, "h4", "nested")
+        res = run(["init", "--yes", "--base", nested], self.base)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("no dots", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.base, "h4")))
+
+    def test_init_prints_the_export_line_for_a_base_that_is_not_the_default(self):
+        home = tempfile.mkdtemp(dir=self._tmp.name)
+        env = {k: v for k, v in os.environ.items() if k != "DOTS_OPS_BASE"}
+        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
+        elsewhere = os.path.join(home, "shared")
+        res = subprocess.run([sys.executable, SCRIPT, "init", "--yes", "--base", elsewhere, "--dot", "DOT-A"],
+                             env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"INIT export DOTS_OPS_BASE={elsewhere}", res.stdout)
+        # the default base prints no export line: nothing has to be set
+        res = subprocess.run([sys.executable, SCRIPT, "init", "--yes", "--dot", "DOT-B"],
+                             env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("INIT export", res.stdout)
+    def test_init_and_board_resolve_the_same_base(self):
+        home = tempfile.mkdtemp(dir=self._tmp.name)
+        env = {k: v for k, v in os.environ.items() if k != "DOTS_OPS_BASE"}
+        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
+        res = subprocess.run([sys.executable, SCRIPT, "init", "--yes", "--dot", "DOT-A"], env=env,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        base = os.path.join(home, ".dots-ops")
+        self.assertIn(f"INIT base={base}", res.stdout)
+        live = os.path.join(base, "live", "DOT-A")
+        self.assertTrue(os.path.isdir(live))
+        # a line written under that base is the one board reads, so both resolved the same folder
+        d.append_line(os.path.join(live, "agent-1.jsonl"),
+                      {"t": d.now(), "agent": "agent-1", "role": "구현", "model": "m", "project": "proj",
+                       "task": "issue 1", "state": "step", "host": "local", "note": "n", "evidence": "e"})
+        board = subprocess.run([sys.executable, SCRIPT, "board"], env=env, capture_output=True, text=True,
+                               timeout=20)
+        self.assertEqual(board.returncode, 0, board.stderr)
+        self.assertIn("DOT-A agent-1", board.stdout)
+        # the maintainer's own directory name is not a candidate anywhere in the tool
+        self.assertNotIn("CodeProjects", read(SCRIPT))
+
 
 
 class WithoutConfigTests(Base):

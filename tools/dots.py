@@ -6,7 +6,7 @@ workflows/session-memory.md, workflows/direct-mail.md):
   live/<DOT>/<agent>.jsonl     live-record-v1 lines, append-only, written by that agent only
   memory/<DOT>/<agent>.json    memory-v1 session memory, rewritten whole by that agent only
   <project>/mail/<agent>/      direct mail (mail-v1); in.jsonl is the agent's inbox
-  listen/<agent>.json          a `wait` that is blocking right now, removed when it exits
+  listen/<agent>.<pid>.json   one `wait` that is blocking right now, removed when that process exits
   dots.json                    optional: dots, projects, hosts and the wake command
 
 Agent, once per step (start, each material step and at least every 15 min, blocked, done):
@@ -22,9 +22,9 @@ Agent, once per step (start, each material step and at least every 15 min, block
 Agent with no assigned work (the steering receiver; it does not end its turn):
   dots.py wait <DOT> <agent> [--timeout SECONDS]   default 3300 (55 min)
       Prints unread mail at once and exits 0; otherwise blocks, polls its mailboxes about once
-      a second, prints a message as soon as it lands and exits 0; exits 3 on timeout with one
-      line. Holds listen/<agent>.json while blocking and removes it on any exit.
-  dots.py reply <project> <agent> <kind> <task> --re ID [--ref R]...   text on stdin
+      a second, prints a message as soon as it lands and exits 0. Either way it marks what it
+      printed read, so the same message is not delivered twice. Exits 3 on timeout, 4 when a
+      signal ends it. Holds listen/<agent>.<pid>.json while blocking.
 
 Main session outside Dots:
   dots.py send <project> <agent> <kind> <task> [--re ID] [--ref R]...  text on stdin
@@ -44,9 +44,11 @@ Setup (once per machine; idempotent, adds only):
       <base>/dots.json, live/<DOT>/, memory/<DOT>/ and <project>/mail/, then prints the brief
       to paste to each dot root. Never deletes or rewrites an existing record or entry.
 
-Base folder: $DOTS_OPS_BASE, else the first existing of ~/.dots-ops and ~/CodeProjects/.dots-ops,
-else ~/.dots-ops. Every command works without dots.json: the dot and the project are read from
-the folders that exist.
+Base folder: $DOTS_OPS_BASE, else ~/.dots-ops; `init` resolves it the same way, so an instance
+that already keeps its folder elsewhere points that variable at it. `init --base DIR` writes
+another one for this machine and prints the export line to set, because later commands still
+read the environment first. Every command works without dots.json: the dot and the project are
+read from the folders that exist.
 """
 import argparse, contextlib, datetime, fcntl, glob, json, os, re, secrets, signal, socket, subprocess, sys, time
 
@@ -54,10 +56,6 @@ def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
     if env:
         return os.path.expanduser(env)
-    for candidate in ("~/.dots-ops", "~/CodeProjects/.dots-ops"):
-        path = os.path.expanduser(candidate)
-        if os.path.isdir(path):
-            return path
     return os.path.expanduser("~/.dots-ops")
 
 BASE = default_base()
@@ -74,7 +72,7 @@ MAX_ITEM = 300      # one decision or blocker
 MAX_DECISIONS = 20  # newest kept; the full history is the live log
 MAX_BLOCKERS = 10
 POLL_S = 1.0        # wait's mailbox poll; a message lands within about a second
-WAKE_TIMEOUT = 60   # one wake command, once; never retried
+WAKE_TIMEOUT = 25   # one wake command, once, never retried; under the connector's 30 s exec yield
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                     r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY"
@@ -170,8 +168,10 @@ def marker(path):
         return None
 
 def after(msgs, last):
+    """Lines after the marker id. A duplicate id already on disk resolves to its last occurrence,
+    so a marker can never stop short of a later line that repeats it."""
     ids = [m.get("id") for m in msgs]
-    return msgs if last not in ids else msgs[ids.index(last) + 1:]
+    return msgs if last not in ids else msgs[len(ids) - ids[::-1].index(last):]
 
 def project_of(box):
     return os.path.basename(os.path.dirname(os.path.dirname(box)))
@@ -194,11 +194,11 @@ def unread_upto(box, took):
     """Unread messages in one box, minus the ones this tick is marking read with --took."""
     msgs = mail_state(box)["new"]
     ids = [m.get("id") for m in msgs]
-    return msgs[ids.index(took) + 1:] if took in ids else msgs
+    return msgs[len(ids) - ids[::-1].index(took):] if took in ids else msgs
 
 def unread_all(agent):
-    """(project, message) for every unread line in every mailbox of that agent id."""
-    return [(project_of(box), m) for box in mailboxes(agent) for m in mail_state(box)["new"]]
+    """(box, project, message) for every unread line in every mailbox of that agent id."""
+    return [(box, project_of(box), m) for box in mailboxes(agent) for m in mail_state(box)["new"]]
 
 def write_atomic(path, data):
     tmp = f"{path}.tmp.{os.getpid()}"
@@ -213,6 +213,18 @@ def append_line(path, obj):
     with open(path, "ab") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+def append_unique(path, msg):
+    """Append one mail line, drawing another id if that mailbox already used this one.
+    The check runs under the same lock as the write, so two senders cannot pick the same id."""
+    with open(path, "ab") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        seen = {m.get("id") for m in jsonl(path)}
+        while msg["id"] in seen:
+            msg["id"] = new_id()
+        fh.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -468,24 +480,46 @@ def age_label(minutes):
         return f"{int(minutes // 60)}h"
     return f"{max(0, int(minutes))}m"
 
-def listen_state(agent):
-    """The live `wait` marker for that agent, or None. A dead pid or a past `until` is not listening."""
-    m = load_json(os.path.join(BASE, "listen", f"{agent}.json"))
-    if not m:
-        return None
+def marker_paths(agent):
+    """Every `wait` marker for that agent: one file per waiting process, so two waiters never collide."""
+    return sorted(glob.glob(os.path.join(BASE, "listen", glob.escape(agent) + ".*.json")))
+
+def marker_live(m):
+    """A marker is not listening when its pid is invalid, its process is gone or its `until` has passed.
+    A marker written on another host is judged by `until` alone: a pid there means nothing here."""
     pid = m.get("pid")
     if not isinstance(pid, int) or pid <= 0:
-        return None
+        return False
     until = parse_t(m.get("until"))
     if until is not None and until < datetime.datetime.now(datetime.timezone.utc):
-        return None
+        return False
+    if m.get("host") and m["host"] != socket.gethostname():
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return None
+        return False
     except PermissionError:
         pass
-    return m
+    return True
+
+def listen_state(agent):
+    """One live `wait` marker for that agent, or None."""
+    for path in marker_paths(agent):
+        m = load_json(path)
+        if m and marker_live(m):
+            return m
+    return None
+
+def prune_markers(agent):
+    """Remove markers of waiters that are gone; never one that is still listening."""
+    for path in marker_paths(agent):
+        m = load_json(path)
+        if m is None or not marker_live(m):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 # ---------------------------------------------------------------- mail
 
@@ -524,17 +558,21 @@ def send(a):
     re_id = token("re", a.re) if a.re else None
     new_project = not os.path.isdir(os.path.join(BASE, project))
     box = mail_box(project, agent, create=True)
-    if re_id and re_id not in [m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))]:
-        die(f"--re {re_id} is not in {project}/mail/{agent}/in.jsonl")
+    known = {m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))}
+    known |= {m.get("id") for m in jsonl(os.path.join(box, "out.jsonl"))}
+    if re_id and re_id not in known:
+        die(f"--re {re_id} is not in {project}/mail/{agent}/in.jsonl or out.jsonl")
     msg = mail_line(project, agent, a.kind, task, re_id, refs, body, main_name(project))
-    append_line(os.path.join(box, "in.jsonl"), msg)
+    append_unique(os.path.join(box, "in.jsonl"), msg)
     print(msg["id"], flush=True)
     if new_project:
         print(f"PROJECT {project} (new mail folder)", flush=True)
     cfg = config()
+    prune_markers(agent)
     live = listen_state(agent)
     if live:
-        print(f"LISTENING dot={live.get('dot', '-')} pid={live.get('pid')} since={live.get('since', '-')}", flush=True)
+        print(f"LISTENING dot={live.get('dot', '-')} pid={live.get('pid')} since={live.get('since', '-')}"
+              f" host={live.get('host', '-')}", flush=True)
         return
     seen = last_tick(agent)
     print(f"NOT_LISTENING last_tick={age_label(None if seen is None else age_min(seen[0].isoformat()))}", flush=True)
@@ -622,7 +660,7 @@ def reply(a):
     if re_id not in [m.get("id") for m in jsonl(os.path.join(box, "in.jsonl"))]:
         die(f"--re {re_id} is not in {project}/mail/{agent}/in.jsonl")
     msg = mail_line(project, agent, a.kind, task, re_id, refs, body, agent)
-    append_line(os.path.join(box, "out.jsonl"), msg)
+    append_unique(os.path.join(box, "out.jsonl"), msg)
     print(msg["id"])
 
 # ---------------------------------------------------------------- wait
@@ -635,12 +673,13 @@ def wait(a):
     pending = unread_all(agent)
     if pending:
         print_pending(pending)
+        mark_delivered(pending)
         return 0
     if not os.path.isdir(os.path.join(BASE, "live", dot)):
         print(f"dots: no live/{dot} folder; waiting anyway", file=sys.stderr)
     listen_dir = os.path.join(BASE, "listen")
     os.makedirs(listen_dir, exist_ok=True)
-    path = os.path.join(listen_dir, f"{agent}.json")
+    path = os.path.join(listen_dir, f"{agent}.{os.getpid()}.json")
     until = iso_after(timeout)
     previous = {s: signal.getsignal(s) for s in SIGNALS}
     for s in SIGNALS:
@@ -648,6 +687,7 @@ def wait(a):
     try:
         write_atomic(path, json.dumps({"pid": os.getpid(), "dot": dot, "since": now(), "until": until,
                                        "host": socket.gethostname()}, ensure_ascii=False) + "\n")
+        prune_markers(agent)
         print(f"WAIT listening dot={dot} agent={agent} pid={os.getpid()} until={until} host={socket.gethostname()}",
               flush=True)
         deadline = time.monotonic() + timeout
@@ -656,6 +696,7 @@ def wait(a):
             pending = unread_all(agent)
             if pending:
                 print_pending(pending)
+                mark_delivered(pending)
                 return 0
             if time.monotonic() >= deadline:
                 print(f"WAIT timeout dot={dot} agent={agent} after={timeout}s unread=0", flush=True)
@@ -666,21 +707,27 @@ def wait(a):
             signal.signal(s, handler)
 
 def stop_now(signum, frame):
-    raise SystemExit(0)
+    raise SystemExit(4)
 
 def drop_marker(path):
-    """Remove the marker only if it is this process's, so a newer waiter keeps its own."""
-    m = load_json(path)
-    if m is None or m.get("pid") == os.getpid():
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+    """Remove this process's own marker. Another waiter has its own file and keeps it."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 def print_pending(pending):
-    for project, m in pending:
+    for _box, project, m in pending:
         show_mail(project, m, "MAIL_NEW")
     print(f"WAIT mail={len(pending)} unread (handle these before your next step)", flush=True)
+
+def mark_delivered(pending):
+    """Move each box's read marker to the newest message `wait` printed, so the next wait blocks
+    instead of printing it again. `tick --took` moves the same marker for a working agent."""
+    for box, _project, m in pending:
+        mid = m.get("id")
+        if isinstance(mid, str) and TOKEN.match(mid):
+            write_atomic(os.path.join(box, ".agent-read"), mid + "\n")
 
 # ---------------------------------------------------------------- init
 
@@ -708,14 +755,13 @@ def pairs(values, flag):
 
 def init(a):
     tty = sys.stdin.isatty() and not a.yes
-    base = os.path.expanduser(a.base or os.environ.get("DOTS_OPS_BASE") or "~/.dots-ops")
+    base = os.path.expanduser(a.base) if a.base else default_base()
     if tty:
         base = os.path.expanduser(ask(f"base folder [{base}]: ", base))
     if not a.yes and not tty:
         die("no terminal: pass --yes with --dot/--project/--host flags")
     if os.path.exists(base) and not os.path.isdir(base):
         die(f"{base} is not a folder")
-    os.makedirs(base, exist_ok=True)
 
     cfg = load_json(os.path.join(base, "dots.json")) or {"v": 1, "dots": [], "projects": [], "hosts": []}
     cfg.setdefault("v", 1)
@@ -805,6 +851,7 @@ def init(a):
     if not dots:
         die("no dots: pass --dot ID at least once")
 
+    os.makedirs(base, exist_ok=True)   # only once the input is accepted
     for d in dots:
         if isinstance(d, dict) and isinstance(d.get("id"), str):
             os.makedirs(os.path.join(base, "live", d["id"]), exist_ok=True)
@@ -823,6 +870,8 @@ def init(a):
     if current != data:
         write_atomic(path, data)
     print(f"INIT base={base}")
+    if os.path.abspath(base) != os.path.abspath(default_base()):
+        print(f"INIT export DOTS_OPS_BASE={base} (every other command resolves this folder)")
     for line in report:
         print(line)
     print(f"INIT config {path} ({'unchanged' if current == data else 'written'})")
@@ -840,7 +889,8 @@ def brief(base, dots, projects, cfg, script):
     print("Projects: " + (", ".join(f"{k} (main {v})" for k, v in sorted(main_by.items())) or "none"))
     print("Record every step: python3 " + script + " tick <DOT> <agentId> <state> --task T --host H --note N --evidence E")
     print("No assigned work: do not end the turn. python3 " + script + " wait <DOT> <agentId> --timeout 3300; "
-          "on exit 3 tick step, then wait again.")
+          "it marks what it prints read, so the next wait blocks. On exit 3 tick step, then wait again; "
+          "exit 4 means it was interrupted, so wait again.")
     print("Main session: python3 " + script + " send <project> <agentId> <kind> <task>  (text on stdin)")
     print(f"Kit pin: dots-superkit/handoff-v1 @ <kit commit SHA>")
     if cfg.get("wake"):
@@ -848,7 +898,38 @@ def brief(base, dots, projects, cfg, script):
     else:
         print("Wake command: none (send prints the manual doorbell)")
 
+class Piped:
+    """A reader that stops early (`dots.py send ... | head -1`) must not raise and must not skip
+    the rest of the command: a write to a closed pipe is dropped, and fd 1 moves to /dev/null so
+    the flush at exit cannot fail either."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except BrokenPipeError:
+            self._silence()
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            self._silence()
+
+    def _silence(self):
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), self._stream.fileno())
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
 def main(argv):
+    sys.stdout = Piped(sys.stdout)
     p = argparse.ArgumentParser(prog="dots.py", description=__doc__.split("\n")[0],
                                 epilog="Run `dots.py <command> -h` for one command; the folder is "
                                        "$DOTS_OPS_BASE or ~/.dots-ops.")
@@ -875,7 +956,7 @@ def main(argv):
     s.add_argument("agent")
     s.add_argument("kind", help=f"one of {', '.join(TO_AGENT)}")
     s.add_argument("task")
-    s.add_argument("--re", help="id of the message this answers")
+    s.add_argument("--re", help="id this answers, from in.jsonl or out.jsonl")
     s.add_argument("--ref", action="append", default=[], help="exact reference; repeatable")
     i = sub.add_parser("inbox", help="main session: agent replies not yet marked read")
     i.add_argument("project", nargs="?")
@@ -891,10 +972,11 @@ def main(argv):
     y.add_argument("task")
     y.add_argument("--re", required=True, help="id of the message this answers")
     y.add_argument("--ref", action="append", default=[], help="exact reference; repeatable")
-    w = sub.add_parser("wait", help="agent: block until mail arrives, then print it and exit 0")
+    w = sub.add_parser("wait", help="agent: block until mail arrives; exits 0 with mail, 3 on timeout, 4 on a signal")
     w.add_argument("dot")
     w.add_argument("agent")
-    w.add_argument("--timeout", type=int, default=3300, help="seconds; exit 3 after this (default 3300)")
+    w.add_argument("--timeout", type=int, default=3300,
+                   help="seconds to block; exit 3 after this (default 3300)")
     n = sub.add_parser("init", help="once per machine: config, folder tree, brief for each dot root")
     n.add_argument("--base", help="shared folder; default $DOTS_OPS_BASE or ~/.dots-ops")
     n.add_argument("--dot", action="append", default=[], help="dot id; repeatable")

@@ -63,12 +63,12 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 
 | Side | Command |
 |---|---|
-| Main session | `dots.py send <project> <agentId> <kind> <task> [--re ID] [--ref R]...` — text on stdin; prints the message id, then the agent's listening status |
+| Main session | `dots.py send <project> <agentId> <kind> <task> [--re ID] [--ref R]...` — text on stdin; `--re` names a message in `in.jsonl` or an agent reply in `out.jsonl`; prints the message id, then the agent's listening status |
 | Main session | `dots.py inbox [project] [agentId]` — agent replies not yet marked read; `dots.py read <project> <agentId> <id>` marks them read |
 | Agent | `dots.py wait <DOT> <agentId> [--timeout SECONDS]` — default 3300 seconds (55 minutes) |
 | Agent | `dots.py reply <project> <agentId> <kind> <task> --re ID [--ref R]...` — text on stdin |
 
-`send` writes one [mail-v1](../protocol/mail-v1.schema.json) line into `in.jsonl` and `reply` one into `out.jsonl`, exactly as a hand-written line does, so `mail.py` or any reader of the schema reads them unchanged. `from` is the project's main-session id from `dots.json` (`<project>-main` when the config names none). Delivery then depends on what the agent is doing:
+`send` writes one [mail-v1](../protocol/mail-v1.schema.json) line into `in.jsonl` and `reply` one into `out.jsonl`, exactly as a hand-written line does, so `mail.py` or any reader of the schema reads them unchanged. `from` is the project's main-session id from `dots.json` (`<project>-main` when the config names none). `--re` accepts an id from either file, because the review and answer legs of this route answer the agent's own `result`, which is a line in `out.jsonl`. Delivery then depends on what the agent is doing:
 
 1. **The agent is in `wait`.** The line is printed the moment it lands — typically within a second — and `wait` exits 0. This is the only near-real-time path, and it is what steering means here: the agent is holding one tool call open, so an instruction reaches it mid-task instead of at the end of a step.
 2. **The agent is working.** It sees the line at the top of its next `tick`, printed before the live line under a `MAIL_FIRST ... handle these before your next step` header. A working agent ticks at each material step and at least every 15 minutes, so that is the worst case while it is working.
@@ -76,11 +76,11 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 
 The wake command is whatever the instance already has to post one line into that dot's chat: an argv list, no shell, `{project}`, `{agent}`, `{id}` and `{dot}` substituted. It is not part of this kit and the kit cannot check that it exists.
 
-While `wait` blocks it holds `<base>/listen/<agentId>.json` — `{pid, dot, since, until, host}` — and removes it on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker whose process is gone, or whose `until` has passed, counts as not listening, so a waiter that died never looks alive. `wait` prints unread mail at once and exits 0 if anything is already unread, and exits 3 with one line on timeout.
+While `wait` blocks it holds one marker per waiting process, `<base>/listen/<agentId>.<pid>.json` — `{pid, dot, since, until, host}` — and removes only its own on any exit, including `SIGTERM`, `SIGHUP` and `SIGINT`. A marker whose process is gone, or whose `until` has passed, counts as not listening, so a waiter that died never looks alive. A marker written on another host is judged by `until` alone: a pid there says nothing here. `wait` prints unread mail at once and exits 0 if anything is already unread; otherwise it blocks. It exits 3 with one line on timeout and 4 when a signal ends it, so an interrupted call is never mistaken for a delivery.
 
-**An agent with no assigned work does not end its turn.** It runs `wait` with a long timeout and, if its own tool returns early with the session still running, keeps polling that session; on exit 3 it ticks `step` and waits again, until the coordinator releases it. This is the loop that lets a main session steer an agent the root never wakes.
+**An agent with no assigned work does not end its turn.** It runs `wait` with a long timeout and, if its own tool returns early with the session still running, keeps polling that session. `wait` moves the same `.agent-read` marker `tick --took` moves, so the lines it printed count as delivered: the loop is wait, handle, wait, and the same instruction is never printed twice. On exit 3 it ticks `step` and waits again; on exit 4 a signal ended it, so it waits again. This is the loop that lets a main session steer an agent the root never wakes.
 
-**What it costs.** The wait is one blocking command and spends nothing by itself, but the agent's session polls it: each poll is one model call, at most one every five minutes. An agent waiting for an hour therefore makes about a dozen calls while it has nothing to do. Keep the timeout long enough to be useful and let the coordinator release an agent that is no longer needed; an agent left waiting for a day spends a day of calls.
+**What it costs.** The wait is one blocking command and spends nothing by itself, but the agent's session polls it: each poll is one model call, at most one every five minutes. An agent waiting for an hour therefore makes about a dozen calls while it has nothing to do. Each poll also re-reads that agent's inboxes from disk, which is local CPU and disk rather than model calls. Keep the timeout long enough to be useful and let the coordinator release an agent that is no longer needed; an agent left waiting for a day spends a day of calls.
 
 ### `dots.json`: the optional config for one machine
 
@@ -92,9 +92,9 @@ While `wait` blocks it holds `<base>/listen/<agentId>.json` — `{pid, dot, sinc
 | `dots` | The dot ids this machine keeps `live/` and `memory/` folders for. |
 | `projects` | `id`, plus `main`, the session id that appears as `from` in that project's `in.jsonl`. |
 | `hosts` | `label`, the value a live record's `host` uses, plus what that host is for. `vm` and `local` are always there; `init --host` adds the user's own ([hosts](hosts.md#placement-the-vm-first-then-the-one-local-machine)). |
-| `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 60-second timeout, never retried. |
+| `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
 
-`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder; there is no other environment variable.
+`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`; there is no other environment variable, and `init` resolves the same folder as every other command. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
 ## Reading cadence and the doorbell
 
