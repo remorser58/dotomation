@@ -1,35 +1,35 @@
 {
-  "_comment": "Template: copy next to the tool as dots-monitor.owner.json and replace hosts, paths, dots and repositories. 'local' means the machine running the tool; any other host is reached with ssh <host>. Paths may start with ~/.",
+  "_comment": "Template: copy outside the repository as your own config and pass --config PATH, then replace hosts, paths, dots and repositories. 'local' means the machine running the tool; any other host is reached with ssh <host>. Paths may start with ~/.",
   "ledger": {
-    "host": "osaka",
-    "root": "~/CodeProjects/.dots-ops/live",
+    "host": "local",
+    "root": "~/.dots-ops/live",
     "dots": [
-      "REM17",
-      "REV18"
+      "DOT-A",
+      "DOT-B"
     ]
   },
   "dots": {
-    "REM17": {
-      "account": 17,
-      "name": "REM"
+    "DOT-A": {
+      "account": 1,
+      "name": "A"
     },
-    "REV18": {
-      "account": 18,
-      "name": "REV"
+    "DOT-B": {
+      "account": 2,
+      "name": "B"
     }
   },
   "activity": [
     {
-      "dot": "REM17",
-      "host": "osaka",
-      "label": "osaka",
-      "path": "~/wgpt-daemon-17/data/app.log"
+      "dot": "DOT-A",
+      "host": "local",
+      "label": "local",
+      "path": "~/.local/state/web-gpt-agent-a/app.log"
     },
     {
-      "dot": "REV18",
-      "host": "osaka",
-      "label": "osaka",
-      "path": "~/wgpt-daemon/data/app.log"
+      "dot": "DOT-B",
+      "host": "local",
+      "label": "local",
+      "path": "~/.local/state/web-gpt-agent-b/app.log"
     }
   ],
   "github": {

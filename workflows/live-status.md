@@ -1,23 +1,23 @@
 # Live records: seeing Dots internal work as it happens
 
-The owner opens one folder on Osaka and sees which internal agent is doing what, on which host, with which model requested, and how long ago. It is an append-only log written by the agents themselves — not a service, dashboard, broker, watcher or telemetry. The one read-only tool that reads it is [monitoring](monitoring.md); it writes nothing here.
+The owner opens one folder on `local` and sees which internal agent is doing what, on which host, with which model requested, and how long ago. It is an append-only log written by the agents themselves — not a service, dashboard, broker, watcher or telemetry. The one read-only tool that reads it is [monitoring](monitoring.md); it writes nothing here.
 
 ## Where the record lives
 
-Osaka OCI, shared folder `~/CodeProjects/.dots-ops/`:
+`local`, in the shared folder `<work root>/.dots-ops/`:
 
 - `handoff/` — cross-dot handoffs, human-readable.
-- `live/<DOT>/` — the live records. `DOT` is `REM17` or `REV18`.
+- `live/<DOT>/` — the live records, one folder per dot.
 - `tasks/` — approved task records.
 
 Every root, coordinator, worker and reviewer appends to `live/<DOT>/<agentId>.jsonl`, using the same `agentId` it uses in messages and in the roster. Lines are append-only: no agent edits another agent's file or rewrites an earlier line; a correction is a new line. Only the coordinator writes `roster.json`.
 
-Creating the folder and appending a line are ordinary filesystem operations on the approved Osaka account (`mkdir -p live/<DOT>`, `>>`). The kit installs nothing: no service, watcher, scheduler, hook, dashboard or collector.
+Creating the folder and appending a line are ordinary filesystem operations on the approved `local` account (`mkdir -p live/<DOT>`, `>>`). The kit installs nothing: no service, watcher, scheduler, hook, dashboard or collector.
 
 ## One line, ten fields
 
 ```json
-{"t":"2026-11-22T20:37:55Z","agent":"yomanchi-lead","role":"총괄","model":"requested gpt-6.2-astra ultra; runtime does not display effective","project":"yomanchi","task":"rev-task intake","state":"step","host":"osaka","note":"Open rev-task issues: 0. No assignment made.","evidence":"https://github.com/remorser58/Yomanchi/issues"}
+{"t":"2026-11-22T20:37:55Z","agent":"example-lead","role":"총괄","model":"requested gpt-6.2-astra ultra; runtime does not display effective","project":"example-project","task":"task intake","state":"step","host":"local","note":"Open task issues: 0. No assignment made.","evidence":"https://github.com/example/app/issues"}
 ```
 
 [Schema](../protocol/live-record-v1.schema.json). Exactly these ten field names, all present, nothing extra; `t` is required. `state` is the only enumerated field. `role`, `model`, `project` and `host` accept any non-empty single line so that records already in the folder stay readable, and the table below gives the wording to use from now on. A synthetic start-to-done sequence is in [examples/live-records.json](../examples/live-records.json).
@@ -25,13 +25,13 @@ Creating the folder and appending a line are ordinary filesystem operations on t
 | Field | Required shape | Wording to use |
 |---|---|---|
 | `t` | RFC 3339 date-time, e.g. `2026-11-22T20:37:55Z`. Fractional seconds and `+00:00` are accepted. | UTC. A line that uses `timestamp`, `time` or `at` instead of `t` is not a live record. |
-| `agent` | Stable id token. | The same id used in messages and in the roster (`rem-root`, `yomanchi-lead`, `REV`). |
+| `agent` | Stable id token. | The same id used in messages and in the roster. |
 | `role` | One non-empty line. | One of 총괄 (lead/coordinator), 구현 (implementation), 연구 (research), 디자인 (design), 디버깅 (debugging), 검토 (review). One record names one role. |
 | `model` | One non-empty line. | `confirmed gpt-6.2-astra xhigh` only when the runtime displays the model and effort; otherwise `requested gpt-6.2-astra ultra; runtime does not display effective`, naming what the summon asked for. A role name, a prior run or a coordinator's statement is never the value. |
-| `project` | One non-empty line. | `kice`, `remorswarm` or `yomanchi`. A lane that spans two projects appends one record per project rather than a combined value. |
+| `project` | One non-empty line. | The project the lane belongs to, one id per project. A lane that spans two projects appends one record per project rather than a combined value. |
 | `task` | One non-empty line. | The approved task or its `work_id/revision`. Keep it stable for the whole task so the lines group. |
 | `state` | `start`, `step`, `blocked` or `done`. | — |
-| `host` | One non-empty line. | `vm` (Dots VM), `osaka` (Osaka OCI), `mini` (Mac mini), `macbook` (MacBook). The host actually used, confirmed by hostname — not where the agent was launched from. |
+| `host` | One non-empty line. | `vm` (Dots VM) or `local` (the local computer). The host actually used, confirmed by hostname — not where the agent was launched from. |
 | `note` | One non-empty line. | What changed, what was observed, what is missing. No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text. |
 | `evidence` | One non-empty line. | A path or link to the exact artifact: commit and path, PR, message id, file path. "It worked" is not evidence. |
 
@@ -43,7 +43,7 @@ Lines already in the folder may use `timestamp` instead of `t`, miss a field, or
 
 - `start` when taking up the brief, before the first workspace mutation.
 - `step` at each material step, and at least every 15 minutes while working. A long tool run gets a `step` before it and a `step` after it.
-- Each time it appends a line, the agent also rewrites its own [session memory](session-memory.md) with the same `t`, `task`, `state` and `host`. `dots.py tick` on Osaka does both in one call.
+- Each time it appends a line, the agent also rewrites its own [session memory](session-memory.md) with the same `t`, `task`, `state` and `host`. The instance helper `dots.py tick` does both in one call.
 - An agent assigned to a project main session also reads its [direct mail](direct-mail.md) inbox each time it appends a line, and cites a message it acts on as `mail:<agentId>/<message id>`.
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules. A later `review` that reopens the work is answered with a new `step`; on [direct mail](direct-mail.md) an accepting `answer` gets one more `done`.
@@ -56,12 +56,12 @@ A working agent with no new line for 30 minutes is **stalled**. The coordinator 
 
 ```json
 {
-  "dot": "REM17",
+  "dot": "DOT-A",
   "updated_at": "2026-11-22T20:37:25Z",
-  "coordinator": "rem-ops-ultra",
+  "coordinator": "example-ultra",
   "slots": [
     {
-      "agent": "rem-root",
+      "agent": "example-root",
       "role": "총괄",
       "model": "requested gpt-6.2-astra xhigh; runtime does not display effective",
       "task": "root approvals and verified handoffs",
@@ -81,7 +81,7 @@ A working agent with no new line for 30 minutes is **stalled**. The coordinator 
 
 ## Reading it
 
-The owner, or any authorised reader, reads `live/<DOT>/` through `ssh osaka` read-only or the approved route for that account ([hosts](hosts.md#approved-routes)). Show the roster, then the newest line of each agent, then the stalls. Do not edit, truncate or reorder another dot's files.
+The owner, or any authorised reader, reads `live/<DOT>/` read-only through the approved route for that account ([hosts](hosts.md#approved-routes)). Show the roster, then the newest line of each agent, then the stalls. Do not edit, truncate or reorder another dot's files.
 
 A self-report alone does not show that an agent is working. [Monitoring](monitoring.md) reads these files and compares them with the Web GPT Agent daemon request log of the dot's account, and resolves each `evidence` reference against GitHub: `python3 tools/dots_monitor.py snapshot`. It is read-only, and a `WORKING` there still means only "recent claim and real tool calls", not a verified result.
 

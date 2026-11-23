@@ -30,8 +30,8 @@ def stamp(minutes_ago=0, seconds_ago=0):
 
 
 def record(agent="writer", minutes_ago=5, state="step", evidence="MATCH-CHECK",
-           note="did the step", task="task-1/1", role="구현", project="remorswarm",
-           host="osaka", **extra):
+           note="did the step", task="task-1/1", role="구현", project="example",
+           host="local", **extra):
     body = {
         "t": stamp(minutes_ago),
         "agent": agent,
@@ -135,12 +135,12 @@ class FakeTransport:
         return None, "gh: Not Found (HTTP 404)"
 
 
-def base_config(dots=("REM17",), activity=None, repos=("owner/repo",), enabled=True):
+def base_config(dots=("DOT-A",), activity=None, repos=("owner/repo",), enabled=True):
     return {
-        "ledger": {"host": "osaka", "root": "~/live", "dots": list(dots)},
+        "ledger": {"host": "local", "root": "~/live", "dots": list(dots)},
         "dots": {dot: {"account": 17} for dot in dots},
         "activity": activity if activity is not None else [
-            {"dot": "REM17", "host": "osaka", "label": "osaka", "path": "~/wgpt/app.log"}],
+            {"dot": "DOT-A", "host": "local", "label": "local", "path": "~/wgpt/app.log"}],
         "github": {"enabled": enabled, "repos": list(repos), "cache_seconds": 0,
                    "max_lookups": 40},
         "thresholds": {"stall_minutes": 30, "active_window_minutes": 15,
@@ -163,7 +163,7 @@ def snapshot_for(files, activity_text=None, roster=None, gh=None, config=None,
     return snapshot, transport, errors
 
 
-def rows(snapshot, dot="REM17"):
+def rows(snapshot, dot="DOT-A"):
     return {row["agent"]: row for row in snapshot["dots"][dot]["agents"]}
 
 
@@ -186,7 +186,7 @@ class TestRedaction(unittest.TestCase):
         self.assertEqual(dm.redact("base %s" % sha), "base %s" % sha)
 
     def test_hyphenated_task_id_survives(self):
-        task = "rev18-yomanchi-intake-20261122T2100Z/1"
+        task = "alpha-intake-20261122T2100Z/1"
         self.assertEqual(dm.redact(task), task)
 
     def test_high_entropy_token_is_removed(self):
@@ -245,11 +245,11 @@ class TestRecordParsing(unittest.TestCase):
 
 class TestLedgerFraming(unittest.TestCase):
     def test_parse_dump(self):
-        dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": record()}},
-                                                {"REM17": {"dot": "REM17", "slots": []}}),
+        dump = dm.parse_ledger_dump(ledger_dump({"DOT-A": {"writer.jsonl": record()}},
+                                                {"DOT-A": {"dot": "DOT-A", "slots": []}}),
                                     TEST_NONCE)
-        self.assertEqual(sorted(dump["REM17"]["files"]), ["roster.json", "writer.jsonl"])
-        self.assertIn('"agent": "writer"', dump["REM17"]["files"]["writer.jsonl"]["text"])
+        self.assertEqual(sorted(dump["DOT-A"]["files"]), ["roster.json", "writer.jsonl"])
+        self.assertIn('"agent": "writer"', dump["DOT-A"]["files"]["writer.jsonl"]["text"])
 
     def test_split_tail_drops_partial_first_line(self):
         text = '{"half": true}\n{"full": true}'
@@ -259,21 +259,21 @@ class TestLedgerFraming(unittest.TestCase):
     def test_truncated_file_keeps_complete_lines(self):
         first = record(agent="writer", minutes_ago=60)
         body = first + "\n" + record(agent="writer", minutes_ago=5)
-        dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": body}},
-                                                sizes={("REM17", "writer.jsonl"): 9999}),
+        dump = dm.parse_ledger_dump(ledger_dump({"DOT-A": {"writer.jsonl": body}},
+                                                sizes={("DOT-A", "writer.jsonl"): 9999}),
                                     TEST_NONCE)
-        data = dm.read_dot("REM17", dump, 100)
+        data = dm.read_dot("DOT-A", dump, 100)
         self.assertEqual(len(data["agents"]["writer"]["records"]), 1)
         self.assertEqual(len(data["agents"]["writer"]["legacy"]), 0)
 
     def test_content_cannot_forge_sentinels(self):
         # Bare or wrong-nonce sentinels inside a file are file content, not framing.
-        body = "\n".join([record(minutes_ago=9), "==END", "==DOT REV18",
+        body = "\n".join([record(minutes_ago=9), "==END", "==DOT DOT-B",
                           "==END ffffffffffffffff", record(minutes_ago=2, state="done")])
-        dump = dm.parse_ledger_dump(ledger_dump({"REM17": {"writer.jsonl": body}},
+        dump = dm.parse_ledger_dump(ledger_dump({"DOT-A": {"writer.jsonl": body}},
                                                 nonce=TEST_NONCE), TEST_NONCE)
-        self.assertEqual(list(dump), ["REM17"])
-        data = dm.read_dot("REM17", dump, 262144)
+        self.assertEqual(list(dump), ["DOT-A"])
+        data = dm.read_dot("DOT-A", dump, 262144)
         records = data["agents"]["writer"]["records"]
         self.assertEqual([r["state"] for r in records], ["step", "done"])
         self.assertEqual(len(data["agents"]["writer"]["legacy"]), 3)
@@ -285,21 +285,21 @@ class TestLedgerFraming(unittest.TestCase):
 
     def test_generated_scripts_parse_on_a_real_shell(self):
         with tempfile.TemporaryDirectory() as root:
-            os.mkdir(os.path.join(root, "REM17"))
-            with open(os.path.join(root, "REM17", "writer.jsonl"), "w", encoding="utf-8") as fh:
-                fh.write(record() + "\n==END\n==DOT REV18\n")
+            os.mkdir(os.path.join(root, "DOT-A"))
+            with open(os.path.join(root, "DOT-A", "writer.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(record() + "\n==END\n==DOT DOT-B\n")
             log = os.path.join(root, "app.log")
             with open(log, "w", encoding="utf-8") as fh:
                 fh.write(log_line(1) + "\n==END\n")
             transport = dm.Transport(10, 10)
             nonce = dm.new_nonce()
-            out, error = transport.run("local", dm.ledger_script(root, ["REM17", "REV18"],
+            out, error = transport.run("local", dm.ledger_script(root, ["DOT-A", "DOT-B"],
                                                                  262144, nonce))
             self.assertIsNone(error)
             dump = dm.parse_ledger_dump(out, nonce)
-            self.assertFalse(dump["REM17"]["nodir"])
-            self.assertTrue(dump["REV18"]["nodir"])
-            self.assertIn("==DOT REV18", dump["REM17"]["files"]["writer.jsonl"]["text"])
+            self.assertFalse(dump["DOT-A"]["nodir"])
+            self.assertTrue(dump["DOT-B"]["nodir"])
+            self.assertIn("==DOT DOT-B", dump["DOT-A"]["files"]["writer.jsonl"]["text"])
             out, error = transport.run("local", dm.activity_script([log, root + "/none"],
                                                                    262144, nonce))
             self.assertIsNone(error)
@@ -310,14 +310,14 @@ class TestLedgerFraming(unittest.TestCase):
 
 class TestMissingLiveDirectory(unittest.TestCase):
     def test_missing_live_directory_is_a_ledger_error(self):
-        snapshot, _, errors = snapshot_for({}, activity_text=log_line(1), nodirs=("REM17",))
-        self.assertEqual(snapshot["dots"]["REM17"]["agents"], [])
-        self.assertTrue(any(e["source"] == "ledger" and "REM17" in e["detail"]
+        snapshot, _, errors = snapshot_for({}, activity_text=log_line(1), nodirs=("DOT-A",))
+        self.assertEqual(snapshot["dots"]["DOT-A"]["agents"], [])
+        self.assertTrue(any(e["source"] == "ledger" and "DOT-A" in e["detail"]
                             and "missing" in e["detail"] for e in errors), errors)
-        self.assertIn("DOTS_ERROR ledger REM17: live directory missing", dm.render_table(snapshot))
+        self.assertIn("DOTS_ERROR ledger DOT-A: live directory missing", dm.render_table(snapshot))
 
     def test_unreachable_host_is_reported_once(self):
-        _, _, errors = snapshot_for({}, failures={"osaka": "exit 255: connection refused"})
+        _, _, errors = snapshot_for({}, failures={"local": "exit 255: connection refused"})
         self.assertEqual(len([e for e in errors if e["source"] == "ledger"]), 1)
 
     def test_snapshot_exits_two_when_a_live_directory_is_missing(self):
@@ -326,7 +326,7 @@ class TestMissingLiveDirectory(unittest.TestCase):
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(config, fh)
-            fake = FakeTransport(files={}, nodirs=("REM17",))
+            fake = FakeTransport(files={}, nodirs=("DOT-A",))
             out = io.StringIO()
             with mock.patch.object(dm, "Transport", lambda *a, **k: fake), \
                     contextlib.redirect_stdout(out):
@@ -365,32 +365,32 @@ class TestActivity(unittest.TestCase):
         self.assertIsNone(dump["1"]["text"])
 
     def test_missing_log_reports_error(self):
-        snapshot, _, errors = snapshot_for({"REM17": {"writer.jsonl": record()}}, activity_text=None)
+        snapshot, _, errors = snapshot_for({"DOT-A": {"writer.jsonl": record()}}, activity_text=None)
         self.assertTrue(any(e["source"] == "activity" for e in errors))
         self.assertIn("DOTS_ERROR", dm.render_table(snapshot))
 
 
 class TestClassification(unittest.TestCase):
     def test_working_when_tool_calls_follow_the_record(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                       activity_text=log_line(2))
         self.assertEqual(rows(snapshot)["writer"]["classification"], "WORKING")
 
     def test_quiet_when_record_is_newer_than_every_call(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                       activity_text=log_line(9))
         row = rows(snapshot)["writer"]
         self.assertEqual(row["classification"], "QUIET")
         self.assertEqual(row["activity_since_record"], 0)
 
     def test_stalled_after_thirty_minutes(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=45)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=45)}},
                                       activity_text=log_line(1))
         self.assertEqual(rows(snapshot)["writer"]["classification"], "STALLED")
 
     def test_blocked_wins_over_age(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=90, state="blocked",
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=90, state="blocked",
                                          evidence="local-token")}})
         self.assertEqual(rows(snapshot)["writer"]["classification"], "BLOCKED")
 
@@ -399,7 +399,7 @@ class TestClassification(unittest.TestCase):
                                             "merged": False, "head": "a" * 40,
                                             "merge": None}, None)}
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=5, state="done",
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=5, state="done",
                                          evidence="https://github.com/owner/repo/pull/7")}},
             gh=gh)
         row = rows(snapshot)["writer"]
@@ -408,7 +408,7 @@ class TestClassification(unittest.TestCase):
 
     def test_done_on_local_only_evidence_is_unproven(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=5, state="done",
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=5, state="done",
                                          evidence="MATCH-REDTEAM-CHECK")}})
         row = rows(snapshot)["writer"]
         self.assertEqual(row["classification"], "UNPROVEN")
@@ -416,7 +416,7 @@ class TestClassification(unittest.TestCase):
 
     def test_done_on_missing_pull_request_is_unproven(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=5, state="done",
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=5, state="done",
                                          evidence="https://github.com/owner/repo/pull/404")}})
         row = rows(snapshot)["writer"]
         self.assertEqual(row["classification"], "UNPROVEN")
@@ -424,13 +424,13 @@ class TestClassification(unittest.TestCase):
 
     def test_unresolved_evidence_on_a_step_is_unproven(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=5,
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=5,
                                          evidence="https://github.com/owner/repo/pull/404")}})
         self.assertEqual(rows(snapshot)["writer"]["classification"], "UNPROVEN")
 
     def test_unknown_resolver_keeps_done_but_flags_it(self):
         snapshot, _, errors = snapshot_for(
-            {"REM17": {"writer.jsonl": record(minutes_ago=5, state="done",
+            {"DOT-A": {"writer.jsonl": record(minutes_ago=5, state="done",
                                          evidence="https://github.com/owner/repo/pull/7")}},
             gh={"repos/owner/repo/pulls/7": (None, "error connecting to api.github.com")})
         row = rows(snapshot)["writer"]
@@ -440,7 +440,7 @@ class TestClassification(unittest.TestCase):
 
     def test_legacy_only_agent(self):
         legacy = json.dumps({"timestamp": stamp(1), "agent": "old", "state": "step"})
-        snapshot, _, _ = snapshot_for({"REM17": {"old.jsonl": legacy}})
+        snapshot, _, _ = snapshot_for({"DOT-A": {"old.jsonl": legacy}})
         row = rows(snapshot)["old"]
         self.assertEqual(row["classification"], "LEGACY")
         self.assertEqual(row["state"], "unconfirmed")
@@ -449,7 +449,7 @@ class TestClassification(unittest.TestCase):
 
     def test_legacy_lines_are_not_dropped_when_v1_lines_exist(self):
         body = json.dumps({"timestamp": stamp(30)}) + "\n" + record(minutes_ago=2)
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": body}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": body}},
                                       activity_text=log_line(1))
         row = rows(snapshot)["writer"]
         self.assertEqual(row["classification"], "WORKING")
@@ -457,8 +457,8 @@ class TestClassification(unittest.TestCase):
 
     def test_roster_slot_without_file(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record()}},
-            roster={"dot": "REM17", "slots": [{"agent": "writer", "role": "구현"},
+            {"DOT-A": {"writer.jsonl": record()}},
+            roster={"dot": "DOT-A", "slots": [{"agent": "writer", "role": "구현"},
                                               {"agent": "ghost", "role": "검토"}]})
         row = rows(snapshot)["ghost"]
         self.assertEqual(row["classification"], "NO_RECORD")
@@ -467,26 +467,26 @@ class TestClassification(unittest.TestCase):
 
     def test_file_without_roster_slot_is_reported(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"extra-agent.jsonl": record(agent="extra-agent")}},
-            roster={"dot": "REM17", "slots": [{"agent": "writer"}]})
-        self.assertEqual(snapshot["dots"]["REM17"]["unrostered"], ["extra-agent"])
+            {"DOT-A": {"extra-agent.jsonl": record(agent="extra-agent")}},
+            roster={"dot": "DOT-A", "slots": [{"agent": "writer"}]})
+        self.assertEqual(snapshot["dots"]["DOT-A"]["unrostered"], ["extra-agent"])
         self.assertIn("without roster slot", dm.render_table(snapshot))
 
     def test_json_snapshot_shape(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record()}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record()}},
                                       activity_text=log_line(1))
         row = rows(snapshot)["writer"]
         for key in ("role", "task", "state", "age_seconds", "classification", "note",
                     "evidence_status", "evidence"):
             self.assertIn(key, row)
         parsed = json.loads(dm.render_json(snapshot))
-        self.assertEqual(parsed["dots"]["REM17"]["agents"][0]["classification"], "WORKING")
-        self.assertEqual(parsed["dots"]["REM17"]["activity"]["osaka"]["calls_15m"], 1)
+        self.assertEqual(parsed["dots"]["DOT-A"]["agents"][0]["classification"], "WORKING")
+        self.assertEqual(parsed["dots"]["DOT-A"]["activity"]["local"]["calls_15m"], 1)
 
     def test_ledger_failure_is_reported_and_not_fatal(self):
-        snapshot, _, errors = snapshot_for({"REM17": {"writer.jsonl": record()}},
-                                           failures={"osaka": "timed out after 5s"})
-        self.assertEqual(snapshot["dots"]["REM17"]["agents"], [])
+        snapshot, _, errors = snapshot_for({"DOT-A": {"writer.jsonl": record()}},
+                                           failures={"local": "timed out after 5s"})
+        self.assertEqual(snapshot["dots"]["DOT-A"]["agents"], [])
         self.assertTrue(any(e["source"] == "ledger" for e in errors))
 
     def test_done_on_stale_pull_request_head_is_unproven(self):
@@ -494,7 +494,7 @@ class TestClassification(unittest.TestCase):
                                             "merged": False, "head": "1" * 40,
                                             "merge": None}, None)}
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(
+            {"DOT-A": {"writer.jsonl": record(
                 minutes_ago=5, state="done",
                 evidence="https://github.com/owner/repo/pull/7 @" + "2" * 40)}},
             gh=gh)
@@ -505,7 +505,7 @@ class TestClassification(unittest.TestCase):
     def test_legacy_only_agent_past_the_threshold_is_stalled(self):
         old = json.dumps({"timestamp": stamp(90), "agent": "old", "state": "step"})
         undated = json.dumps({"agent": "undated", "state": "step"})
-        snapshot, _, _ = snapshot_for({"REM17": {"old.jsonl": old, "undated.jsonl": undated}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"old.jsonl": old, "undated.jsonl": undated}},
                                       activity_text=log_line(1))
         found = rows(snapshot)
         self.assertEqual(found["old"]["classification"], "STALLED")
@@ -516,7 +516,7 @@ class TestClassification(unittest.TestCase):
     def test_legend_uses_configured_stall_threshold(self):
         config = base_config()
         config["thresholds"]["stall_minutes"] = 5
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=7)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=7)}},
                                       config=config)
         self.assertEqual(rows(snapshot)["writer"]["classification"], "STALLED")
         table = dm.render_table(snapshot)
@@ -525,7 +525,7 @@ class TestClassification(unittest.TestCase):
 
     def test_file_name_that_is_not_a_token_is_skipped_and_reported(self):
         snapshot, _, errors = snapshot_for(
-            {"REM17": {"writer.jsonl": record(), "bad name.jsonl": record(agent="bad")}})
+            {"DOT-A": {"writer.jsonl": record(), "bad name.jsonl": record(agent="bad")}})
         self.assertEqual(sorted(rows(snapshot)), ["writer"])
         self.assertTrue(any(e["source"] == "ledger" and "1 live file(s) skipped" in e["detail"]
                             for e in errors), errors)
@@ -536,7 +536,7 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_json_output_redacts_every_field(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record(task="api_key=SECRETTASK2",
+            {"DOT-A": {"writer.jsonl": record(task="api_key=SECRETTASK2",
                                               role="password=SECRETROLE3",
                                               project="ghp_" + "A" * 36)}},
             activity_text=log_line(1),
@@ -544,12 +544,12 @@ class TestReviewRegressions(unittest.TestCase):
         text = dm.render_json(snapshot)
         for secret in ("SECRETTASK2", "SECRETROLE3", "ghp_AAAA", "ghp_DDDD"):
             self.assertNotIn(secret, text)
-        self.assertEqual(json.loads(text)["dots"]["REM17"]["agents"][0]["agent"], "writer")
+        self.assertEqual(json.loads(text)["dots"]["DOT-A"]["agents"][0]["agent"], "writer")
 
     def test_watch_json_events_are_redacted(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            dm.emit_event({"event": "DOTS_BLOCKED", "dot": "REM17", "agent": "writer",
+            dm.emit_event({"event": "DOTS_BLOCKED", "dot": "DOT-A", "agent": "writer",
                            "detail": {"role": "ghp_" + "B" * 36, "task": "api_key=SECRET9"}},
                           True)
         self.assertNotIn("SECRET9", out.getvalue())
@@ -558,7 +558,7 @@ class TestReviewRegressions(unittest.TestCase):
 
     def test_table_redacts_and_flattens_roster_coordinator(self):
         snapshot, _, _ = snapshot_for(
-            {"REM17": {"writer.jsonl": record()}},
+            {"DOT-A": {"writer.jsonl": record()}},
             roster={"coordinator": "ghp_" + "C" * 36 + "\nDOTS_ERROR ledger forged",
                     "updated_at": "2026\nDOTS_STALLED forged", "slots": [{"agent": "writer"}]})
         table = dm.render_table(snapshot)
@@ -570,7 +570,7 @@ class TestReviewRegressions(unittest.TestCase):
     def test_forged_roster_agent_id_is_dropped_and_reported(self):
         forged = "bad\nDOTS_ERROR ledger fake line"
         snapshot, _, errors = snapshot_for(
-            {"REM17": {"writer.jsonl": record()}},
+            {"DOT-A": {"writer.jsonl": record()}},
             roster={"slots": [{"agent": "writer"}, {"agent": forged}, {"agent": 7}, "x"]})
         table = dm.render_table(snapshot)
         self.assertFalse([l for l in table.splitlines()
@@ -646,7 +646,7 @@ class TestEvidence(unittest.TestCase):
 
 class TestWatchDedup(unittest.TestCase):
     def test_first_scan_reports_new_agent_then_nothing(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                       activity_text=log_line(2))
         previous = {"agents": {}, "activity": {}, "errors": set()}
         events, state = dm.diff_events(previous, snapshot)
@@ -655,24 +655,24 @@ class TestWatchDedup(unittest.TestCase):
         self.assertEqual(events, [])
 
     def test_classification_change_emits_once(self):
-        working, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        working, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                      activity_text=log_line(2))
-        stalled, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=45)}},
+        stalled, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=45)}},
                                      activity_text=log_line(2))
         previous = {"agents": {}, "activity": {}, "errors": set()}
         _, state = dm.diff_events(previous, working)
         events, state2 = dm.diff_events(state, stalled)
         self.assertEqual([e["event"] for e in events], ["DOTS_STALLED"])
         self.assertEqual(events[0]["detail"]["from"], "WORKING")
-        self.assertEqual(events[0]["dot"], "REM17")
+        self.assertEqual(events[0]["dot"], "DOT-A")
         self.assertEqual(events[0]["agent"], "writer")
         again, _ = dm.diff_events(state2, stalled)
         self.assertEqual(again, [])
 
     def test_activity_transitions(self):
-        idle, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        idle, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                   activity_text=log_line(40))
-        active, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        active, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                     activity_text=log_line(1))
         previous = {"agents": {}, "activity": {}, "errors": set()}
         _, state = dm.diff_events(previous, idle)
@@ -682,9 +682,9 @@ class TestWatchDedup(unittest.TestCase):
         self.assertIn("DOTS_IDLE", [e["event"] for e in events])
 
     def test_error_and_recovery_are_emitted_once(self):
-        broken, _, _ = snapshot_for({"REM17": {"writer.jsonl": record()}},
-                                    failures={"osaka": "exit 255: connection refused"})
-        healthy, _, _ = snapshot_for({"REM17": {"writer.jsonl": record()}},
+        broken, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record()}},
+                                    failures={"local": "exit 255: connection refused"})
+        healthy, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record()}},
                                      activity_text=log_line(1))
         previous = {"agents": {}, "activity": {}, "errors": set()}
         events, state = dm.diff_events(previous, broken)
@@ -695,20 +695,20 @@ class TestWatchDedup(unittest.TestCase):
         self.assertIn("DOTS_RECOVERED", [e["event"] for e in recovered])
 
     def test_event_line_format(self):
-        line = dm.format_event({"event": "DOTS_BLOCKED", "dot": "REV18",
-                                "agent": "yomanchi-23-engine",
+        line = dm.format_event({"event": "DOTS_BLOCKED", "dot": "DOT-B",
+                                "agent": "example-23-engine",
                                 "detail": {"state": "blocked", "age": "16m",
                                            "task": "issue #23"}})
-        self.assertTrue(line.startswith("DOTS_BLOCKED REV18 yomanchi-23-engine "))
+        self.assertTrue(line.startswith("DOTS_BLOCKED DOT-B example-23-engine "))
         self.assertIn('task="issue #23"', line)
         self.assertIn("age=16m", line)
 
     def test_table_contains_every_classification(self):
-        snapshot, _, _ = snapshot_for({"REM17": {"writer.jsonl": record(minutes_ago=5)}},
+        snapshot, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}},
                                       activity_text=log_line(1))
         table = dm.render_table(snapshot)
         self.assertIn("WORKING", table)
-        self.assertIn("activity osaka", table)
+        self.assertIn("activity local", table)
         self.assertIn("writer", table)
 
 

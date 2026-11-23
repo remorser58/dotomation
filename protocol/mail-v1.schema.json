@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:dots-superkit:mail-v1",
   "title": "dots-superkit/mail-v1",
-  "description": "One append-only line in mail/<agentId>/in.jsonl (main session to agent) or mail/<agentId>/out.jsonl (agent to main session) on Osaka. This is the shape only. Who may write which file, the event rules each kind maps to and the reading cadence are in workflows/direct-mail.md. Exactly these ten fields, all required, no extras.",
+  "description": "One append-only line in mail/<agentId>/in.jsonl (main session to agent) or mail/<agentId>/out.jsonl (agent to main session) in the shared folder on `local`. This is the shape only. Who may write which file, the event rules each kind maps to and the reading cadence are in workflows/direct-mail.md. Exactly these ten fields, all required, no extras.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -65,7 +65,7 @@
       "items": {
         "$ref": "#/$defs/line"
       },
-      "description": "Exact references: rev/* branch, full commit SHA, mini:<workspace path>, path, link, gate:<ID>, or supersedes:<message id>."
+      "description": "Exact references: rev/* branch, full commit SHA, local:<workspace path>, path, link, gate:<ID>, or supersedes:<message id>."
     }
   },
   "required": [

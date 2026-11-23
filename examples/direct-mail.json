@@ -1,5 +1,5 @@
 {
-  "description": "Synthetic direct-mail exchange (mail-v1) between a project main session and one dot sub-agent working on the Mac mini. Ids, SHAs, paths and gate IDs are invented. Each message is one line in the file named by 'file'. Negative cases are in examples/edge-cases.md.",
+  "description": "Synthetic direct-mail exchange (mail-v1) between a project main session and one dot sub-agent working in a workspace on `local`. Ids, SHAs, paths and gate IDs are invented. Each message is one line in the file named by 'file'. Negative cases are in examples/edge-cases.md.",
   "messages": [
     {
       "file": "mail/example-android/in.jsonl",
@@ -11,7 +11,7 @@
     },
     {
       "file": "mail/example-android/out.jsonl",
-      "line": {"v": 1, "id": "m-20261123T013000Z-e5f6", "t": "2026-11-23T01:30:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T010000Z-a1b2", "text": "Committed in the Mac mini workspace, pushed nowhere. Ran :androidApp:testDebugUnitTest (430 tests, 0 failures) and lintDebug (0 errors). Not run: screenshot comparison; no test yet for G3.", "refs": ["mini:/Volumes/Example/yomanchi-rev18/issue-90", "rev/widget-refresh-20261123", "0123456789abcdef0123456789abcdef01234567"]}
+      "line": {"v": 1, "id": "m-20261123T013000Z-e5f6", "t": "2026-11-23T01:30:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T010000Z-a1b2", "text": "Committed in the workspace on `local`, pushed nowhere. Ran :androidApp:testDebugUnitTest (430 tests, 0 failures) and lintDebug (0 errors). Not run: screenshot comparison; no test yet for G3.", "refs": ["local:/work/example-project/issue-90", "rev/widget-refresh-20261123", "0123456789abcdef0123456789abcdef01234567"]}
     },
     {
       "file": "mail/example-android/in.jsonl",
@@ -19,7 +19,7 @@
     },
     {
       "file": "mail/example-android/out.jsonl",
-      "line": {"v": 1, "id": "m-20261123T022000Z-2c3d", "t": "2026-11-23T02:20:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T015500Z-0a1b", "text": "Fixed the second-write cancel path and added a regression test for G3. 431 tests, 0 failures; lint 0 errors. Not run: screenshot comparison.", "refs": ["mini:/Volumes/Example/yomanchi-rev18/issue-90", "rev/widget-refresh-20261123", "89abcdef0123456789abcdef0123456789abcdef", "supersedes:m-20261123T013000Z-e5f6"]}
+      "line": {"v": 1, "id": "m-20261123T022000Z-2c3d", "t": "2026-11-23T02:20:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T015500Z-0a1b", "text": "Fixed the second-write cancel path and added a regression test for G3. 431 tests, 0 failures; lint 0 errors. Not run: screenshot comparison.", "refs": ["local:/work/example-project/issue-90", "rev/widget-refresh-20261123", "89abcdef0123456789abcdef0123456789abcdef", "supersedes:m-20261123T013000Z-e5f6"]}
     },
     {
       "file": "mail/example-android/in.jsonl",

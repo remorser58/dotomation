@@ -49,7 +49,7 @@ FRACTION_RE = re.compile(r"\.([0-9]+)")
 CLASS_ORDER = ("BLOCKED", "UNPROVEN", "DONE", "STALLED", "WORKING", "QUIET", "LEGACY", "NO_RECORD")
 
 DEFAULT_CONFIG = {
-    "ledger": {"host": "osaka", "root": "~/CodeProjects/.dots-ops/live", "dots": ["REM17", "REV18"]},
+    "ledger": {"host": "local", "root": "~/.dots-ops/live", "dots": ["DOT-A", "DOT-B"]},
     "dots": {},
     "activity": [],
     "github": {"enabled": True, "repos": [], "cache_seconds": 300, "max_lookups": 60},
@@ -231,7 +231,7 @@ def parse_ledger_dump(text, nonce):
     """Parse the framed dump produced by ledger_script() for this run's nonce.
 
     Every sentinel carries the nonce, so a record or note that happens to
-    contain ``==END`` or ``==DOT REV18`` cannot close a file early or move the
+    contain ``==END`` or a ``==DOT`` line cannot close a file early or move the
     following lines into another dot's table.
     """
     dot_tag = "==DOT %s " % nonce
