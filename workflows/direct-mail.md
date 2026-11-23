@@ -273,6 +273,14 @@ wake command ran.
   writable`, which is the safe direction. A ledger record that is not an object is dropped, so that
   run rings again instead of dying. Nothing is repaired, and an unreadable mailbox hides its mail
   from `watch` the same way a deleted line does.
+- **A line whose bytes are not UTF-8.** A mailbox is bytes the root appends to, so one damaged line is
+  expected. It costs that line and nothing else: each line is decoded on its own, a line that does not
+  decode is skipped, and the run prints `dots: skipped N lines in <path>, not UTF-8; every other line
+  was read` once per change in N, so the size of the damage is visible without a once-a-second poll
+  repeating itself. Decoding the file as one stream would drop every line from the bad byte to the
+  next buffer boundary — a message written after the damage would never be rung — so the per-line
+  read is the rule, not an optimisation. `.agent-read` and `.main-read` are single ids and read as one
+  line; a marker with damage in it reads as no marker, which the missing-id case below covers.
 - **A line with no usable id.** An owed line whose `id` is missing or not a token can never be
   woken or answered, and `board` still counts it as `MAIL_WAITING`; `watch` prints
   `WATCH_ERROR {project} {agent} {id!r} unusable id` on every run instead of skipping it in silence.

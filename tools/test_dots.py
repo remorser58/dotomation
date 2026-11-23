@@ -44,10 +44,19 @@ def run(args, base, stdin=None, timeout=20):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def spawn(args, base):
+def spawn(args, base, body=None):
+    """Start the tool, and hand it `body` on stdin when one is given. The pipe is written, closed and
+    then forgotten: since Python 3.12 `communicate` flushes stdin, so a closed pipe left on the object
+    makes it raise ValueError instead of returning the output. Every stdin-writing case goes through
+    here so there is one place that knows this."""
     env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.Popen([sys.executable, SCRIPT] + list(args), env=env, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([sys.executable, SCRIPT] + list(args), env=env, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if body is not None:
+        p.stdin.write(body)
+        p.stdin.close()
+        p.stdin = None
+    return p
 
 
 def wait_for(target, seconds=5.0):
@@ -343,12 +352,8 @@ class WakeTests(Base):
                        "import sys, time, pathlib; time.sleep(0.3); pathlib.Path(sys.argv[1]).write_text('ran')",
                        target]
         d.write_atomic(os.path.join(self.base, "dots.json"), json.dumps(cfg, indent=1) + "\n")
-        p = subprocess.Popen([sys.executable, SCRIPT, "send", "proj", "agent-1", "task", "issue 1"],
-                             env=dict(os.environ, DOTS_OPS_BASE=self.base, PYTHONDONTWRITEBYTECODE="1"),
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = spawn(["send", "proj", "agent-1", "task", "issue 1"], self.base, body="go")
         self.procs.append(p)
-        p.stdin.write("go")
-        p.stdin.close()
         self.assertRegex(p.stdout.readline().strip(), ID_RE)  # the id only; then the reader goes away
         p.stdout.close()
         err = p.stderr.read()
@@ -377,6 +382,29 @@ class TickTests(Base):
         self.assertIn(second, res.stdout)
         self.assertNotIn(f"MAIL_NEW proj {first}", res.stdout)
         self.assertEqual(d.marker(os.path.join(self.base, "proj", "mail", "agent-1", ".agent-read")), first)
+
+    def test_a_bad_byte_costs_one_mail_line_not_the_rest_of_the_mailbox(self):
+        # the root appends bytes, so one byte that is not UTF-8 is a shape the tool must survive. Reading
+        # the stream would drop every line from that byte to the next buffer boundary, so a real message
+        # written after it would never be rung; one bad byte costs exactly the line it sits on
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        os.makedirs(box, exist_ok=True)
+
+        def mail_line(mid, text):
+            return json.dumps({"v": 1, "id": mid, "t": d.now(), "from": "proj-main", "to": "agent-1",
+                               "task": "issue 1", "kind": "task", "re": None, "text": text,
+                               "refs": []}) + "\n"
+        with open(os.path.join(box, "in.jsonl"), "wb") as fh:
+            for i in range(3):
+                fh.write(mail_line(f"m-20260101T000000Z-000{i}", "before the bad byte").encode())
+            fh.write(b'{"v": 1, "text": "not UTF-8 \xff"}\n')
+            fh.write(mail_line("m-20260101T000000Z-0009", "after the bad byte").encode())
+        res = self.tick()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.count("MAIL_NEW"), 4, res.stdout)   # three, then the one after it
+        self.assertIn("after the bad byte", res.stdout)
+        self.assertIn(f"skipped 1 line in {os.path.join(box, 'in.jsonl')}", res.stderr)
+        self.assertNotIn("treated as no lines", res.stderr)   # the file itself is readable
 
     def test_refused_tick_writes_nothing(self):
         live = os.path.join(self.base, "live", "DOT-A", "agent-1.jsonl")
@@ -569,9 +597,7 @@ class ReplyWaitTests(Base):
     """reply result|question|block stays open, so the answer is that command's output."""
 
     def start_reply(self, *args, agent="agent-1", body="done, rev/x-20261123"):
-        p = spawn(["reply", "proj", agent, *args], self.base)
-        p.stdin.write(body)
-        p.stdin.close()
+        p = spawn(["reply", "proj", agent, *args], self.base, body=body)
         self.procs.append(p)
         return p
 
@@ -651,9 +677,7 @@ class ReplyWaitTests(Base):
                                          "to": "agent-1", "task": "issue 1", "kind": "task", "re": None,
                                          "text": "hand written", "refs": []}, ensure_ascii=False) + "\n")
         p = spawn(["reply", "proj", "agent-1", "result", "issue 1", "--ref", "rev/x", "--dot", "DOT-A",
-                   "--timeout", "4"], self.base)
-        p.stdin.write("done")
-        p.stdin.close()
+                   "--timeout", "4"], self.base, body="done")
         self.procs.append(p)
         out, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 3, out + err)     # the bad line is not the answer, so it waits
@@ -1276,7 +1300,8 @@ class ReadWarningTests(unittest.TestCase):
             self.assertFalse(os.path.exists(target))
 
     def test_a_file_that_is_not_utf8_is_reported_not_raised(self):
-        # a mailbox file the root filled with bytes is still a shape the tool must survive
+        # a mailbox file the root filled with bytes is still a shape the tool must survive, and the
+        # report says how much of it was skipped rather than calling the whole file unreadable
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "in.jsonl")
             with open(path, "wb") as fh:
@@ -1284,8 +1309,10 @@ class ReadWarningTests(unittest.TestCase):
             err = io.StringIO()
             with redirect_stderr(err):
                 self.assertEqual(d.jsonl(path), [])
-                self.assertIsNone(d.marker(path))
-            self.assertIn("UnicodeDecodeError", err.getvalue())
+                self.assertEqual(d.jsonl(path), [])     # the same count is not repeated every poll
+                self.assertIsNone(d.marker(path))       # a marker is one line: no per-line fallback
+            self.assertEqual(err.getvalue().count("skipped 1 line in"), 1, err.getvalue())
+            self.assertIn("(UnicodeDecodeError)", err.getvalue())
 
     def test_a_path_that_recovers_and_breaks_again_is_reported_again(self):
         # a folder where a file belongs reads as no lines; a good read clears the warning, so a second
