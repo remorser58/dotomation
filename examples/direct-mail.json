@@ -23,7 +23,7 @@
     },
     {
       "file": "mail/example-android/in.jsonl",
-      "line": {"v": 1, "id": "m-20261123T024500Z-4e5f", "t": "2026-11-23T02:45:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "answer", "re": "m-20261123T022000Z-2c3d", "text": "Accepted 89abcde after my own run: gate:G1 PASS (431/0); gate:G2 PASS; gate:G3 PASS (new regression test plus a manual cancel during the second write). Published that SHA and opened the pull request. Record your done citing this message and the SHA; the coordinator closes.", "refs": ["89abcdef0123456789abcdef0123456789abcdef", "https://github.com/example/app/pull/91", "gate:G1", "gate:G2", "gate:G3"]}
+      "line": {"v": 1, "id": "m-20261123T024500Z-4e5f", "t": "2026-11-23T02:45:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "answer", "re": "m-20261123T022000Z-2c3d", "text": "Accepted 89abcde after my own run: gate:G1 PASS (431/0); gate:G2 PASS; gate:G3 PASS (new regression test plus a manual cancel during the second write). Published that SHA and opened the pull request. Append a done that cites this message and the SHA; the coordinator closes.", "refs": ["89abcdef0123456789abcdef0123456789abcdef", "https://github.com/example/app/pull/91", "gate:G1", "gate:G2", "gate:G3"]}
     }
   ]
 }

@@ -45,7 +45,7 @@ Lines already in the folder may use `timestamp` instead of `t`, miss a field, or
 - `step` at each material step, and at least every 15 minutes while working. A long tool run gets a `step` before it and a `step` after it.
 - An agent assigned to a project main session also reads its [direct mail](direct-mail.md) inbox each time it appends a line, and cites a message it acts on as `mail:<agentId>/<message id>`.
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
-- `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules.
+- `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules. A later `review` that reopens the work is answered with a new `step`; on [direct mail](direct-mail.md) an accepting `answer` gets one more `done`.
 
 A working agent with no new line for 30 minutes is **stalled**. The coordinator checks that agent directly — alive, waiting on a peer, host gone — and reassigns the slot. A stall is not evidence of a VM reset, and a reset suspicion is not a stall.
 
