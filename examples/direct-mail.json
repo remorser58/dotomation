@@ -1,0 +1,35 @@
+{
+  "description": "Synthetic direct-mail exchange (mail-v1) between a project main session and one dot sub-agent. Ids, SHAs and paths are invented. Each message is one line in the file named by 'file'.",
+  "messages": [
+    {
+      "file": "mail/example-android/in.jsonl",
+      "line": {"v": 1, "id": "m-20261123T010000Z-a1b2", "t": "2026-11-23T01:00:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "task", "re": null, "text": "Keep the widget refresh change, but move the cancel check before the account write. Same branch, new commit.", "refs": ["rev/widget-refresh-20261123"]}
+    },
+    {
+      "file": "mail/example-android/out.jsonl",
+      "line": {"v": 1, "id": "m-20261123T010420Z-c3d4", "t": "2026-11-23T01:04:20Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "ack", "re": "m-20261123T010000Z-a1b2", "text": "Taken. Working in the same workspace; next live step after the unit tests.", "refs": []}
+    },
+    {
+      "file": "mail/example-android/out.jsonl",
+      "line": {"v": 1, "id": "m-20261123T013000Z-e5f6", "t": "2026-11-23T01:30:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T010000Z-a1b2", "text": "Pushed to the rev-out repository. Ran :androidApp:testDebugUnitTest (430 tests, 0 failures) and lintDebug (0 errors). Not run: screenshot comparison.", "refs": ["rev/widget-refresh-20261123", "0123456789abcdef0123456789abcdef01234567"]}
+    },
+    {
+      "file": "mail/example-android/in.jsonl",
+      "line": {"v": 1, "id": "m-20261123T015500Z-0a1b", "t": "2026-11-23T01:55:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "review", "re": "m-20261123T013000Z-e5f6", "text": "Checked 0123456 on my side: unit tests pass, but a cancel during the second write still leaves the old account state. Fix that path and send a new result that supersedes this one.", "refs": ["0123456789abcdef0123456789abcdef01234567"]}
+    },
+    {
+      "file": "mail/example-android/out.jsonl",
+      "line": {"v": 1, "id": "m-20261123T022000Z-2c3d", "t": "2026-11-23T02:20:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T015500Z-0a1b", "text": "Fixed the second-write cancel path and added a regression test for it. Same checks pass (431 tests, 0 failures; lint 0).", "refs": ["rev/widget-refresh-20261123", "89abcdef0123456789abcdef0123456789abcdef", "supersedes:m-20261123T013000Z-e5f6"]}
+    },
+    {
+      "file": "mail/example-android/in.jsonl",
+      "line": {"v": 1, "id": "m-20261123T024500Z-4e5f", "t": "2026-11-23T02:45:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "answer", "re": "m-20261123T022000Z-2c3d", "text": "Accepted 89abcde after my own run. Published that SHA to GitHub and opened the pull request. Record done with this message id.", "refs": ["89abcdef0123456789abcdef0123456789abcdef", "https://github.com/example/app/pull/91"]}
+    }
+  ],
+  "rejected": [
+    {"why": "agent message without re", "line": {"v": 1, "id": "m-x1", "t": "2026-11-23T01:00:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "note", "re": null, "text": "hello", "refs": []}, "rule": "workflows/direct-mail.md: every message an agent sends carries re"},
+    {"why": "kind outside the enum", "line": {"v": 1, "id": "m-x2", "t": "2026-11-23T01:00:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "merge", "re": null, "text": "merge it", "refs": []}, "rule": "schema: kind"},
+    {"why": "extra field", "line": {"v": 1, "id": "m-x3", "t": "2026-11-23T01:00:00Z", "from": "example-main", "to": "example-android", "task": "issue #90", "kind": "note", "re": null, "text": "x", "refs": [], "token": "redacted"}, "rule": "schema: additionalProperties false"},
+    {"why": "branch alone as a result target", "line": {"v": 1, "id": "m-x4", "t": "2026-11-23T01:00:00Z", "from": "example-android", "to": "example-main", "task": "issue #90", "kind": "result", "re": "m-20261123T010000Z-a1b2", "text": "Done.", "refs": ["rev/widget-refresh-20261123"]}, "rule": "SKILL.md submit: a branch name alone is not evidence of the checked result; name the full commit SHA"}
+  ]
+}

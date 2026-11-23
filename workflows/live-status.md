@@ -43,6 +43,7 @@ Lines already in the folder may use `timestamp` instead of `t`, miss a field, or
 
 - `start` when taking up the brief, before the first workspace mutation.
 - `step` at each material step, and at least every 15 minutes while working. A long tool run gets a `step` before it and a `step` after it.
+- An agent assigned to a project main session also reads its [direct mail](direct-mail.md) inbox each time it appends a line, and cites a message it acts on as `mail:<agentId>/<message id>`.
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules.
 
