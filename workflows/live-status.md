@@ -37,12 +37,13 @@ Creating the folder and appending a line are ordinary filesystem operations on t
 
 ## Legacy lines
 
-Lines already in the folder may use `timestamp` instead of `t`, miss a field, or spell a role, host, project or model in the wording of the day. They stay exactly as written: never rewritten, reformatted, migrated or deleted, because the log is append-only. Read them as unconfirmed — they still show what that agent said at that time, but they are not v1 records, they do not prove a step, and they cannot be cited as a confirmed setting. A stall clock runs only from that agent's newest v1 line; an agent with no v1 line is checked as stalled. The correction is a new v1 line, not an edit of the old one.
+Lines already in the folder may use `timestamp` instead of `t`, miss a field, or spell a role, host, project or model in the wording of the day. They stay exactly as written: never rewritten, reformatted, migrated or deleted, because the log is append-only. Read them as unconfirmed — they still show what that agent said at that time, but they are not v1 records, they do not prove a step, and they cannot be cited as a confirmed setting. A stall clock runs from that agent's newest v1 line. An agent with a live file but no v1 line is checked as stalled once its newest off-format line with a readable time (`t`, `timestamp`, `time`, `at` or `datetime`) is over 30 minutes old, and at once when no line has one. The correction is a new v1 line, not an edit of the old one.
 
 ## When to append
 
 - `start` when taking up the brief, before the first workspace mutation.
 - `step` at each material step, and at least every 15 minutes while working. A long tool run gets a `step` before it and a `step` after it.
+- Each time it appends a line, the agent also rewrites its own [session memory](session-memory.md) with the same `t`, `task`, `state` and `host`. `dots.py tick` on Osaka does both in one call.
 - An agent assigned to a project main session also reads its [direct mail](direct-mail.md) inbox each time it appends a line, and cites a message it acts on as `mail:<agentId>/<message id>`.
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules. A later `review` that reopens the work is answered with a new `step`; on [direct mail](direct-mail.md) an accepting `answer` gets one more `done`.

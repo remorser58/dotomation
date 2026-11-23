@@ -6,7 +6,7 @@ Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자�
 
 - 목표부터 정하기: WISH · 증거를 갖춰 실행: ULW · 계획만: ulw-plan · 승인된 계획 실행: ulw-execute.
 - 반복·병렬·조사: ulw-loop · mass-ulw · ulw-research · 독립 관점 교차 검토: hyperplan.
-- [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [호스트 배치와 승인 경로](workflows/hosts.md), [실시간 작업 기록](workflows/live-status.md), [프로젝트 메인 세션과 서브에이전트 직통 우편함](workflows/direct-mail.md), [실제 작업 여부 모니터링](workflows/monitoring.md), [VM 체크포인트·리셋 복구](workflows/vm-watchdog.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
+- [텍스트 호출법](workflows/dispatch.md), [목표와 모드별 절차](workflows/goals.md), [전문 작업 19종](workflows/specialists.md), [호스트 배치와 승인 경로](workflows/hosts.md), [실시간 작업 기록](workflows/live-status.md), [서브에이전트 세션 메모리](workflows/session-memory.md), [프로젝트 메인 세션과 서브에이전트 직통 우편함](workflows/direct-mail.md), [실제 작업 여부 모니터링](workflows/monitoring.md), [VM 체크포인트·리셋 복구](workflows/vm-watchdog.md), [상위 프로젝트 기능별 구현 범위와 한계](FEATURES.md), [모드 판정 예시](examples/mode-cases.md).
 
 - 역할을 배정할 때는 [Astra 프로필과 역할별 브리핑](profiles/astra/PROFILE.md)을 같은 커밋에서 읽는다. REM·Ultra·xhigh는 브리핑 이름이지 실행 설정의 증거가 아니다. [역할 판정 예시](examples/astra-cases.md)도 있다.
 
@@ -37,6 +37,7 @@ work_id / revision: <안정된 작업 ID> / 1
 
 - 오사카 공유 폴더 `~/CodeProjects/.dots-ops/`의 `live/<DOT>/`(DOT = REM17·REV18)에 총괄·담당·검증자가 각자 한 줄씩 JSONL로 남긴다: 시작, 단계마다(작업 중 최소 15분), 막힘, 종료. 필드와 시점은 [live-record-v1](protocol/live-record-v1.schema.json)과 [실시간 작업 기록](workflows/live-status.md)에 있다.
 - 조정자는 `live/<DOT>/roster.json`에 슬롯(담당·역할·모델·작업·상태·마지막 기록 시각)을 유지한다. 30분 넘게 새 줄이 없는 작업 담당은 정체로 보고 직접 확인한 뒤 재배정한다.
+- 각 에이전트는 기록을 남길 때마다 `memory/<DOT>/<agentId>.json`에 자기 세션 메모리(목표·지금 하는 일·다음 할 일·결정·막힌 점)를 통째로 덮어쓴다. 오사카 `dots.py tick` 한 번이 기록 줄·메모리·안 읽은 우편 확인을 같이 하고, `dots.py board`는 전원의 상태·메모리 요약·우편·정체를 한 화면에 보여 준다. 메인 세션·조정자·리드는 이 파일을 직접 읽고, 정체나 VM 리셋으로 자리를 바꾸면 새 담당이 이전 메모리를 읽고 이어받는다: [세션 메모리](workflows/session-memory.md), [memory-v1](protocol/memory-v1.schema.json).
 - 오너가 정한 프로젝트(현재 요만치, 메인 세션 `yomanchi-main` = 맥북 OMP)에서는 메인 세션이 REV 본체를 거치지 않고 오사카 `~/CodeProjects/.dots-ops/<project>/mail/<agentId>/` 우편함으로 서브에이전트와 직접 주고받는다. 서브에이전트는 코드를 GitHub에 올리지 않는다. 오사카 작업이면 rev-out 저장소에 `rev/*` 커밋을 push 하고, 미니 작업이면 커밋을 그 자리에 두고 작업 경로를 적는다. 메인 세션은 자기 환경에서 게이트별로 검증한 뒤 GitHub에 올리고 PR을 연다. 조정자는 수락 답이 온 최신 결과만 닫는다. 에이전트는 `result`를 보낼 때 `done`을 남기고, 수락 답이 오면 그 답과 GitHub에 올린 SHA를 인용한 `done`을 한 줄 더 남긴다. 메인 세션이 보낸 메시지에 답이 없고, 에이전트가 읽음 표시도 하지 않았고, 새 live 줄도 없이 20분이 지나면 메인 세션이 본체 채팅에 한 줄을 보내고, 본체는 그 에이전트를 깨우기만 한다: [직통 우편함](workflows/direct-mail.md), [mail-v1](protocol/mail-v1.schema.json).
 - VM 작업은 단계마다 오사카에 체크포인트를 남긴다. 리셋이 의심되면 `state:"blocked"`, `note:"vm reset suspected"`로 남기고, 복구는 마지막 확정 체크포인트의 다음 단계 하나부터 진행한다: [VM watchdog](workflows/vm-watchdog.md).
 - 기록은 자기 보고다. 실제로 일하는지는 `python3 tools/dots_monitor.py snapshot`으로 본다. 각 에이전트의 마지막 기록과 그 계정의 Web GPT Agent 데몬 요청 수(15분·60분)를 맞대고, 기록의 증거 링크(PR·커밋·이슈·댓글·CI 실행)가 GitHub에 실제로 있는지 확인해 WORKING·QUIET·STALLED·BLOCKED·DONE·UNPROVEN·LEGACY로 나눈다. `watch --interval 60`은 상태가 바뀔 때만 `DOTS_STALLED` 같은 한 줄을 출력한다. 읽기만 하며 기록을 고치거나 Dot에 메시지를 보내거나 작업을 배정하지 않는다: [모니터링](workflows/monitoring.md).
