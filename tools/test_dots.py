@@ -1440,6 +1440,11 @@ class WatchTests(Base):
         self.assertEqual(len(rings), 1)   # the same blocked line is not woken again
         res = run(["watch", "--dot", "DOT-C", *self.recovery({})], self.base)
         self.assertIn("WATCH_ERROR board DOT-C no live folder", res.stdout)
+        live = os.path.join(self.base, "live", "DOT-A")
+        os.rename(live, live + ".away")   # unreadable for one run, then back unchanged
+        self.assertIn("WATCH_ERROR board DOT-A no live folder", self.idle_watch()[0])
+        os.rename(live + ".away", live)
+        self.assertEqual(len(self.idle_watch()[1]), 1)
 
     def test_a_changed_recovery_script_is_never_run(self):
         self.live("step", 0, host="vm")

@@ -1292,7 +1292,9 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
     prints WATCH_SKIP."""
     dots = scan_dots(scan, cfg)
     rows, errors = board_rows(dots)
-    scope = lambda key: key.split("/", 1)[0] in dots   # records outside this run's dots are kept
+    # forget a record only for a dot this run read; a folder missing for one run keeps its records
+    read_ok = set(dots) - {e["dot"] for e in errors if e["error"] == "no live folder"}
+    scope = lambda key: key.split("/", 1)[0] in read_ok
     seen = set()
     for r in rows if scan.idle else ():
         flags = [f for f in r["flags"] if f in ("STALLED", "CLAIM-STALE", "BLOCKED")]
@@ -1353,7 +1355,7 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         st["roster"][key] = {"t": now()}
         save_state(st_path, st, warned)
         print(f"WATCH_ROSTER_STALE {e['dot']} {e['error']}", flush=True)
-    for key in [k for k in st["roster"] if scan.idle and k.split("|", 1)[0] in dots and k not in reported]:
+    for key in [k for k in st["roster"] if scan.idle and k.split("|", 1)[0] in read_ok and k not in reported]:
         del st["roster"][key]
         save_state(st_path, st, warned)
     if scan.recovery:

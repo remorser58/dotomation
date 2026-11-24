@@ -210,7 +210,9 @@ from the files alone:
 - **The same run reads the board when it has an idle command.** With `--idle-cmd` each run reads
   `board` for the dots named with `--dot`, else the configured dots, else every `live/` folder
   (`WATCH_CONFIG` names them in `dots=`), and acts on the agent's own files only. Records for dots
-  outside this run's set are kept, so runs over different dots share one ledger:
+  outside this run's set, or whose `live/` folder was missing this run, are kept, so runs over
+  different dots can share one ledger one after another; runs sharing a `--state` must not overlap,
+  because each replaces the whole file:
   - a `STALLED` or `CLAIM-STALE` row runs the idle argv, and again every `rewake_min` minutes while
     the same live line stays newest; a newer line ends the record. A row with only legacy lines
     (`NO-LIVE STALLED`) is woken too, with `age=-`; an empty `{project}`, `{task}` or `{state}` is `-`;
