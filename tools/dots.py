@@ -88,7 +88,7 @@ import sys
 if __name__ == "__main__" and sys.path:
     del sys.path[0]
 
-import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, stat, subprocess, time
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, math, os, re, secrets, signal, socket, stat, subprocess, time
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -643,8 +643,9 @@ def roster_behind(roster_doc, newest):
     lag = (newest[0] - upd).total_seconds() / 60
     if lag <= STALL_MIN:
         return None
-    return (f"roster.json: updated_at {roster_doc.get('updated_at')} is {round(lag)}m older than the newest "
-            f"live line ({newest[1]} {newest[0].strftime('%Y-%m-%dT%H:%M:%SZ')}); its slot states are stale")
+    newest_utc = newest[0].astimezone(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return (f"roster.json: updated_at {roster_doc.get('updated_at')} is {math.ceil(lag)}m older than the newest "
+            f"live line ({newest[1]} {newest_utc}); its slot states are stale")
 
 def claim_stale(last, waiting, roster_state):
     """A claim the evidence disproves, from the files only. The roster is the root's word and is

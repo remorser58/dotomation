@@ -495,6 +495,28 @@ class TickTests(Base):
                                            "slots": [{"agent": "agent-2", "state": "closed"}]}) + "\n")
         self.assertFalse([e for e in self.board_json()["errors"] if e["dot"] == "DOT-A"])
 
+    def test_a_finished_agent_with_an_older_memory_is_not_flagged_memo_behind(self):
+        self.assertEqual(self.tick().returncode, 0)  # agent-1 memory on "issue 1"
+        self.write_live("agent-1", "done", d.now(), task="issue 2")
+        self.write_live("agent-2", "step", d.now())
+        rows = {r["agent"]: r for r in self.board_json()["agents"]}
+        self.assertEqual([f for f in rows["agent-1"]["flags"] if "MEMO" in f], [])
+        self.assertIn("NO-MEMO", rows["agent-2"]["flags"])
+
+    def test_roster_age_needs_a_dated_roster_and_a_v1_line(self):
+        roster = os.path.join(self.base, "live", "DOT-A", "roster.json")
+        d.write_atomic(roster, json.dumps({"slots": [{"agent": "agent-2", "state": "working"}]}) + "\n")
+        with open(os.path.join(self.base, "live", "DOT-A", "agent-2.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("2026-01-01 legacy line\n")
+        self.assertFalse([e for e in self.board_json()["errors"] if e["dot"] == "DOT-A"])
+        self.write_live("agent-2", "step", "2026-01-01T11:00:00+09:00")
+        errs = [e["error"] for e in self.board_json()["errors"] if e["dot"] == "DOT-A"]
+        self.assertTrue(any("cannot be dated" in e for e in errs), errs)
+        d.write_atomic(roster, json.dumps({"updated_at": "2026-01-01T01:29:36Z", "slots": []}) + "\n")
+        errs = [e["error"] for e in self.board_json()["errors"] if e["dot"] == "DOT-A"]
+        self.assertTrue(any("31m older than the newest live line (agent-2 2026-01-01T02:00:00Z)" in e
+                            for e in errs), errs)
+
 
 class MailTests(Base):
     def test_reply_inbox_read_round_trip(self):
