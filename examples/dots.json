@@ -1,5 +1,5 @@
 {
- "description": "Synthetic dots.json, written by `python3 tools/dots.py init` on one machine (the optional `watch` delays below are the one key an owner adds by hand; the same values passed to `watch` as `--after-min`/`--notify-after-min` win, because this file sits in the folder the dot root writes). Dot ids, project ids, session ids, host labels and the wake command are invented; the wake command stands for whatever CLI the instance already has to post one line into a dot's chat. The shape is described in workflows/direct-mail.md; the file is optional and every command works without it.",
+ "description": "Synthetic dots.json, written by `python3 tools/dots.py init` on one machine (the `watch` delays below are keys an owner adds by hand; the same values passed to `watch` as `--after-min`/`--notify-after-min`/`--rewake-min`/`--blocked-after-min` win, because this file sits in the folder the dot root writes). Dot ids, project ids, session ids, host labels and the wake command are invented; the wake command stands for whatever CLI the instance already has to post one line into a dot's chat. The shape is described in workflows/direct-mail.md; the file is optional and every command works without it.",
  "config": {
   "v": 1,
   "dots": [
@@ -16,6 +16,6 @@
   ],
   "wake": ["python3", "/work/bin/dot-chat-post", "{dot}", "[example-project-main -> {dot}] {agent}: mail {id} unread; wake it to read its inbox (dots.py wait {dot} {agent})"],
   "notify": ["python3", "/work/bin/dot-chat-post", "{dot}", "[example-project-main -> {dot}] {agent}: mail {id} still unread {age} min after the wake"],
-  "watch": {"after_min": 10, "notify_after_min": 20}
+  "watch": {"after_min": 10, "notify_after_min": 20, "rewake_min": 120, "blocked_after_min": 120}
  }
 }
