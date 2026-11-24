@@ -1913,9 +1913,12 @@ def update_writable(path: pathlib.Path) -> bool:
 
 
 def update_in_checkout(script: pathlib.Path) -> bool:
-    # Git worktrees use a .git file, not a directory. Also protect a checkout's symlink to a copy.
-    return any(os.path.lexists(parent / ".git")
-               for path in (script, pathlib.Path(os.path.abspath(__file__))) for parent in path.parents)
+    # Only the kit's own checkout (<repo>/tools/dots.py beside <repo>/.git; a worktree's .git is a file)
+    # belongs to git. A copy that merely sits somewhere inside another git work tree is a standalone
+    # install. Both the resolved file and the path it was run from count, so a symlink into a checkout
+    # is never replaced either.
+    return any(path.parent.name == "tools" and os.path.lexists(path.parent.parent / ".git")
+               for path in (script, pathlib.Path(os.path.abspath(__file__))))
 
 
 @contextlib.contextmanager

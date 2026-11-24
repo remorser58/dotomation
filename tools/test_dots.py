@@ -1931,16 +1931,28 @@ class AutoUpdateTests(unittest.TestCase):
         self.assert_original()
         self.assert_requests()
 
-    def test_git_worktree_notifies_once_without_replacing_tool(self):
-        (self.script.parent.parent / ".git").write_text("gitdir: ../git/worktrees/test\n", encoding="utf-8")
-        result = self.cli()
+    def test_kit_checkout_notifies_once_without_replacing_tool(self):
+        repo = self.script.parent.parent.parent / "kit"
+        (repo / "tools").mkdir(parents=True)
+        (repo / ".git").write_text("gitdir: ../git/worktrees/test\n", encoding="utf-8")
+        script = repo / "tools" / "dots.py"
+        script.write_bytes(self.original)
+        result = self.cli(script=script)
         self.assertEqual((result.returncode, result.stderr), (0, f"dots: {self.NEW} is available; run git pull\n"))
-        self.assertEqual(self.cli().stderr, "")
-        self.assert_original()
+        self.assertEqual(self.cli(script=script).stderr, "")
+        self.assertEqual(script.read_bytes(), self.original)
+        self.assertEqual(list((repo / "tools").iterdir()), [script])
         self.assert_requests(self.API)
-        checked = self.cli("update", "--check")
+        checked = self.cli("update", "--check", script=script)
         self.assertEqual(checked.stdout, f"UPDATE current={d.VERSION} latest={self.NEW} action=git-pull\n")
         self.assert_requests(self.API, self.API)
+
+    def test_copy_inside_unrelated_git_tree_still_updates(self):
+        (self.script.parent.parent / ".git").mkdir()
+        result = self.cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.script.read_bytes(), self.replacement)
+        self.assertEqual(self.backup.read_bytes(), self.original)
 
     def test_check_ignores_opt_outs_and_daily_stamp_but_never_downloads_assets(self):
         self.stamp.write_text(json.dumps({"t": time.time(), "latest": "unknown"}), encoding="utf-8")
