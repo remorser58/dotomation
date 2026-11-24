@@ -1,0 +1,51 @@
+name: Release dots.py
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify release tag
+        env:
+          TAG: ${{ github.ref_name }}
+          PYTHONPATH: tools
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from dots import VERSION
+
+          tag = os.environ["TAG"]
+          if tag != f"v{VERSION}" or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", VERSION):
+              raise SystemExit(f"Tag {tag!r} must match the stable version v{VERSION}")
+          PY
+      - run: python3 -m unittest discover -s tools
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish release assets
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum tools/dots.py | sed 's#tools/##' > tools/dots.py.sha256
+          gh release create "$TAG" tools/dots.py tools/dots.py.sha256 --generate-notes

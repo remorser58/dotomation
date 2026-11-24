@@ -67,6 +67,7 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 | Main session | `dots.py inbox [project] [agentId]` — agent replies not yet marked read; `dots.py read <project> <agentId> <id>` marks them read |
 | Agent | `dots.py wait <DOT> <agentId> [--timeout SECONDS]` — default 3300 seconds (55 minutes) |
 | Agent | `dots.py reply <project> <agentId> <kind> <task> [--re ID] [--ref R]... [--dot DOT] [--timeout S] [--no-wait]` — text on stdin. A `result`, `question` or `block` stays open and prints the answer; `--no-wait` returns as soon as the line is written |
+| User | `dots.py update [--check]` — check now, even when automatic checks are disabled; `--check` reports availability without installing. Git checkouts use `git pull`. |
 
 `send` writes one [mail-v1](../protocol/mail-v1.schema.json) line into `in.jsonl` and `reply` one into `out.jsonl`, exactly as a hand-written line does, so `mail.py` or any reader of the schema reads them unchanged. `from` is the project's main-session id from `dots.json` (`<project>-main` when the config names none). `--re` accepts an id from either file, because the review and answer legs of this route answer the agent's own `result`, which is a line in `out.jsonl`. Delivery then depends on what the agent is doing:
 
@@ -122,9 +123,10 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 | `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
 | `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake ran and the message is still unanswered. |
 | `watch` | `after_min` (default 10), `notify_after_min` (default 20), `rewake_min` (default 120) and `blocked_after_min` (default 120), the delays `watch` uses. Integers, 0 or more; anything else is ignored and the default stays. |
+| `auto_update` | Set to `false` to disable automatic release checks. `DOTS_AUTO_UPDATE=0` does the same; neither affects an explicit `update`. |
 
-Every value here is a suggestion, not a setting: `dots.json` sits in the folder the dot root can
-write, so `watch` takes the same values from its own command line and the command line wins —
+`dots.json` sits in the folder the dot root can write. `auto_update` can only turn automatic checks off.
+For watchdog settings, `watch` takes the same values from its own command line, and the command line wins —
 `--wake-cmd`, `--notify-cmd`, `--after-min`, `--notify-after-min`, `--rewake-min`,
 `--blocked-after-min`, plus `--state` for the ledger path. Each run prints one `WATCH_CONFIG` line
 naming where every value came from (`argv`, `dots.json` or `default`), so a config that changed
@@ -132,7 +134,7 @@ under the owner is visible as a changed line. The idle command and the recovery 
 (`--idle-cmd`, `--recovery-script`/`--recovery-sha256`/`--ledger`) have no `dots.json` key at all:
 they add new code to every run on the owner's side, so only the owner's command line turns them on.
 
-`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`; there is no other environment variable, and `init` resolves the same folder as every other command. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
+`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
 ## Reading cadence and the doorbell
 
