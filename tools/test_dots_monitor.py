@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 sys.dont_write_bytecode = True  # leave no __pycache__ next to the tool
@@ -181,6 +182,21 @@ class TestRedaction(unittest.TestCase):
         self.assertNotIn("abc123", dm.redact("api_key: abc123"))
         self.assertNotIn("deadbeef", dm.redact("?access_token=deadbeef&x=1"))
 
+    def test_prefixed_credentials_and_bearer_headers_are_redacted(self):
+        sha = "9f610ad13a6cbaeadcf33d80b6a0cb2de3c8d1db"
+        for label, secret in (
+            ("DATABASE_PASSWORD=", "hunter2"),
+            ("MY_API_KEY=", "abcd1234efgh5678"),
+            ("OPENAI_API_KEY=", "feedface"),
+            ("SERVICE_KEY=", "shortkey"),
+            ("Authorization: Bearer ", "0123456789abcdef0123456789abcdef"),
+        ):
+            with self.subTest(label=label):
+                text = dm.redact(label + secret + " task=task-1/1 base=" + sha)
+                self.assertNotIn(secret, text)
+                self.assertIn("[REDACTED]", text)
+                self.assertIn("task=task-1/1 base=" + sha, text)
+
     def test_commit_sha_survives(self):
         sha = "9f610ad13a6cbaeadcf33d80b6a0cb2de3c8d1db"
         self.assertEqual(dm.redact("base %s" % sha), "base %s" % sha)
@@ -306,6 +322,49 @@ class TestLedgerFraming(unittest.TestCase):
             dump = dm.parse_activity_dump(out, nonce)
             self.assertIn("==END", dump["0"]["text"])
             self.assertIsNone(dump["1"]["text"])
+
+    def test_unreadable_live_files_and_activity_logs_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dot = Path(tmp) / "DOT-A"
+            dot.mkdir()
+            log = Path(tmp) / "app.log"
+            for path, text in ((dot / "writer.jsonl", record()),
+                               (dot / "roster.json", '{"slots": []}'),
+                               (log, log_line(1))):
+                path.write_text(text, encoding="utf-8")
+                path.chmod(0)
+                if os.access(path, os.R_OK):
+                    self.skipTest("the test user can read files with mode 000")
+            config = base_config(activity=[{"dot": "DOT-A", "host": "local", "path": str(log)}])
+            config["ledger"]["root"] = tmp
+            snapshot = dm.build_snapshot(config, dm.Transport(10, 10), NOW)
+
+        table = dm.render_table(snapshot)
+        self.assertIn("DOTS_ERROR ledger DOT-A: writer.jsonl unreadable", table)
+        self.assertIn("DOTS_ERROR ledger DOT-A: roster.json unreadable", table)
+        self.assertIn("DOTS_ERROR activity " + str(log) + " unreadable", table)
+        self.assertEqual(snapshot["dots"]["DOT-A"]["activity"], {})
+
+    def test_ledger_caps_live_files_per_dot_and_reports_overflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dot = Path(tmp) / "DOT-A"
+            dot.mkdir()
+            for index in range(1, 203):
+                agent = "writer-%03d" % index
+                (dot / (agent + ".jsonl")).write_text(record(agent=agent), encoding="utf-8")
+            (dot / "roster.json").write_text('{"coordinator": "lead"}', encoding="utf-8")
+            other = Path(tmp) / "DOT-B"
+            other.mkdir()
+            (other / "writer.jsonl").write_text(record(), encoding="utf-8")
+            config = base_config(dots=("DOT-A", "DOT-B"), activity=[])
+            config["ledger"]["root"] = tmp
+            snapshot = dm.build_snapshot(config, dm.Transport(10, 10), NOW)
+
+        self.assertEqual(set(rows(snapshot)), {"writer-%03d" % i for i in range(1, 201)})
+        self.assertEqual(list(rows(snapshot, "DOT-B")), ["writer"])
+        self.assertEqual(snapshot["dots"]["DOT-A"]["roster"]["coordinator"], "lead")
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertIn("DOTS_ERROR ledger DOT-A: more than 200 live files", dm.render_table(snapshot))
 
 
 class TestMissingLiveDirectory(unittest.TestCase):
@@ -465,6 +524,24 @@ class TestClassification(unittest.TestCase):
         self.assertFalse(row["file_present"])
         self.assertIn("roster slot without live file", dm.render_table(snapshot))
 
+    def test_non_list_roster_entries_are_dropped_and_reported(self):
+        for entries in ({"slots": 3, "agents": 1.5, "actors": True},
+                        {"slots": {}, "agents": "x", "actors": None}):
+            with self.subTest(entries=entries):
+                snapshot, _, _ = snapshot_for(
+                    {"DOT-A": {"writer.jsonl": record()}}, roster=entries)
+                self.assertEqual(list(rows(snapshot)), ["writer"])
+                self.assertIn("DOTS_ERROR roster DOT-A: 3 roster slot(s) dropped",
+                              dm.render_table(snapshot))
+
+    def test_non_object_roster_json_is_reported(self):
+        for roster in ([1, 2], "x", 5):
+            with self.subTest(roster=roster):
+                snapshot, _, _ = snapshot_for(
+                    {"DOT-A": {"writer.jsonl": record()}}, roster=roster)
+                self.assertIn("DOTS_ERROR roster DOT-A: roster.json is not an object",
+                              dm.render_table(snapshot))
+
     def test_file_without_roster_slot_is_reported(self):
         snapshot, _, _ = snapshot_for(
             {"DOT-A": {"extra-agent.jsonl": record(agent="extra-agent")}},
@@ -593,6 +670,16 @@ class TestEvidence(unittest.TestCase):
         self.assertEqual(kinds, ["pull", "comment", "commit", "run", "commit"])
         self.assertEqual(len(bare), 1)
 
+    def test_issue_comment_marker_must_be_in_the_fragment(self):
+        gh = {"repos/o/r": ({"full_name": "o/r"}, None),
+              "repos/o/r/issues/comments/7086145047": ({"id": 7086145047}, None)}
+        resolver = dm.EvidenceResolver(base_config(), FakeTransport(gh=gh), NOW, [])
+        for suffix, expected in (("issuecomment-1#2", "unresolved"),
+                                 ("24#issuecomment-7086145047", "resolved")):
+            with self.subTest(suffix=suffix):
+                status, _, _ = dm.evidence_status("https://github.com/o/r/issues/" + suffix, resolver)
+                self.assertEqual(status, expected)
+
     def test_search_url_is_a_repo_reference(self):
         refs, _ = dm.evidence_refs(
             "https://github.com/o/r/issues?q=is%3Aissue+is%3Aopen+label%3Arev-task")
@@ -680,6 +767,31 @@ class TestWatchDedup(unittest.TestCase):
         self.assertIn("DOTS_ACTIVE", [e["event"] for e in events])
         events, _ = dm.diff_events(state, idle)
         self.assertIn("DOTS_IDLE", [e["event"] for e in events])
+
+    def test_failed_activity_never_reports_quiet_or_idle(self):
+        config = base_config(dots=("DOT-A", "DOT-B"), activity=[
+            {"dot": "DOT-A", "host": "other-host", "path": "/app.log"}])
+        files = {"DOT-A": {"writer.jsonl": record()}, "DOT-B": {}}
+        working, _, _ = snapshot_for(files, activity_text=log_line(1), config=config)
+        previous = {"agents": {}, "activity": {}, "errors": set()}
+        _, prior_state = dm.diff_events(previous, working)
+        for failure in ("exit 255: connection refused", "timed out after 5s", None):
+            with self.subTest(failure=failure):
+                transport = FakeTransport(files=files, activity_texts=[None],
+                                          failures={"other-host": failure} if failure else {})
+                failed = dm.build_snapshot(config, transport, NOW)
+                table = dm.render_table(failed)
+                self.assertIn("DOTS_ERROR activity", table)
+                self.assertIn("DOT-A (account 17)  roster=?@? slots=0\n  activity unknown", table)
+                self.assertIn("DOT-B (account 17)  roster=?@? slots=0\n  activity none configured", table)
+                self.assertEqual(rows(failed)["writer"]["classification"], "ACTIVITY_UNKNOWN")
+                self.assertIsNone(rows(failed)["writer"]["activity_since_record"])
+                events, state = dm.diff_events(prior_state, failed)
+                self.assertIn("DOTS_ERROR - - source=activity", "\n".join(map(dm.format_event, events)))
+                self.assertFalse({"DOTS_IDLE", "DOTS_QUIET"} & {e["event"] for e in events})
+                quiet, _, _ = snapshot_for(files, activity_text="", config=config)
+                recovered, _ = dm.diff_events(state, quiet)
+                self.assertIn("DOTS_IDLE", {e["event"] for e in recovered})
 
     def test_error_and_recovery_are_emitted_once(self):
         broken, _, _ = snapshot_for({"DOT-A": {"writer.jsonl": record()}},
