@@ -42,7 +42,7 @@ work_id / revision: <안정된 작업 ID> / 1
 
 ### `dots.py` 자동 업데이트
 
-저장소 밖에 복사한 `dots.py`는 명령이 끝난 뒤 GitHub의 최신 릴리스를 24시간에 한 번만 확인합니다. 새 버전은 SHA-256을 확인한 뒤 적용하고, 이전 파일은 `dots.py.bak-<이전 버전>`으로 남깁니다. Git 체크아웃에서는 파일을 바꾸지 않고 `git pull`을 안내하며, `watch`는 확인하지 않습니다.
+따로 복사해 둔 `dots.py`는 명령이 끝난 뒤 GitHub의 최신 릴리스를 24시간에 한 번만 확인합니다. 새 버전은 SHA-256을 확인한 뒤 적용하고, 이전 파일은 `dots.py.bak-<이전 버전>`으로 남깁니다. 이 저장소를 클론한 `tools/dots.py`는 파일을 바꾸지 않고 `git pull`을 안내하며, `watch`는 확인하지 않습니다.
 
 자동 확인을 끄려면 `DOTS_AUTO_UPDATE=0`을 설정하거나 `<공유 폴더>/dots.json`에 `"auto_update": false`를 추가하세요. 자동 확인을 꺼도 `python3 dots.py update --check`로 지금 확인하거나 `python3 dots.py update`로 직접 업데이트할 수 있습니다.
 

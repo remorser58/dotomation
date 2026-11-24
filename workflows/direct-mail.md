@@ -67,7 +67,7 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 | Main session | `dots.py inbox [project] [agentId]` — agent replies not yet marked read; `dots.py read <project> <agentId> <id>` marks them read |
 | Agent | `dots.py wait <DOT> <agentId> [--timeout SECONDS]` — default 3300 seconds (55 minutes) |
 | Agent | `dots.py reply <project> <agentId> <kind> <task> [--re ID] [--ref R]... [--dot DOT] [--timeout S] [--no-wait]` — text on stdin. A `result`, `question` or `block` stays open and prints the answer; `--no-wait` returns as soon as the line is written |
-| User | `dots.py update [--check]` — check now, even when automatic checks are disabled; `--check` reports availability without installing. Git checkouts use `git pull`. |
+| User | `dots.py update [--check]` — check now, even when automatic checks are disabled; `--check` reports availability without installing. The kit's own checkout (`tools/dots.py` in a clone) uses `git pull` instead. |
 
 `send` writes one [mail-v1](../protocol/mail-v1.schema.json) line into `in.jsonl` and `reply` one into `out.jsonl`, exactly as a hand-written line does, so `mail.py` or any reader of the schema reads them unchanged. `from` is the project's main-session id from `dots.json` (`<project>-main` when the config names none). `--re` accepts an id from either file, because the review and answer legs of this route answer the agent's own `result`, which is a line in `out.jsonl`. Delivery then depends on what the agent is doing:
 
