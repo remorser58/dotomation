@@ -39,7 +39,7 @@ One tick replaces three separate calls (append the line, rewrite the memory, rea
 ## How readers use it
 
 - **Main session.** Before sending a `task` or `review`, read the agent's memory. A question the memory already answers does not need a message. If `doing` shows the agent is on something else, say which work comes first in the message itself; the agent answers in its outbox.
-- **Coordinator.** Read the board each round with the roster. A `MEMO-BEHIND` or `NO-MEMO` flag on a working agent is a missing record, handled like a missing live line. A stall is still judged from the live line, not from the memory.
+- **Coordinator.** Read the board each round with the roster. A `MEMO-BEHIND` or `NO-MEMO` flag on a working or blocked agent is a missing record, handled like a missing live line; an agent whose newest line is `done` owes no memory and is not flagged. A stall is still judged from the live line, not from the memory.
 - **Replacement after a stall or VM reset.** The coordinator briefs the replacement with the previous agent's memory file path and its last live lines. The replacement reads them, then reads the actual target (branch, SHA, file) before any mutation and continues from the last confirmed step only. It starts its own memory under its own id; it never writes the previous agent's file.
 - **Lead and owner.** `dots.py board` through the approved route to `local` is the one-call status view.
 

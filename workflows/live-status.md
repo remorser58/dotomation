@@ -78,6 +78,7 @@ A working agent with no new line for 30 minutes is **stalled**. The coordinator 
 - `method` is optional and describes the method the coordinator adopted; it is not a second log.
 - No secrets, and no per-agent history — that is the jsonl.
 - A slot without a live file, or a live file without a slot, is a discrepancy to reconcile before reporting status, not something to hide by deleting either.
+- `updated_at` is the time of the round that wrote the roster. When it is more than 30 minutes older than the dot's newest live line, `dots.py board` reports `roster.json: updated_at … is Nm older than the newest live line …; its slot states are stale` among its errors. An `awaits_*` or hold state read from such a roster describes an earlier round: check the live lines and the evidence they name before acting on it, and the coordinator rewrites the roster in its next round.
 
 ## Reading it
 

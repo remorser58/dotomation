@@ -465,6 +465,36 @@ class TickTests(Base):
         text = run(["board"], self.base).stdout
         self.assertIn("roster=working", text)
 
+    def write_live(self, agent, state, t, task="issue 1", dot="DOT-A"):
+        line = {"t": t, "agent": agent, "role": "구현", "model": "requested x", "project": "proj",
+                "task": task, "state": state, "host": "local", "note": "n", "evidence": "e"}
+        with open(os.path.join(self.base, "live", dot, f"{agent}.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+
+    def board_json(self):
+        res = run(["board", "--json"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_a_finished_agent_without_memory_is_not_flagged_no_memo(self):
+        self.write_live("agent-2", "done", d.now())
+        self.write_live("agent-3", "blocked", d.now())
+        rows = {r["agent"]: r for r in self.board_json()["agents"]}
+        self.assertNotIn("NO-MEMO", rows["agent-2"]["flags"])
+        self.assertIn("NO-MEMO", rows["agent-3"]["flags"])
+
+    def test_a_roster_older_than_the_newest_live_line_is_reported_stale(self):
+        roster = os.path.join(self.base, "live", "DOT-A", "roster.json")
+        d.write_atomic(roster, json.dumps({"updated_at": "2026-01-01T00:00:00Z",
+                                           "slots": [{"agent": "agent-2", "state": "awaits_verdict"}]}) + "\n")
+        self.write_live("agent-2", "done", "2026-01-01T02:00:00Z")
+        errs = [e["error"] for e in self.board_json()["errors"] if e["dot"] == "DOT-A"]
+        self.assertTrue(any("120m older than the newest live line (agent-2" in e for e in errs), errs)
+        self.assertIn("120m older", run(["board"], self.base).stdout)
+        d.write_atomic(roster, json.dumps({"updated_at": "2026-01-01T01:45:00Z",
+                                           "slots": [{"agent": "agent-2", "state": "closed"}]}) + "\n")
+        self.assertFalse([e for e in self.board_json()["errors"] if e["dot"] == "DOT-A"])
+
 
 class MailTests(Base):
     def test_reply_inbox_read_round_trip(self):
