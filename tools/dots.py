@@ -67,7 +67,7 @@ Owner side (the dot root is not trusted):
       A marker counts as a waiter only with a `until` between now and a day out, so a marker naming
       a live local pid with a plausible `until` is the one case the tool cannot tell from a real
       wait; workflows/direct-mail.md says how to check it.
-      With --idle-cmd (or dots.json "idle") each run also reads the board: a STALLED or CLAIM-STALE
+      With --idle-cmd (command line only) each run also reads the board: a STALLED or CLAIM-STALE
       row runs the idle argv, again every `rewake_min` minutes while the same line stays; a BLOCKED
       row runs it once per blocked line and prints one WATCH_BLOCKED_OPEN after `blocked_after_min`.
       A roster report is printed once as WATCH_ROSTER_STALE. With --recovery-script, a working
@@ -1134,11 +1134,13 @@ def watch_cfg(cfg):
 
 def watch_settings(a, cfg):
     """Effective watchdog settings; the command line wins over dots.json, which sits in the folder the
-    dot root writes. Returns (wake argv, notify argv, delays, state path, sources, board scan) where
-    every source is `argv`, `dots.json`, `default` or `none`."""
-    wake = notify = idle = None
+    dot root writes. The idle command and the recovery reader run new code on the owner's side, so
+    they come from the command line only, never from dots.json. Returns (wake argv, notify argv,
+    delays, state path, sources, board scan) where every source is `argv`, `dots.json`, `default` or
+    `none`."""
+    wake = notify = None
     src = {}
-    for key in ("wake", "notify", "idle"):
+    for key in ("wake", "notify"):
         spec = getattr(a, f"{key}_cmd", None)
         if spec is not None:
             argv = cli_argv(spec, f"--{key}-cmd")
@@ -1148,10 +1150,10 @@ def watch_settings(a, cfg):
             src[key] = "dots.json" if argv else "none"
         if key == "wake":
             wake = argv
-        elif key == "notify":
-            notify = argv
         else:
-            idle = argv
+            notify = argv
+    idle = cli_argv(a.idle_cmd, "--idle-cmd") if a.idle_cmd is not None else None
+    src["idle"] = "argv" if idle else "none"
     delays, dsrc = watch_cfg(cfg)
     for key in WATCH_DEFAULTS:
         v = getattr(a, key, None)
@@ -1165,43 +1167,27 @@ def watch_settings(a, cfg):
     src["state"] = "argv" if a.state else "default"
     for d in a.dot or []:
         token("DOT", d)
-    rc, rc_err = recovery_settings(a, cfg, src)
-    scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=rc, recovery_error=rc_err)
+    scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=recovery_settings(a, src))
     return wake, notify, delays, path, src, scan
 
-def recovery_settings(a, cfg, src):
-    """The pinned recovery ledger reader: ({script, sha256, ledgers} or None, error or None). The
-    flags are all or nothing: once either --recovery-script or --recovery-sha256 is given, dots.json
-    `recovery` is never read, and the pair must be complete. A dots.json entry that is not usable is
-    reported, never fatal, because the dot root writes that file; a script is never loaded unpinned."""
+def recovery_settings(a, src):
+    """The pinned recovery reader from the command line: {script, sha256, ledgers} or None. The two
+    flags go together; a flag given empty counts as given, so an unset pin variable is refused rather
+    than read as no pin. A script is never loaded unpinned."""
     ledgers = dict(pairs(a.ledger or [], "ledger"))
     for d in ledgers:
         token("DOT", d)
-    if a.recovery_script or a.recovery_sha256:
-        sha = (a.recovery_sha256 or "").strip().lower()
-        if not a.recovery_script or not re.fullmatch(r"[0-9a-f]{64}", sha):
-            die("--recovery-script and --recovery-sha256 (64 hex characters) go together")
-        src["recovery"] = "argv"
-        script = a.recovery_script
-    else:
+    if a.recovery_script is None and a.recovery_sha256 is None:
         if ledgers:
             die("--ledger needs --recovery-script and --recovery-sha256")
-        rc = cfg.get("recovery")
-        if rc is None:
-            src["recovery"] = "none"
-            return None, None
-        src["recovery"] = "dots.json"
-        rc = rc if isinstance(rc, dict) else {}
-        script, sha = rc.get("script"), rc.get("sha256")
-        sha = sha.strip().lower() if isinstance(sha, str) else ""
-        if not (isinstance(script, str) and script.strip() and re.fullmatch(r"[0-9a-f]{64}", sha)):
-            return None, "dots.json recovery needs a script and its 64-hex sha256; not used"
-        raw = rc.get("ledgers") if isinstance(rc.get("ledgers"), dict) else {}
-        ledgers = {k: v for k, v in raw.items() if isinstance(k, str) and TOKEN.match(k) and isinstance(v, str)}
-        if len(ledgers) != len(raw):
-            return None, "dots.json recovery ledgers must map dot ids to folders; not used"
-    return ({"script": os.path.abspath(os.path.expanduser(script)), "sha256": sha,
-             "ledgers": {d: os.path.abspath(os.path.expanduser(p)) for d, p in ledgers.items()}}, None)
+        src["recovery"] = "none"
+        return None
+    sha = (a.recovery_sha256 or "").strip().lower()
+    if not (a.recovery_script or "").strip() or "\0" in a.recovery_script or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        die("--recovery-script and --recovery-sha256 (64 hex characters) go together")
+    src["recovery"] = "argv"
+    return {"script": os.path.abspath(os.path.expanduser(a.recovery_script)), "sha256": sha,
+            "ledgers": {d: os.path.abspath(os.path.expanduser(p)) for d, p in ledgers.items()}}
 
 def state_path():
     return os.path.join(BASE, "watch", "state.json")
@@ -1304,7 +1290,9 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
     VM work no recovery ledger tracks. Reads files only; the one thing it runs is the owner's idle
     argv. Like the mail half, a ledger record may only add a line: every ring or report it holds back
     prints WATCH_SKIP."""
-    rows, errors = board_rows(scan_dots(scan, cfg))
+    dots = scan_dots(scan, cfg)
+    rows, errors = board_rows(dots)
+    scope = lambda key: key.split("/", 1)[0] in dots   # records outside this run's dots are kept
     seen = set()
     for r in rows if scan.idle else ():
         flags = [f for f in r["flags"] if f in ("STALLED", "CLAIM-STALE", "BLOCKED")]
@@ -1320,7 +1308,7 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         blocked = "BLOCKED" in flags
         since = age_min(rec.get("ring_t"))
         # a blocker waits on someone else, so a second wake cannot clear it; a quiet worker may need several
-        due = not rec.get("ring_t") if blocked else since is None or since < 0 or since >= delays["rewake_min"]
+        due = since is None or since < 0 or (not blocked and since >= delays["rewake_min"])
         task = json.dumps(r["task"] or "", ensure_ascii=False)
         why = ",".join(flags)
         if due:
@@ -1329,7 +1317,6 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
             code, detail = ring(scan.idle, values)
             if code is not None:
                 rec["ring_t"] = now()
-                rec["rings"] = rec.get("rings", 0) + 1
                 save_state(st_path, st, warned)
             print(f"WATCH_IDLE {r['dot']} {r['agent']} {why} age={age}{'' if age == '-' else 'm'} "
                   f"state={r['state'] or '-'} "
@@ -1347,14 +1334,16 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         save_state(st_path, st, warned)
         print(f"WATCH_BLOCKED_OPEN {r['dot']} {r['agent']} age={r['age_min']}m task={task} "
               f"blockers={json.dumps(r['blockers'][:3], ensure_ascii=False)}", flush=True)
-    for key in [k for k in st["agents"] if k not in seen]:
+    for key in [k for k in st["agents"] if scan.idle and scope(k) and k not in seen]:
         del st["agents"][key]
         save_state(st_path, st, warned)
     reported = set()
-    for e in errors if scan.idle else ():
+    for e in errors:
         if "slot states" not in e["error"]:
             # no live folder, a dropped slot: board shows it, so the watchdog does too
             print(f"WATCH_ERROR board {e['dot']} {e['error']}", flush=True)
+            continue
+        if not scan.idle:
             continue
         key = roster_key(e["dot"], e["error"])
         reported.add(key)
@@ -1364,15 +1353,18 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         st["roster"][key] = {"t": now()}
         save_state(st_path, st, warned)
         print(f"WATCH_ROSTER_STALE {e['dot']} {e['error']}", flush=True)
-    for key in [k for k in st["roster"] if k not in reported]:
+    for key in [k for k in st["roster"] if scan.idle and k.split("|", 1)[0] in dots and k not in reported]:
         del st["roster"][key]
         save_state(st_path, st, warned)
     if scan.recovery:
-        watch_vm(scan.recovery, rows, st, st_path, warned)
+        watch_vm(scan.recovery, rows, st, st_path, warned, scope)
 
 def load_recovery(rc):
     """Import the pinned recovery reader, or (None, why). The bytes hashed are the bytes run."""
-    fd = open_raw(rc["script"])
+    try:
+        fd = open_raw(rc["script"])
+    except ValueError as exc:
+        return None, f"script unreadable {exc}"
     if fd is None:
         return None, "script unreadable"
     with os.fdopen(fd, "rb") as fh:
@@ -1390,7 +1382,7 @@ def load_recovery(rc):
         return None, "no inspect(root)"
     return mod, None
 
-def watch_vm(rc, rows, st, st_path, warned):
+def watch_vm(rc, rows, st, st_path, warned, scope):
     """Working VM lines in a dot whose recovery ledger has no unfinished job. The ledger is read by
     the pinned reader's inspect(); nothing is registered, attached or written there."""
     seen = set()
@@ -1412,7 +1404,7 @@ def watch_vm(rc, rows, st, st_path, warned):
             mod, why = load_recovery(rc)
             if mod is None:
                 print(f"WATCH_ERROR recovery {rc['script']} {why}", flush=True)
-                return
+                return   # nothing was read, so no record is pruned either
         try:
             jobs = mod.inspect(pathlib.Path(root))
         except Exception as exc:
@@ -1430,7 +1422,7 @@ def watch_vm(rc, rows, st, st_path, warned):
         save_state(st_path, st, warned)
         print(f"WATCH_VM_UNREGISTERED {r['dot']} {r['agent']} t={r['t']} "
               f"task={json.dumps(r['task'] or '', ensure_ascii=False)} ledger_jobs={len(jobs)}", flush=True)
-    for key in [k for k in st["vm"] if k not in seen]:
+    for key in [k for k in st["vm"] if scope(k) and k not in seen]:
         del st["vm"][key]
         save_state(st_path, st, warned)
 
@@ -1449,8 +1441,6 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
          f"dots={'argv' if scan.dots else 'found'}:{','.join(scan_dots(scan, cfg)) or 'none'}" if board
          else "dots=none",
          f"state={src['state']}:{st_path}"]), flush=True)
-    if scan.recovery_error:
-        print(f"WATCH_ERROR recovery {scan.recovery_error}", flush=True)
     if expected:
         path = os.path.abspath(__file__)
         actual = None
@@ -1926,7 +1916,7 @@ def main(argv):
     c.add_argument("--state", help="ledger path; keep it outside the shared folder (default <base>/watch/state.json)")
     c.add_argument("--idle-cmd", dest="idle_cmd",
                    help='argv list as JSON run for a STALLED, CLAIM-STALE or BLOCKED board row; placeholders '
-                        '{dot} {agent} {project} {task} {state} {age} {why}; wins over dots.json "idle"')
+                        '{dot} {agent} {project} {task} {state} {age} {why}; command line only, never dots.json')
     c.add_argument("--rewake-min", dest="rewake_min", type=int,
                    help="minutes between idle wakes of the same quiet task (wins over dots.json; default 120)")
     c.add_argument("--blocked-after-min", dest="blocked_after_min", type=int,

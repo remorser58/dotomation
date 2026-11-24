@@ -1368,6 +1368,10 @@ class WatchTests(Base):
         self.assertIn("WATCH_SKIP DOT-A agent-2 reason=blocked_open_already", out)
         self.assertIn("WATCH_SKIP DOT-A agent-4 reason=vm_reported", out)
         self.assertEqual(rings, ["DOT-A agent-3 STALLED issue 1"])   # a future ring_t is due, not a mute
+        st = d.load_json(os.path.join(self.base, "watch", "state.json"))
+        st["agents"]["DOT-A/agent-2"]["ring_t"] = future
+        d.write_atomic(os.path.join(self.base, "watch", "state.json"), json.dumps(st) + "\n")
+        self.assertEqual(self.idle_watch()[1][-1], "DOT-A agent-2 BLOCKED issue 1")
 
     def test_an_agent_with_only_legacy_lines_is_still_woken(self):
         with open(os.path.join(self.base, "live", "DOT-A", "agent-9.jsonl"), "w", encoding="utf-8") as fh:
@@ -1407,20 +1411,35 @@ class WatchTests(Base):
         self.assertIn("WATCH_ERROR recovery DOT-A unexpected ledger shape", res.stdout)
         self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
 
-    def test_recovery_flags_never_mix_with_dots_json(self):
-        self.live("step", 0, host="vm")
+    def test_recovery_and_idle_come_from_the_command_line_only(self):
+        self.live("step", 60, host="vm")
         flags = self.recovery({})
-        self.config_with(recovery={"script": flags[1], "sha256": flags[3], "ledgers": {"DOT-A": flags[5][6:]}})
-        res = run(["watch", "--dot", "DOT-A", "--recovery-sha256", flags[3]], self.base)
-        self.assertEqual(res.returncode, 2)   # half a pin is refused, never completed from dots.json
-        self.assertIn("go together", res.stderr)
-        self.assertIn("WATCH_VM_UNREGISTERED", run(["watch", "--dot", "DOT-A"], self.base).stdout)
-        self.config_with(recovery={"script": flags[1], "sha256": "nope"})
+        target, argv = self.recorder("root.txt", ("{agent}",))
+        self.config_with(idle=argv, recovery={"script": flags[1], "sha256": flags[3], "ledgers": {"DOT-A": flags[5][6:]}})
         res = run(["watch", "--dot", "DOT-A"], self.base)
-        self.assertEqual(res.returncode, 0, res.stderr)   # the root's file cannot stop the watchdog
-        self.assertIn("recovery=dots.json ", res.stdout)
-        self.assertIn("WATCH_ERROR recovery dots.json recovery needs", res.stdout)
-        self.assertTrue(os.path.exists(os.path.join(self.base, "watch", "heartbeat.json")))
+        self.assertEqual(res.returncode, 0, res.stderr)   # a mail-only launch stays mail-only
+        self.assertIn("idle=none", res.stdout)
+        self.assertIn("recovery=none", res.stdout)
+        self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
+        self.assertFalse(os.path.exists(target))
+        for half in (["--recovery-sha256", flags[3]], ["--recovery-script", flags[1], "--recovery-sha256", ""]):
+            res = run(["watch", "--dot", "DOT-A", *half], self.base)
+            self.assertEqual(res.returncode, 2, half)   # half or an empty pin is refused
+            self.assertIn("go together", res.stderr)
+
+    def test_runs_over_other_dots_keep_their_records(self):
+        self.make_dot("DOT-B")
+        self.live("blocked", 10)
+        _, rings = self.idle_watch()
+        self.assertEqual(len(rings), 1)
+        res = run(["watch", "--dot", "DOT-B", "--idle-cmd", '["true"]'], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        res = run(["watch", "--dot", "DOT-A", *self.recovery({})], self.base)   # recovery-only scan
+        self.assertEqual(res.returncode, 0, res.stderr)
+        _, rings = self.idle_watch()
+        self.assertEqual(len(rings), 1)   # the same blocked line is not woken again
+        res = run(["watch", "--dot", "DOT-C", *self.recovery({})], self.base)
+        self.assertIn("WATCH_ERROR board DOT-C no live folder", res.stdout)
 
     def test_a_changed_recovery_script_is_never_run(self):
         self.live("step", 0, host="vm")
@@ -1448,8 +1467,8 @@ class WatchTests(Base):
                 if e["dot"] == "watch"]
         self.assertEqual(errs, ["no heartbeat file; the watchdog has not run"])
 
-    def test_the_idle_command_line_beats_dots_json(self):
-        self.config_with(idle=["/usr/bin/false"], watch={"rewake_min": 100000})
+    def test_the_rewake_command_line_beats_dots_json(self):
+        self.config_with(watch={"rewake_min": 100000})
         self.live("step", 60)
         out, rings = self.idle_watch("--rewake-min", "0")
         self.assertEqual(rings, ["DOT-A agent-2 STALLED issue 1"])

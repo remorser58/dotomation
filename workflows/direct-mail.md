@@ -122,15 +122,15 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 | `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
 | `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake ran and the message is still unanswered. |
 | `watch` | `after_min` (default 10), `notify_after_min` (default 20), `rewake_min` (default 120) and `blocked_after_min` (default 120), the delays `watch` uses. Integers, 0 or more; anything else is ignored and the default stays. |
-| `idle` | Optional argv list for the board scan of `watch`: `{dot}`, `{agent}`, `{project}`, `{task}`, `{state}`, `{age}` and `{why}` (the flags that fired). |
-| `recovery` | Optional `{"script", "sha256", "ledgers": {"<DOT>": "<ledger dir>"}}`: the pinned [VM watchdog](vm-watchdog.md) reader `watch` uses to find VM work with no ledger job. |
 
 Every value here is a suggestion, not a setting: `dots.json` sits in the folder the dot root can
 write, so `watch` takes the same values from its own command line and the command line wins —
-`--wake-cmd`, `--notify-cmd`, `--idle-cmd`, `--after-min`, `--notify-after-min`, `--rewake-min`,
-`--blocked-after-min`, `--recovery-script`/`--recovery-sha256`/`--ledger`, plus `--state` for the ledger
-path. Each run prints one `WATCH_CONFIG` line naming where every value came from (`argv`,
-`dots.json` or `default`), so a config that changed under the owner is visible as a changed line.
+`--wake-cmd`, `--notify-cmd`, `--after-min`, `--notify-after-min`, `--rewake-min`,
+`--blocked-after-min`, plus `--state` for the ledger path. Each run prints one `WATCH_CONFIG` line
+naming where every value came from (`argv`, `dots.json` or `default`), so a config that changed
+under the owner is visible as a changed line. The idle command and the recovery reader
+(`--idle-cmd`, `--recovery-script`/`--recovery-sha256`/`--ledger`) have no `dots.json` key at all:
+they add new code to every run on the owner's side, so only the owner's command line turns them on.
 
 `init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`; there is no other environment variable, and `init` resolves the same folder as every other command. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
@@ -207,9 +207,10 @@ from the files alone:
   commands are argv lists the owner configures, for example `dots.py watch
   --loop 5 --wake-cmd '["ssh","local","dots-post","{project}","{agent}","{id}"]'
   --notify-cmd '["notify-send","{agent}","{id}","{age}"]'`.
-- **The same run reads the board when it has an idle command.** With `--idle-cmd` (or `dots.json`
-  `idle`) each run reads `board` for the dots named with `--dot`, else the configured dots, else every
-  `live/` folder (`WATCH_CONFIG` names them in `dots=`), and acts on the agent's own files only:
+- **The same run reads the board when it has an idle command.** With `--idle-cmd` each run reads
+  `board` for the dots named with `--dot`, else the configured dots, else every `live/` folder
+  (`WATCH_CONFIG` names them in `dots=`), and acts on the agent's own files only. Records for dots
+  outside this run's set are kept, so runs over different dots share one ledger:
   - a `STALLED` or `CLAIM-STALE` row runs the idle argv, and again every `rewake_min` minutes while
     the same live line stays newest; a newer line ends the record. A row with only legacy lines
     (`NO-LIVE STALLED`) is woken too, with `age=-`; an empty `{project}`, `{task}` or `{state}` is `-`;
@@ -219,25 +220,27 @@ from the files alone:
     woken in a loop;
   - a roster report from `board` (stale or undated `updated_at`) prints one `WATCH_ROSTER_STALE`, keyed
     on the report without its growing minute count and the newest line it is measured against; any
-    other board error (`no live folder`, dropped slots) prints `WATCH_ERROR board {dot} …` every run;
+    other board error (`no live folder`, dropped slots) prints `WATCH_ERROR board {dot} …` every run,
+    with or without an idle command;
   - a ring or report the ledger holds back prints `WATCH_SKIP {dot} {agent} reason=idle_already|
     blocked_open_already|roster_reported|vm_reported …`, as for mail, and a `ring_t` in the future is
-    treated as due.
+    not a time, so the wake is due.
 - **VM work no recovery ledger tracks is reported.** With `--recovery-script PATH --recovery-sha256
-  HEX --ledger DOT=DIR` (or `dots.json` `recovery`), a `start` or `step` line on `host=vm` in a dot
-  whose ledger has no unfinished job prints one `WATCH_VM_UNREGISTERED {dot} {agent} t=… task=…` per
-  line. The script is hashed and loaded from the same bytes, then its `inspect(root)` is called; a
-  mismatch prints `WATCH_ERROR recovery … sha256 mismatch` and none of it runs. Nothing is
-  registered, attached or written there. The two flags go together, and once either is given
-  `dots.json` `recovery` is not read; an unusable `dots.json` entry prints `WATCH_ERROR recovery …`
-  and the run goes on without it.
+  HEX --ledger DOT=DIR`, a `start` or `step` line on `host=vm` in a dot whose ledger has no
+  unfinished job prints one `WATCH_VM_UNREGISTERED {dot} {agent} t=… task=…` per line. The script is
+  hashed and loaded from the same bytes, then its `inspect(root)` is called; a mismatch prints
+  `WATCH_ERROR recovery … sha256 mismatch` and none of it runs. Nothing is registered, attached or
+  written there. The two flags go together: one without the other, or either given empty, stops the
+  command.
   Each ring prints `WATCH_IDLE {dot} {agent} {flags} age=… state=… task=… exit=…`, and the ledger keeps
   one record per agent, roster report and VM line, so a restart repeats none of them.
 - **The watchdog leaves a heartbeat, and `board` checks it.** Every run writes `heartbeat.json`
   (`t`, `pid`, `loop`) beside its ledger. `board` reports `watch: last run Nm ago …; the watchdog is
   down` when `<base>/watch/heartbeat.json` is older than 15 minutes or three loops, whichever is
   longer. A ledger kept elsewhere with `--state` is checked with `board --heartbeat PATH`, which also
-  reports a missing file.
+  reports a missing file. The default heartbeat sits in the folder the root writes, so a forged fresh
+  `t` hides a dead watchdog: for a check the root cannot fake, keep `--state` in an owner-private
+  folder and point `board --heartbeat` at it.
 - **A wait marker holds the wake, and `WATCH_HELD` says so.** `listen/<agent>.<pid>.json` needs a
   `until` still in the future and no more than 24 hours out, judged with one hour of slack because
   the waiter's clock may run ahead of the reader's; a marker without one, with a past one or with a
