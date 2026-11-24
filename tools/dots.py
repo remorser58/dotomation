@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dots.py: one call per step for a Dots agent, one view for the people who read it.
 
-Shared folder on `local` (rules: dots-superkit workflows/live-status.md,
+Shared folder on `local` (rules: dotomation workflows/live-status.md,
 workflows/session-memory.md, workflows/direct-mail.md):
   live/<DOT>/<agent>.jsonl     live-record-v1 lines, append-only, written by that agent only
   memory/<DOT>/<agent>.json    memory-v1 session memory, rewritten whole by that agent only
@@ -1750,7 +1750,7 @@ def rules_lines(script):
     """The agent-side rules, printed once by init's brief and again by the first command an agent
     runs with no memory file. The dot root may never paste the brief, so the tool repeats them."""
     return [
-        "AGENT_RULES dots-superkit — this is your first command, so the rules are printed once:",
+        "AGENT_RULES dotomation — this is your first command, so the rules are printed once:",
         f"  every step: python3 {script} tick <DOT> <agentId> <start|step|blocked|done> --task T --host H "
         f"--note N --evidence E",
         f"  hand work back: python3 {script} reply <project> <agentId> <result|question|block> <task> --re ID "
@@ -1782,7 +1782,7 @@ def brief(base, dots, projects, cfg, script):
     print()
     print("Paste this into each dot root's chat (fill the pin with the kit commit SHA):")
     print()
-    print(f"Dots Superkit shared folder on local: {base}")
+    print(f"Dotomation shared folder on local: {base}")
     print(f"Helper: python3 {script}")
     print(f"Dots: {', '.join(names)}")
     print("Projects: " + (", ".join(f"{k} (main {v})" for k, v in sorted(main_by.items())) or "none"))
