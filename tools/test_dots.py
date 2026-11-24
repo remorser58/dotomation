@@ -625,6 +625,65 @@ class MailTests(Base):
         # a duplicate already on disk cannot hold the read marker: after() resolves to the last one
         self.assertEqual(d.after([{"id": "a"}, {"id": "a"}, {"id": "b"}], "a"), [{"id": "b"}])
 
+    def test_a_line_without_an_id_does_not_hide_older_mail(self):
+        # a fresh mailbox has no read marker; a hand-written line with no id used to stand in for it,
+        # so wait and tick showed only what came after that line
+        mid = self.send(kind="note", text="the real note")
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        with open(os.path.join(box, "in.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": d.now(), "from": "proj-main", "to": "agent-1",
+                                 "text": "hand-written, no id"}) + "\n")
+        self.assertEqual(d.unread_upto(box, None)[0]["id"], mid)
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "2"], self.base)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn(f"MAIL_NEW proj {mid}", res.stdout)
+        # the same holds for replies: an out.jsonl line with "id": null hides nothing from inbox
+        with open(os.path.join(box, "out.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": None, "kind": "note", "text": "x"}) + "\n")
+            fh.write(json.dumps({"id": "m-20260101T000000Z-cccc", "kind": "note", "task": "t",
+                                 "text": "a reply"}) + "\n")
+        self.assertEqual([m.get("id") for m in d.mail_state(box)["unread_out"]],
+                         [None, "m-20260101T000000Z-cccc"])
+
+    def test_a_base_with_glob_characters_still_finds_mail(self):
+        # the base is a user path; `[` in it used to make every mailbox lookup match nothing
+        outer = tempfile.TemporaryDirectory()
+        self.addCleanup(outer.cleanup)
+        base = os.path.join(outer.name, "br[ack]", "base")
+        os.makedirs(os.path.join(base, "live", "DOT-A"))
+        os.makedirs(os.path.join(base, "proj", "mail"))
+        res = run(["send", "proj", "agent-1", "task", "issue 1"], base, stdin="do it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        mid = res.stdout.splitlines()[0]
+        res = run(["wait", "DOT-A", "agent-1", "--timeout", "2"], base)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn(f"MAIL_NEW proj {mid}", res.stdout)
+        res = run(["watch", "--after-min", "0", "--wake-cmd", json.dumps(["true"])], base)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", res.stdout)
+
+    def test_a_folder_where_a_read_marker_belongs_does_not_crash_tick_or_read(self):
+        mid = self.send(text="handle this")
+        box = os.path.join(self.base, "proj", "mail", "agent-1")
+        os.makedirs(os.path.join(box, ".agent-read"))
+        res = self.tick("--took", mid, state="step")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("it stays unread", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(glob.glob(os.path.join(box, ".agent-read.tmp.*")), [])   # no temp left behind
+        rid = run(["reply", "proj", "agent-1", "note", "issue 1", "--re", mid], self.base,
+                  stdin="seen").stdout.splitlines()[0]
+        os.makedirs(os.path.join(box, ".main-read"))
+        res = run(["read", "proj", "agent-1", rid], self.base)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("it stays unread", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        # a file where the project folder belongs is a message, not a traceback
+        with open(os.path.join(self.base, "other"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        res = run(["send", "other", "agent-1", "task", "issue 1"], self.base, stdin="do it")
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("dots: cannot create", res.stderr)
+
 
 def board_rows(base):
     res = run(["board", "--json"], base)
@@ -848,6 +907,65 @@ class BoardEvidenceTests(Base):
         self.assertIn("roster claims done", row["claim_stale"])
         self.assertIn("(the root's claim)", run(["board"], self.base).stdout)
 
+    def test_blockers_of_the_wrong_shape_do_not_crash_board_or_tick(self):
+        self.assertEqual(self.tick().returncode, 0)
+        path = os.path.join(self.base, "memory", "DOT-A", "agent-1.json")
+        mem = d.load_json(path)
+        mem["blockers"] = 5
+        d.write_atomic(path, json.dumps(mem) + "\n")
+        res = run(["board"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(board_rows(self.base)["agent-1"]["blockers"], [])
+        # a string is not a list of blockers; read as characters it used to fail the 10-blocker rule
+        mem["blockers"] = "0123456789ABCDEF"
+        d.write_atomic(path, json.dumps(mem) + "\n")
+        res = self.tick(state="step")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(d.load_json(path)["blockers"], [])
+
+    def test_board_without_a_live_folder_prints_an_empty_board(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        res = run(["board"], empty.name)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_a_configured_dot_without_a_live_folder_is_reported(self):
+        cfg = d.load_json(os.path.join(self.base, "dots.json"))
+        cfg["dots"] = [{"id": "DOT-A"}, {"id": "DOT-B"}]
+        d.write_atomic(os.path.join(self.base, "dots.json"), json.dumps(cfg, indent=1) + "\n")
+        res = run(["board", "--json"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn({"dot": "DOT-B", "error": "no live folder"}, json.loads(res.stdout)["errors"])
+
+    def test_a_line_off_the_live_schema_is_not_a_v1_line(self):
+        # the key set and state alone used to pass: empty fields and a space-separated t did too
+        self.assertEqual(self.tick().returncode, 0)
+        path = os.path.join(self.base, "live", "DOT-A", "agent-1.jsonl")
+        good = lines(path)[-1]
+        bad = [dict(good, role=""), dict(good, note="two\nlines"), dict(good, t="2026-11-24 19:00:00+00:00"),
+               dict(good, agent="no spaces allowed"), dict(good, host=7)]
+        for x in bad:
+            self.assertFalse(d.is_v1(x), x)
+        self.assertTrue(d.is_v1(good))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(good, t=d.now(), role="", state="done")) + "\n")
+        self.assertEqual(board_rows(self.base)["agent-1"]["state"], "start")   # the off-format line is not newest
+
+    def test_carried_decisions_and_blockers_of_the_wrong_shape_are_dropped(self):
+        self.assertEqual(self.tick("--decision", "kept one").returncode, 0)
+        path = os.path.join(self.base, "memory", "DOT-A", "agent-1.json")
+        mem = d.load_json(path)
+        good = mem["decisions"][0]
+        mem["decisions"] = [dict(good, extra=1), {"t": "garbage", "text": "x"}, dict(good, text="x" * 900), good]
+        mem["blockers"] = ["y" * 900, "a real blocker"]
+        d.write_atomic(path, json.dumps(mem) + "\n")
+        res = self.tick(state="step")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        after = d.load_json(path)
+        self.assertEqual(after["decisions"], [good])
+        self.assertEqual(after["blockers"], ["a real blocker"])
+
 
 class WatchTests(Base):
     """The watchdog runs outside the dot and reads only mail, live lines and listen markers."""
@@ -1008,6 +1126,22 @@ class WatchTests(Base):
         self.assertEqual(set(d.load_json(path)["messages"]), {mid})
         self.assertEqual(set(d.load_json(ledger)["messages"]), {mid})   # the default ledger is untouched
 
+    def test_an_unusable_wake_time_in_the_ledger_cannot_hide_the_notify(self):
+        mid = self.waiting_message(read=False)
+        target, notify = self.recorder("notify.txt")
+        self.config_with(wake=["true"], notify=notify, watch={"after_min": 0, "notify_after_min": 0})
+        ledger = os.path.join(self.base, "watch", "state.json")
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        for wake_t in ("not-a-time", d.iso_after(86400)):
+            d.write_atomic(ledger, json.dumps({"v": 1, "messages": {mid: {
+                "project": "proj", "agent": "agent-1", "wake_t": wake_t}}}) + "\n")
+            res = run(["watch"], self.base)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn(f"WATCH_ERROR proj agent-1 {mid} unusable wake_t=", res.stdout)
+            self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", res.stdout)
+            self.assertIn("after_wake=-m", res.stdout)
+        self.assertEqual(read(target).split(), [mid, mid])
+
     def forget(self):
         """Drop the watchdog's ledger, so the next run is a first run again."""
         path = os.path.join(self.base, "watch", "state.json")
@@ -1083,6 +1217,32 @@ class WatchTests(Base):
         self.assertFalse(os.path.exists(target))
         again = run(args, self.base)
         self.assertIn(f"WATCH_HELD proj agent-1 {mid}", again.stdout)   # every run, not once
+
+    def test_mail_a_marker_holds_still_reaches_the_owner_once(self):
+        # a forged marker held the wake back forever and, with no wake time, no notify ever ran;
+        # the first WATCH_HELD now starts the notify clock, and the owner is told exactly once
+        mid = self.waiting_message(read=False)
+        wtarget, wake = self.recorder("wake.txt")
+        ntarget, notify = self.recorder("notify.txt")
+        marker = os.path.join(self.base, "listen", "agent-1.4242.json")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        d.write_atomic(marker, json.dumps({"pid": 1, "host": socket.gethostname(),
+                                           "until": d.iso_after(23 * 3600)}) + "\n")
+        base_args = ["watch", "--wake-cmd", json.dumps(wake), "--notify-cmd", json.dumps(notify),
+                     "--after-min", "0"]
+        first = run(base_args + ["--notify-after-min", "100"], self.base)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"WATCH_HELD proj agent-1 {mid}", first.stdout)
+        self.assertNotIn("WATCH_NOTIFY", first.stdout)   # not yet: the clock just started
+        due = run(base_args + ["--notify-after-min", "0"], self.base)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", due.stdout)
+        self.assertIn("after_wake=-m", due.stdout)
+        self.assertIn("held=yes", due.stdout)
+        self.assertEqual(read(ntarget).split(), [mid])
+        self.assertFalse(os.path.exists(wtarget))   # the marker still holds the wake
+        again = run(base_args + ["--notify-after-min", "0"], self.base)
+        self.assertIn(f"WATCH_SKIP proj agent-1 {mid} reason=notify_already", again.stdout)
+        self.assertEqual(read(ntarget).split(), [mid])
 
     def test_a_message_with_no_usable_time_still_rings(self):
         # the root writes `t` too: an unparseable or future value must not hide a message from the wake

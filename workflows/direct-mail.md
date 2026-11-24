@@ -97,8 +97,9 @@ there and at least one `--ref` says what the result is about. `--re` stays requi
 
 The main session does not have to guess which agents are stuck: `dots.py board` flags
 `MAIL_WAITING` on an agent whose inbox holds a message that still owes an answer while no `wait`
-marker of that agent is alive, and prints the count and the age of the oldest. `MAIL-UNANSWERED` is
-the same mail without that second condition. Both are read from the files; see
+marker of that agent is alive, and prints the count and the age of the oldest. `MAIL-UNANSWERED`
+counts a narrower set: mail the agent has already read but not yet answered, whether or not it is
+waiting. Both are read from the files; see
 [If the dot root is not trusted](#if-the-dot-root-is-not-trusted) for what the board does with the
 roster.
 
@@ -134,7 +135,7 @@ under the owner is visible as a changed line. The idle command and the recovery 
 (`--idle-cmd`, `--recovery-script`/`--recovery-sha256`/`--ledger`) have no `dots.json` key at all:
 they add new code to every run on the owner's side, so only the owner's command line turns them on.
 
-`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
+`init` adds only what is missing and says what it kept: a second run never rewrites an entry, a record, a memory file or a mail line. The one exception is a command passed again: `--wake-cmd` or `--notify-cmd` replaces the stored argv and prints `INIT wake (replaced)` or `INIT notify (replaced)`. `DOTS_OPS_BASE` chooses the folder, else `~/.dots-ops`. `init --base DIR` writes the tree elsewhere and prints the `DOTS_OPS_BASE` line to set, because later commands still resolve the environment first. An instance that already keeps its folder at `<work root>/.dots-ops` rather than `~/.dots-ops` exports `DOTS_OPS_BASE` to it; nothing is moved or copied.
 
 ## Reading cadence and the doorbell
 
@@ -188,10 +189,12 @@ from the files alone:
   five things, four of them in the folder the root writes: the mail folders (what owes an answer),
   the `listen/` markers (whether a wake runs), the `live/` lines (for `{dot}`), `dots.json` (every
   value no flag overrides) and its own ledger. `--state PATH` moves the ledger out of that folder,
-  and the four flags pin the values `dots.json` would otherwise set. For every message that owes an
-  answer and whose agent holds no live wait marker, it runs the wake argv once after `after_min`
-  minutes; if the message is still unanswered `notify_after_min` minutes after that wake, it runs the
-  notify argv once. A message counts as owed until an `out.jsonl` line answers it, read or not: a
+  and the six flags pin the values `dots.json` would otherwise set (the four above plus
+  `--rewake-min` and `--blocked-after-min`). For every message that owes an answer and whose agent
+  holds no live wait marker, it runs the wake argv once after `after_min` minutes; if the message is
+  still unanswered `notify_after_min` minutes after that wake, or after the first `WATCH_HELD` when a
+  marker holds the wake, it runs the notify argv once. A message counts as owed until an
+  `out.jsonl` line answers it, read or not: a
   `.agent-read` marker that reached it prints `WATCH_STUCK … read=yes unanswered=yes` once and the
   notify runs anyway, because that marker lives in the same folder as the mail. An owed line always
   has an age — its own `t`, else the moment the ledger first saw it — so an unparseable `t` cannot
@@ -201,7 +204,10 @@ from the files alone:
   is one `WATCH_RESOLVED` per answered message. Its ledger defaults to `<base>/watch/state.json`, so
   a restart never rings twice, and `--state PATH` keeps it outside the folder the root writes. The
   ledger may only add a line: every step it suppresses prints
-  `WATCH_SKIP … reason=wake_already|notify_already`, and the rest are `WATCH_CONFIG`, `WATCH_WAKE`,
+  `WATCH_SKIP … reason=wake_already|notify_already`, and a `wake_t` or `held_t` in the ledger that is
+  no time, or one in the future, prints `WATCH_ERROR … unusable wake_t=…; notify is due` (or
+  `held_t=…`) and rings the
+  notify instead of holding it back. The rest are `WATCH_CONFIG`, `WATCH_WAKE`,
   `WATCH_NOTIFY`, `WATCH_STUCK`, `WATCH_HELD`, `WATCH_RESOLVED`, `WATCH_TOOL_CHANGED` and
   `WATCH_ERROR`. The flags win over `dots.json` for the reason above, and `WATCH_CONFIG` names the
   source of each value on every run. `--loop 0` (the default) runs once; a loop sleeps between runs
@@ -253,9 +259,11 @@ from the files alone:
   it read within a second, so owed mail still unread past `after_min` contradicts it, and
   `WATCH_HELD {project} {agent} {id} age=… pid=… host=… until=… read=…` prints on every run. That
   line is the contradiction signal, and both halves of it are the root's to write: `read=` is
-  forgeable exactly like the marker. Nothing else fires while a marker holds the wake — no notify —
-  so this stdout line is the owner's only warning, and the one case the tool cannot settle by
-  itself: check `ps -p <pid>` and the agent's newest live line before believing the marker.
+  forgeable exactly like the marker. The wake stays held, but the marker cannot keep the owner from
+  being told: the ledger records the first `WATCH_HELD` as `held_t`, and once the earlier of that and
+  any wake is `notify_after_min` old the notify runs once, printing `WATCH_NOTIFY … held=yes`. Before
+  then this stdout line is the only warning, and the one case the tool cannot settle by itself: check
+  `ps -p <pid>` and the agent's newest live line before believing the marker.
 
 **What it only detects.** The tool cannot make the root honest. A line the root writes looks exactly
 like one an agent wrote, because `from` is a string and nothing signs it. A roster entry is a claim,
