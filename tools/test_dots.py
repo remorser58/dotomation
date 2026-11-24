@@ -1294,6 +1294,123 @@ class WatchTests(Base):
         self.assertNotIn("Traceback", res.stderr)
         self.assertEqual(read(target).split(), [mid])
 
+    def live(self, state, minutes_ago, agent="agent-2", host="local", task="issue 1"):
+        line = {"t": d.iso_after(-60 * minutes_ago), "agent": agent, "role": "구현", "model": "requested x",
+                "project": "proj", "task": task, "state": state, "host": host, "note": "n", "evidence": "e"}
+        with open(os.path.join(self.base, "live", "DOT-A", f"{agent}.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+
+    def idle_watch(self, *extra):
+        target, argv = self.recorder("idle.txt", ("{dot}", "{agent}", "{why}", "{task}"))
+        res = run(["watch", "--idle-cmd", json.dumps(argv), "--dot", "DOT-A", *extra], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rings = read(target).strip().splitlines() if os.path.exists(target) else []
+        return res.stdout, rings
+
+    def test_a_stalled_agent_is_woken_again_only_after_rewake_min(self):
+        self.live("step", 60)
+        out, rings = self.idle_watch()
+        self.assertIn("WATCH_IDLE DOT-A agent-2 STALLED age=60m state=step", out)
+        self.assertEqual(rings, ["DOT-A agent-2 STALLED issue 1"])
+        out, rings = self.idle_watch()   # the default rewake_min is 120 minutes
+        self.assertNotIn("WATCH_IDLE", out)
+        self.assertEqual(len(rings), 1)
+        out, rings = self.idle_watch("--rewake-min", "0")
+        self.assertIn("WATCH_IDLE DOT-A agent-2", out)
+        self.assertEqual(len(rings), 2)
+        self.live("step", 0)   # a fresh line ends the record
+        out, rings = self.idle_watch("--rewake-min", "0")
+        self.assertNotIn("WATCH_IDLE", out)
+        self.assertEqual(d.load_json(os.path.join(self.base, "watch", "state.json"))["agents"], {})
+
+    def test_a_blocked_agent_is_woken_once_and_reported_open_once(self):
+        self.live("blocked", 200)
+        out, rings = self.idle_watch("--rewake-min", "0")
+        self.assertIn("WATCH_IDLE DOT-A agent-2 BLOCKED", out)
+        self.assertIn("WATCH_BLOCKED_OPEN DOT-A agent-2 age=200m", out)
+        out, rings = self.idle_watch("--rewake-min", "0")
+        self.assertNotIn("WATCH_IDLE", out)
+        self.assertNotIn("WATCH_BLOCKED_OPEN", out)
+        self.assertEqual(len(rings), 1)
+        self.live("blocked", 1, task="issue 2")   # a new blocked line is a new record: one more wake
+        out, rings = self.idle_watch()
+        self.assertIn("WATCH_IDLE DOT-A agent-2 BLOCKED", out)
+        self.assertNotIn("WATCH_BLOCKED_OPEN", out)   # not yet blocked_after_min old
+        self.assertEqual(len(rings), 2)
+
+    def test_a_stale_roster_is_reported_once_while_its_lag_grows(self):
+        roster = os.path.join(self.base, "live", "DOT-A", "roster.json")
+        d.write_atomic(roster, json.dumps({"updated_at": d.iso_after(-7200), "slots": []}) + "\n")
+        self.live("done", 0)
+        out, _ = self.idle_watch()
+        self.assertEqual(out.count("WATCH_ROSTER_STALE DOT-A roster.json: updated_at"), 1, out)
+        self.live("done", 0, agent="agent-3")   # a newer line moves the minute count
+        self.assertNotIn("WATCH_ROSTER_STALE", self.idle_watch()[0])
+        d.write_atomic(roster, json.dumps({"updated_at": d.now(), "slots": []}) + "\n")
+        self.assertNotIn("WATCH_ROSTER_STALE", self.idle_watch()[0])
+        self.assertEqual(d.load_json(os.path.join(self.base, "watch", "state.json"))["roster"], {})
+
+    def recovery(self, jobs):
+        """A pinned stand-in for the recovery reader: inspect(root) returns root/jobs.json."""
+        ledger = os.path.join(self.base, "ledger")
+        os.makedirs(ledger, exist_ok=True)
+        d.write_atomic(os.path.join(ledger, "jobs.json"), json.dumps(jobs) + "\n")
+        script = os.path.join(self.base, "recovery.py")
+        body = "import json\ndef inspect(root):\n    return json.loads((root / 'jobs.json').read_text())\n"
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return ["--recovery-script", script, "--recovery-sha256", hashlib.sha256(body.encode()).hexdigest(),
+                "--ledger", f"DOT-A={ledger}"]
+
+    def test_vm_work_without_a_ledger_job_is_reported_once(self):
+        self.live("step", 0, host="vm")
+        flags = self.recovery({"old": {"phase": "COMPLETE"}})
+        res = run(["watch", "--dot", "DOT-A", *flags], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_VM_UNREGISTERED DOT-A agent-2", res.stdout)
+        self.assertIn("ledger_jobs=1", res.stdout)
+        self.assertNotIn("WATCH_VM_UNREGISTERED", run(["watch", "--dot", "DOT-A", *flags], self.base).stdout)
+        self.recovery({"j": {"phase": "ACTIVE"}})
+        self.live("step", 0, host="vm", task="issue 2")
+        res = run(["watch", "--dot", "DOT-A", *flags], self.base)
+        self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
+        self.assertNotIn("WATCH_ERROR", res.stdout)
+
+    def test_a_changed_recovery_script_is_never_run(self):
+        self.live("step", 0, host="vm")
+        flags = self.recovery({})
+        with open(flags[1], "a", encoding="utf-8") as fh:
+            fh.write("raise SystemExit('ran')\n")
+        res = run(["watch", "--dot", "DOT-A", *flags], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("WATCH_ERROR recovery", res.stdout)
+        self.assertIn("sha256 mismatch", res.stdout)
+        self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
+        self.assertEqual(run(["watch", "--recovery-script", flags[1]], self.base).returncode, 2)
+
+    def test_a_stopped_watchdog_shows_on_the_board(self):
+        self.assertEqual(run(["watch"], self.base).returncode, 0)
+        board = lambda *x: json.loads(run(["board", "--json", *x], self.base).stdout)["errors"]
+        self.assertEqual([e for e in board() if e["dot"] == "watch"], [])
+        beat = os.path.join(self.base, "watch", "heartbeat.json")
+        d.write_atomic(beat, json.dumps({"t": d.iso_after(-3600), "pid": 1, "loop": 5}) + "\n")
+        errs = [e["error"] for e in board() if e["dot"] == "watch"]
+        self.assertTrue(errs and errs[0].startswith("watch: last run 60m ago (limit 15m"), errs)
+        d.write_atomic(beat, json.dumps({"t": d.iso_after(-3600), "pid": 1, "loop": 30}) + "\n")
+        self.assertEqual([e for e in board() if e["dot"] == "watch"], [])   # within three loops
+        errs = [e["error"] for e in board("--heartbeat", os.path.join(self.base, "nope.json"))
+                if e["dot"] == "watch"]
+        self.assertEqual(errs, ["watch: no heartbeat file; the watchdog has not run"])
+
+    def test_the_idle_command_line_beats_dots_json(self):
+        self.config_with(idle=["/usr/bin/false"], watch={"rewake_min": 100000})
+        self.live("step", 60)
+        out, rings = self.idle_watch("--rewake-min", "0")
+        self.assertEqual(rings, ["DOT-A agent-2 STALLED issue 1"])
+        config = [ln for ln in out.splitlines() if ln.startswith("WATCH_CONFIG")][0]
+        self.assertIn("idle=argv:", config)
+        self.assertIn("rewake_min=argv:0", config)
+
 class ReadWarningTests(unittest.TestCase):
     """A path that cannot be read is reported once, and once more if it breaks again after working."""
     def test_an_append_that_wins_the_race_is_refused_not_blocked(self):

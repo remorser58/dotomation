@@ -74,3 +74,5 @@ The procedure is shared; the accounts are not. Each dot keeps its own job IDs, l
 ## Not included
 
 No resident watcher, no schedule of this repository's own, no 24/7 duplication, no automatic attach, no backup of secrets, no external copy installed by this kit. The 20-minute read contract in `PURE-REPLAY.ko.md` is the operator's schedule and must be confirmed in Dots before anyone calls it running.
+
+Owner-requested exception: the owner's own `dots.py watch --recovery-script <recovery.py> --recovery-sha256 <pinned sha> --ledger <DOT>=<ledger dir>` ([direct mail](direct-mail.md#steering-send-wait-reply)) reads each dot's ledger through the pinned `inspect()` and prints `WATCH_VM_UNREGISTERED` once for a `host=vm` `start`/`step` line in a dot whose ledger has no unfinished job. It loads the script only when the bytes match the pinned hash, and it never registers, attaches, resumes or writes to the ledger: the report goes to the owner, and registering the job stays the operator's `register` action.
