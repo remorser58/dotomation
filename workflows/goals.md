@@ -1,6 +1,6 @@
 # Goal and workflow operations
 
-Use the [same-pin handoff and operating rules](../.agents/skills/dots-superkit/SKILL.md) for the root and every child. Persist only in an already approved task record, not a new service or consumer-repo installation. Reuse the matching authorized goal; never reset a paused, cancelled or budget-limited goal to bypass its state.
+Use the [same-pin handoff and operating rules](../.agents/skills/dotomation/SKILL.md) for the root and every child. Persist only in an already approved task record, not a new service or consumer-repo installation. Reuse the matching authorized goal; never reset a paused, cancelled or budget-limited goal to bypass its state.
 
 ## 1. Goal card
 

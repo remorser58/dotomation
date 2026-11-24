@@ -1,6 +1,6 @@
 # Specialist routes
 
-These recipes apply to an authorized assignment under the [common handoff](../.agents/skills/dots-superkit/SKILL.md) and [run/host/tool rules](dispatch.md#confirm-the-run-and-target). Use the current Dots catalog only within those boundaries. Return the inputs opened, observation, decision or output, and limits. A missing tool does not make a different kind of evidence equivalent.
+These recipes apply to an authorized assignment under the [common handoff](../.agents/skills/dotomation/SKILL.md) and [run/host/tool rules](dispatch.md#confirm-the-run-and-target). Use the current Dots catalog only within those boundaries. Return the inputs opened, observation, decision or output, and limits. A missing tool does not make a different kind of evidence equivalent.
 
 ### Engineering
 

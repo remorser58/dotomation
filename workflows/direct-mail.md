@@ -37,7 +37,7 @@ A Dots agent reads and appends these files through the approved route to `local`
 
 ## How it maps to the handoff rules
 
-Direct mail is the addressed message and reply route that [direct exchanges](../.agents/skills/dots-superkit/SKILL.md#direct-exchanges-not-another-queue) allows for an approved worker surface. For the tasks it carries, the main session is the named verifier. The handoff event rules apply as follows:
+Direct mail is the addressed message and reply route that [direct exchanges](../.agents/skills/dotomation/SKILL.md#direct-exchanges-not-another-queue) allows for an approved worker surface. For the tasks it carries, the main session is the named verifier. The handoff event rules apply as follows:
 
 - **Gates.** The coordinator's brief to the agent holds the mandatory gate list. The agent's first message on a task is an `ack` that copies each gate ID and its pass condition, one `gate:<ID>` per gate in `refs`, so the main session checks against the same list. A main-session `task` that adds work inside the assignment names any new gate the same way. A message never removes a gate.
 - `re` is `reply_to`. A message is never authorization to widen scope. A decision that belongs to the owner goes to the owner through the main session.
@@ -46,7 +46,7 @@ Direct mail is the addressed message and reply route that [direct exchanges](../
 - `review` from the main session is a **check**. It answers one `result` id and SHA. It gives one verdict per gate, `gate:<ID> PASS|FAIL|NOT_RUN`, with the observed output or its location, and the reason for each FAIL or NOT_RUN. For a FAIL it tells the agent what to fix.
 - `answer` that accepts a `result` is the final check. It gives PASS for every gate on that SHA, names the SHA the main session published, and names the pull request. A rejection is a `review` with at least one FAIL. A rejection never closes anything.
 - **Coordinator receipt.** The coordinator reads `mail/<agentId>/` read-only. That copy covers the submit chain and the verdicts, so the agent does not have to send the coordinator a second copy. The direct agent-to-main-session leg is still the one that counts.
-- **Close.** Only the coordinator closes, under the [close rule](../.agents/skills/dots-superkit/SKILL.md#events-and-evidence). It closes only after an accepting `answer` on the newest `result`. Before closing, it reads that answer's per-gate verdicts and the published target, compares the gate IDs with the mandatory list in its own brief (a missing gate is NOT_RUN, never PASS), and confirms there is no open `block`, pause or newer owner direction. After a rejection the task stays open, and the coordinator records which gate failed.
+- **Close.** Only the coordinator closes, under the [close rule](../.agents/skills/dotomation/SKILL.md#events-and-evidence). It closes only after an accepting `answer` on the newest `result`. Before closing, it reads that answer's per-gate verdicts and the published target, compares the gate IDs with the mandatory list in its own brief (a missing gate is NOT_RUN, never PASS), and confirms there is no open `block`, pause or newer owner direction. After a rejection the task stays open, and the coordinator records which gate failed.
 - `block` names the missing fact or capability and the next safe step. A message is never a resume after an owner pause.
 
 ## Delivering code

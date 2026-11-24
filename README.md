@@ -1,4 +1,4 @@
-# Dots Superkit
+# Dotomation (닷동화)
 
 Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자와 검증자가 직접 대화하는 작업 키트다. 실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 예외는 소유자가 요청한 두 파일뿐이다: 읽기 전용 점검 도구 `tools/dots_monitor.py`는 설치·서비스·계정·자격 증명 없이 읽기만 하고([모니터링](workflows/monitoring.md)), 기록·메모리·우편을 다루고 서브에이전트를 대기시키는 `tools/dots.py`는 표준 라이브러리만 쓰며 사람이나 에이전트가 띄운 프로세스가 스스로 끝난다([직통 우편](workflows/direct-mail.md#steering-send-wait-reply), [AGENTS.md](AGENTS.md#the-second-exception-toolsdotspy)).
 
@@ -13,13 +13,13 @@ Dots에서 목표를 정하고, 계획·실행·검증을 나누며, 담당자�
 ## 한 건 시작하기
 
 1. 승인된 저장소에서 사용할 **40자리 커밋 SHA**를 정한다. 브랜치명이나 최신판이라는 표현만으로는 버전을 고정할 수 없다.
-2. 그 커밋의 [스킬](.agents/skills/dots-superkit/SKILL.md)과 [공통 실행 규칙](workflows/dispatch.md#confirm-the-run-and-target)을 먼저 읽는다. 조정자는 모든 하위 작업자를 승인된 GPT‑6.2 Astra로 네이티브 경로에서 소환한다: 담당·검증은 `xhigh`, Dot마다 총괄 하나는 `ultra`. 소환이 성공하면 Dots가 실제 모델·강도를 표시하지 않아도 작업을 시작하고, 기록에는 `requested <model> <effort>; runtime does not display effective`로 남긴다. 다른 모델이나 더 낮은 강도로 다시 소환하지 않는다. 작업 전 호스트 이름으로 현재 호스트를 확인하고 대상이 바뀌면 다시 확인한다. Dots 자체 기기 연결로 붙은 컴퓨터는 그 컴퓨터의 네이티브 CLI만 쓴다. 오너가 설치한 이름이 지정된 Web GPT Agent 커넥터는 그 호스트로 가는 승인 경로다([승인 경로](workflows/hosts.md#approved-routes)). Codex(Codex Native2, Codex cloud, Codex 연동 도구)는 어느 호스트에서도 쓰지 않는다.
+2. 그 커밋의 [스킬](.agents/skills/dotomation/SKILL.md)과 [공통 실행 규칙](workflows/dispatch.md#confirm-the-run-and-target)을 먼저 읽는다. 조정자는 모든 하위 작업자를 승인된 GPT‑6.2 Astra로 네이티브 경로에서 소환한다: 담당·검증은 `xhigh`, Dot마다 총괄 하나는 `ultra`. 소환이 성공하면 Dots가 실제 모델·강도를 표시하지 않아도 작업을 시작하고, 기록에는 `requested <model> <effort>; runtime does not display effective`로 남긴다. 다른 모델이나 더 낮은 강도로 다시 소환하지 않는다. 작업 전 호스트 이름으로 현재 호스트를 확인하고 대상이 바뀌면 다시 확인한다. Dots 자체 기기 연결로 붙은 컴퓨터는 그 컴퓨터의 네이티브 CLI만 쓴다. 오너가 설치한 이름이 지정된 Web GPT Agent 커넥터는 그 호스트로 가는 승인 경로다([승인 경로](workflows/hosts.md#approved-routes)). Codex(Codex Native2, Codex cloud, Codex 연동 도구)는 어느 호스트에서도 쓰지 않는다.
 3. 담당자는 짝 검증자에게 결과를 직접 보낸다. 검증자는 정확히 그 결과를 열어 확인한다. 조정자는 검사 기록뿐 아니라 산출물과 요구 조건을 직접 비교해 종료 여부를 정한다. 별도 실행이나 등록 없이 기존 작업의 메시지/메모만 쓰면 된다.
 
 각 담당자와 검증자에게 같은 버전과 범위, 승인된 작업 대상과 도구 제한을 명시해 직접 전달한다. 수신자는 자기 실행 환경에서 확인한다. 호스트나 승인 경로를 확인할 수 없다면 그 작업을 보류하며 다른 모델, 강도, 호스트로 대체하지 않는다.
 
 ```text
-Dots Superkit: dots-superkit/handoff-v1 @ <kit commit SHA>
+Dotomation: dots-superkit/handoff-v1 @ <kit commit SHA>
 work_id / revision: <안정된 작업 ID> / 1
 조정자 / 담당자 / 검증자: <역할별 실제 수신자>
 목표와 완료 조건: <사람에게 어떤 결과가 보이면 끝인가>

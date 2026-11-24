@@ -1,9 +1,9 @@
 ---
-name: dots-superkit
+name: dotomation
 description: "Route approved Dots goal, ULW/WISH, plan, execute, loop, research and specialist work through native tools, pinned peer handoffs, live records and checked evidence. No runner or install."
 ---
 
-# Dots Superkit · handoff-v1
+# Dotomation (닷동화) · handoff-v1
 
 ## Choose the requested behavior
 
