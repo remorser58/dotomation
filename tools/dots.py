@@ -99,6 +99,20 @@ if __name__ == "__main__" and sys.path:
     del sys.path[0]
 
 import argparse, contextlib, datetime, fcntl, glob, hashlib, json, math, os, pathlib, re, secrets, signal, socket, stat, subprocess, time, types
+import ast
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+from dataclasses import dataclass
+from typing import Iterator, Optional, Union
+
+VERSION = "1.0.0"
+VERSION_LINE = re.compile(rb'^VERSION = "([0-9]+(?:\.[0-9]+)+)"\r?$', re.MULTILINE)
+UPDATE_API = "https://api.github.com/repos/remorser58/dotomation/releases/latest"
+UPDATE_LIMIT = 2 * 1024 * 1024
+
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -1737,6 +1751,7 @@ def init(a):
         print(line)
     print(f"INIT config {path} ({'unchanged' if current == data else 'written'})")
     brief(base, dots, projects, cfg, os.path.abspath(__file__))
+    a.base = base
 
 def tool_memory(dot, agent):
     """True when this agent already has the memory file `tick` would have written: v1, its own name,
@@ -1805,6 +1820,242 @@ def brief(base, dots, projects, cfg, script):
         print("Notify command: configured (watch runs it when a woken agent has still not answered)")
     else:
         print("Notify command: none (watch prints WATCH_ERROR when a notify is due and no command is set)")
+
+# ---------------------------------------------------------------- updates
+
+class UpdateError(Exception):
+    """An update refused for a safe, single-token reason."""
+
+
+@dataclass(frozen=True)
+class UpdateRelease:
+    version: str
+    newer: bool
+    script_url: Optional[str]
+    checksum_url: Optional[str]
+
+
+def update_url_allowed(url: str, loopback: tuple[str, ...]) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # Reject malformed ports before handing the URL to urllib.
+    except ValueError:
+        return False
+    return bool(parts.hostname and parts.username is None and (
+        parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in loopback)
+    ))
+
+
+class UpdateSource(urllib.request.HTTPRedirectHandler):
+    """Apply the same URL policy to the API, assets and every redirect."""
+
+    def __init__(self) -> None:
+        override = os.environ.get("DOTS_UPDATE_URL", "")
+        loopback = ("127.0.0.1", "localhost")
+        self.api = override if update_url_allowed(override, loopback) else UPDATE_API
+        self.loopback = tuple(host for host in loopback if host == urllib.parse.urlsplit(self.api).hostname)
+        self.opener = urllib.request.build_opener(self)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise drains the redirect body without a size limit.
+        fp.close()
+        if not update_url_allowed(newurl, self.loopback):
+            raise UpdateError("unsafe-redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def fetch(self, url: str) -> bytes:
+        if not update_url_allowed(url, self.loopback):
+            raise UpdateError("unsafe-url")
+        request = urllib.request.Request(url, headers={"User-Agent": f"dotomation-dots.py/{VERSION}"})
+        try:
+            with self.opener.open(request, timeout=5) as response:
+                data = response.read(UPDATE_LIMIT + 1)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise
+        if len(data) > UPDATE_LIMIT:
+            raise UpdateError("download-too-large")
+        return data
+
+    def latest(self) -> Optional[UpdateRelease]:
+        release = json.loads(self.fetch(self.api))
+        if not isinstance(release, dict):
+            raise UpdateError("invalid-release")
+        tag = release.get("tag_name")
+        if release.get("prerelease") or release.get("draft") or not isinstance(tag, str):
+            return None
+        # Release tags are v-prefixed; no suffixes, signs or prerelease versions.
+        if not re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+", tag):
+            return None
+        version = tag[1:]
+        try:
+            current = tuple(map(int, VERSION.split(".")))
+            latest = tuple(map(int, version.split(".")))
+        except ValueError:
+            return None
+        # Missing components compare as zero: 1.0.0.0 is not newer than 1.0.0.
+        newer = latest + (0,) * max(0, len(current) - len(latest)) > (
+            current + (0,) * max(0, len(latest) - len(current)))
+        assets = release.get("assets")
+        urls = {}
+        if isinstance(assets, list):
+            for asset in assets:
+                if isinstance(asset, dict):
+                    name, url = asset.get("name"), asset.get("browser_download_url")
+                    if name in ("dots.py", "dots.py.sha256") and isinstance(url, str):
+                        urls[name] = url
+        return UpdateRelease(version, newer, urls.get("dots.py"), urls.get("dots.py.sha256"))
+
+
+def update_writable(path: pathlib.Path) -> bool:
+    return (bool(path.stat().st_mode & 0o222) and bool(path.parent.stat().st_mode & 0o222)
+            and os.access(path, os.W_OK) and os.access(path.parent, os.W_OK | os.X_OK))
+
+
+def update_in_checkout(script: pathlib.Path) -> bool:
+    # Only the kit's own checkout (<repo>/tools/dots.py beside <repo>/.git; a worktree's .git is a file)
+    # belongs to git. A copy that merely sits somewhere inside another git work tree is a standalone
+    # install. Both the resolved file and the path it was run from count, so a symlink into a checkout
+    # is never replaced either.
+    return any(path.parent.name == "tools" and os.path.lexists(path.parent.parent / ".git")
+               for path in (script, pathlib.Path(os.path.abspath(__file__))))
+
+
+@contextlib.contextmanager
+def update_lock(directory: pathlib.Path) -> Iterator[None]:
+    """Serialize updaters without waiting or putting a lock file in the shared folder."""
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def update_write(path: pathlib.Path, data: bytes, mode: int) -> None:
+    """Stage bytes in the target directory and replace the name without following it."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as fh:
+        temp = pathlib.Path(fh.name)
+        try:
+            fh.write(data)
+            fh.flush()
+            os.fchmod(fh.fileno(), mode)
+            os.fsync(fh.fileno())
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def update_read(path: pathlib.Path) -> bytes:
+    """Read only a bounded regular file, without blocking on a FIFO in the shared base."""
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise UpdateError("not-a-file")
+        data = fh.read(UPDATE_LIMIT + 1)
+    if len(data) > UPDATE_LIMIT:
+        raise UpdateError("file-too-large")
+    return data
+
+
+def update_json_field(path: pathlib.Path, key: str) -> Union[bool, int, float, None]:
+    """Read an optional update flag or timestamp without printing config warnings."""
+    try:
+        doc = json.loads(update_read(path))
+    except (FileNotFoundError, ValueError):
+        return None
+    value = doc.get(key) if isinstance(doc, dict) else None
+    return value if isinstance(value, (bool, int, float)) else None
+
+
+def apply_update(source: UpdateSource, release: UpdateRelease, script: pathlib.Path) -> bool:
+    """Validate before making any changes; return False if another process replaced us first."""
+    if not update_writable(script):
+        raise UpdateError("not-writable")
+    if not release.script_url or not release.checksum_url:
+        raise UpdateError("missing-assets")
+    checksum = source.fetch(release.checksum_url).rstrip(b"\r\n")
+    match = re.fullmatch(rb"([0-9a-fA-F]{64}) [ *]dots\.py", checksum)
+    if not match:
+        raise UpdateError("invalid-checksum")
+    data = source.fetch(release.script_url)
+    if hashlib.sha256(data).hexdigest().encode("ascii") != match[1].lower():
+        raise UpdateError("checksum-mismatch")
+    if VERSION_LINE.findall(data) != [release.version.encode("ascii")]:
+        raise UpdateError("version-mismatch")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        compile(data, str(script), "exec")
+        tree = ast.parse(data)
+    if not any(isinstance(node, ast.Assign) and len(node.targets) == 1
+               and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "VERSION"
+               and isinstance(node.value, ast.Constant) and node.value.value == release.version
+               for node in tree.body):
+        raise UpdateError("version-mismatch")
+
+    with update_lock(script.parent):
+        if VERSION_LINE.findall(update_read(script)) != [VERSION.encode("ascii")]:
+            return False  # A long-running command must not overwrite a version installed meanwhile.
+        mode = stat.S_IMODE(script.stat().st_mode)
+        backup = script.with_name(f"dots.py.bak-{VERSION}")
+        try:
+            os.link(script, backup)
+        except FileExistsError:
+            # The first backup for this version is kept, even on repeated installs.
+            pass
+        update_write(script, data, mode)
+    print(f"dots: updated {VERSION} -> {release.version} (backup {backup.name})", file=sys.stderr)
+    return True
+
+
+def auto_update(base: pathlib.Path) -> None:
+    if os.environ.get("DOTS_AUTO_UPDATE") == "0" or not base.is_dir():
+        return
+    script = pathlib.Path(os.path.realpath(__file__))
+    if not update_writable(script) or update_json_field(base / "dots.json", "auto_update") is False:
+        return
+    stamp = base / ".update-check.json"
+    with update_lock(base):
+        t = time.time()
+        previous = update_json_field(stamp, "t")
+        if isinstance(previous, (int, float)) and not isinstance(previous, bool) and 0 <= t - previous < 86400:
+            return
+        # Reserve the day's check before dialing, including failures and interrupted checks.
+        update_write(stamp, json.dumps({"t": t, "latest": "unknown"}).encode("ascii"), 0o644)
+        source = UpdateSource()
+        release = source.latest()
+        if release is None:
+            return
+        update_write(stamp, json.dumps({"t": t, "latest": release.version}).encode("ascii"), 0o644)
+    if release.newer:
+        if update_in_checkout(script):
+            print(f"dots: {release.version} is available; run git pull", file=sys.stderr)
+        else:
+            apply_update(source, release, script)
+
+
+def update_command(a) -> int:
+    """Run the explicit update and report its outcome without the automatic check's gates."""
+    latest, action, code = "unknown", "none", 0
+    try:
+        source = UpdateSource()
+        release = source.latest()
+        if release is not None:
+            latest = release.version
+            if release.newer:
+                script = pathlib.Path(os.path.realpath(__file__))
+                if update_in_checkout(script):
+                    action = "git-pull"
+                elif a.check:
+                    action = "available"
+                elif apply_update(source, release, script):
+                    action = "updated"
+    except Exception as exc:  # CLI boundary: --check is informational even when unavailable.
+        if not a.check:
+            reason = str(exc) if isinstance(exc, UpdateError) else type(exc).__name__
+            action, code = f"failed reason={reason}", 1
+    print(f"UPDATE current={VERSION} latest={latest} action={action}")
+    return code
+
 
 class Piped:
     """A reader that stops early (`dots.py send ... | head -1`) must not raise and must not skip
@@ -1930,10 +2181,18 @@ def main(argv):
     c.add_argument("--recovery-sha256", dest="recovery_sha256", help="sha256 of --recovery-script")
     c.add_argument("--ledger", action="append", default=[],
                    help="DOT=DIR recovery ledger folder for that dot's VM work; repeatable")
+    u = sub.add_parser("update", help="check for or install the latest release now")
+    u.add_argument("--check", action="store_true", help="report availability without installing")
     a = p.parse_args(argv)
     announce_rules(a)
     code = {"tick": tick, "board": board, "memo": memo, "send": send, "inbox": inbox, "read": read,
-            "reply": reply, "wait": wait, "init": init, "watch": watch}[a.cmd](a)
+            "reply": reply, "wait": wait, "init": init, "watch": watch, "update": update_command}[a.cmd](a)
+    if a.cmd not in ("watch", "update"):
+        try:
+            auto_update(pathlib.Path(a.base if a.cmd == "init" else BASE))
+        except (Exception, KeyboardInterrupt):
+            # A post-command check must never change that command's status or diagnostics.
+            pass
     sys.exit(code or 0)
 
 if __name__ == "__main__":

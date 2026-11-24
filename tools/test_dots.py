@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for dots.py: steering (wait), mail, init, and the tick/board regressions.
+"""Tests for dots.py: steering, mail, init, tick/board and release updates.
 
 Run with: cd tools && python3 -m unittest test_dots -q
-No network and no ssh: every case uses a temporary base folder and a bounded timeout.
+No external network or ssh: update cases use a loopback server and all cases use a temporary base.
 """
 
 import glob
@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import pathlib
 import re
 import signal
 import socket
@@ -20,6 +21,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.dont_write_bytecode = True  # leave no __pycache__ next to the tool
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +41,7 @@ FIRST = ("--role", "구현", "--model", "requested gpt-6.2-astra xhigh; runtime 
 
 
 def run(args, base, stdin=None, timeout=20):
-    env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
+    env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1", DOTS_AUTO_UPDATE="0")
     return subprocess.run([sys.executable, SCRIPT] + list(args), input=stdin, env=env,
                           capture_output=True, text=True, timeout=timeout)
 
@@ -49,7 +51,7 @@ def spawn(args, base, body=None):
     then forgotten: since Python 3.12 `communicate` flushes stdin, so a closed pipe left on the object
     makes it raise ValueError instead of returning the output. Every stdin-writing case goes through
     here so there is one place that knows this."""
-    env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
+    env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1", DOTS_AUTO_UPDATE="0")
     p = subprocess.Popen([sys.executable, SCRIPT] + list(args), env=env, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if body is not None:
@@ -1674,7 +1676,7 @@ class InitTests(Base):
     def test_init_prints_the_export_line_for_a_base_that_is_not_the_default(self):
         home = tempfile.mkdtemp(dir=self._tmp.name)
         env = {k: v for k, v in os.environ.items() if k != "DOTS_OPS_BASE"}
-        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
+        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1", DOTS_AUTO_UPDATE="0")
         elsewhere = os.path.join(home, "shared")
         res = subprocess.run([sys.executable, SCRIPT, "init", "--yes", "--base", elsewhere, "--dot", "DOT-A"],
                              env=env, capture_output=True, text=True, timeout=20)
@@ -1688,7 +1690,7 @@ class InitTests(Base):
     def test_init_and_board_resolve_the_same_base(self):
         home = tempfile.mkdtemp(dir=self._tmp.name)
         env = {k: v for k, v in os.environ.items() if k != "DOTS_OPS_BASE"}
-        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
+        env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1", DOTS_AUTO_UPDATE="0")
         res = subprocess.run([sys.executable, SCRIPT, "init", "--yes", "--dot", "DOT-A"], env=env,
                              capture_output=True, text=True, timeout=20)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -1753,10 +1755,270 @@ class ScriptHijackTests(unittest.TestCase):
                 fh.write("print('HIJACKED')\nraise SystemExit(9)\n")
             base = os.path.join(tmp, "shared")
             os.makedirs(os.path.join(base, "live", "DOT-A"))
-            env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1")
+            env = dict(os.environ, DOTS_OPS_BASE=base, PYTHONDONTWRITEBYTECODE="1", DOTS_AUTO_UPDATE="0")
             res = subprocess.run([sys.executable, tool, "board"], env=env, capture_output=True,
                                  text=True, timeout=20)
             self.assertNotEqual(res.returncode, 9, res.stdout + res.stderr)
             self.assertNotIn("HIJACKED", res.stdout + res.stderr)
+
+
+class AutoUpdateTests(unittest.TestCase):
+    NEW = "99.10.0"
+    API = "/latest"
+    ASSETS = ["/dots.py.sha256", "/dots.py"]
+
+    def setUp(self):
+        tmp_dir = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(tmp_dir.cleanup)
+        tmp = pathlib.Path(tmp_dir.name)
+        self.base = tmp / "shared"
+        (self.base / "proj" / "mail").mkdir(parents=True)
+        (self.base / "live" / "DOT-A").mkdir(parents=True)
+        tools = tmp / "install" / "bin"
+        tools.mkdir(parents=True)
+        self.script = tools / "dots.py"
+        self.original = pathlib.Path(SCRIPT).read_bytes()
+        self.script.write_bytes(self.original)
+        self.script.chmod(0o751)
+        self.backup = self.script.with_name(f"dots.py.bak-{d.VERSION}")
+        self.stamp = self.base / ".update-check.json"
+        self.replacement = self.original.replace(f'VERSION = "{d.VERSION}"'.encode(),
+                                                f'VERSION = "{self.NEW}"'.encode(), 1)
+        self.requests = []
+        self.responses = {}
+        self.delivered = []
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                fixture.requests.append((self.path, self.headers.get("User-Agent")))
+                if self.path == fixture.API:
+                    box = fixture.base / "proj" / "mail" / "agent-1"
+                    marker = box / ".agent-read"
+                    fixture.delivered.append(marker.read_text().strip() if marker.exists() else None)
+                response = fixture.responses.get(self.path)
+                if response is None:
+                    return  # Abrupt close, no HTTP response.
+                status, body, headers = response
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass  # Keep test output about the CLI, not the fixture.
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        self.url = f"http://127.0.0.1:{server.server_port}"
+        self.publish(f"v{self.NEW}")
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+
+    def publish(self, tag, *, data=None, checksum=None, prerelease=False, script_url=None):
+        body = self.replacement if data is None else data
+        digest = hashlib.sha256(body).hexdigest() if checksum is None else checksum
+        self.responses[self.API] = (200, json.dumps({
+            "tag_name": tag, "prerelease": prerelease,
+            "assets": [{"name": "dots.py", "browser_download_url": script_url or self.url + "/dots.py"},
+                       {"name": "dots.py.sha256", "browser_download_url": self.url + "/dots.py.sha256"}],
+        }).encode(), {})
+        self.responses["/dots.py"] = (200, body, {})
+        self.responses["/dots.py.sha256"] = (200, f"{digest}  dots.py\n".encode(), {})
+
+    def cli(self, *args, auto="1", stdin="", base=None, script=None):
+        env = dict(os.environ, DOTS_OPS_BASE=str(base or self.base), DOTS_UPDATE_URL=self.url + self.API,
+                   DOTS_AUTO_UPDATE=auto, no_proxy="127.0.0.1,localhost", PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run([sys.executable, str(script or self.script), *(args or ("inbox",))],
+                              input=stdin, capture_output=True, text=True, env=env, timeout=12)
+
+    def assert_requests(self, *paths):
+        self.assertEqual(self.requests, [(path, f"dotomation-dots.py/{d.VERSION}") for path in paths])
+
+    def assert_original(self):
+        self.assertEqual(self.script.read_bytes(), self.original)
+        self.assertFalse(self.backup.exists())
+
+    def test_automatic_update_replaces_real_file_with_same_mode_and_preserves_output(self):
+        link = self.script.parent / "dots-link"
+        link.symlink_to(self.script)
+        baseline = self.cli(auto="0", script=link)
+        updated = self.cli(script=link)
+        self.assertEqual((updated.returncode, updated.stdout), (0, baseline.stdout))
+        self.assertEqual(updated.stderr, f"dots: updated {d.VERSION} -> {self.NEW} (backup {self.backup.name})\n")
+        self.assertEqual(self.script.read_bytes(), self.replacement)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(self.script.stat().st_mode & 0o777, 0o751)
+        self.assertEqual(self.backup.read_bytes(), self.original)
+        self.assert_requests(self.API, *self.ASSETS)
+
+    def test_automatic_checksum_mismatch_is_silent_and_leaves_original(self):
+        self.publish(f"v{self.NEW}", checksum="0" * 64)
+        result = self.cli()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "MAIL none (no unread replies)\n", ""))
+        self.assert_original()
+        self.assert_requests(self.API, *self.ASSETS)
+
+    def test_older_equal_and_unstable_releases_never_download_assets(self):
+        for tag, prerelease in [("v0.99.99", False), (f"v{d.VERSION}", False),
+                                (f"v{d.VERSION}.0", False), (f"v{self.NEW}", True),
+                                (f"v{self.NEW}-rc.1", False), ("vnot-a-version", False)]:
+            with self.subTest(tag=tag, prerelease=prerelease):
+                self.stamp.unlink(missing_ok=True)
+                self.requests.clear()
+                self.publish(tag, prerelease=prerelease)
+                result = self.cli()
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assert_original()
+                self.assert_requests(self.API)
+
+    def test_automatic_opt_outs_never_contact_server(self):
+        self.assertEqual(self.cli(auto="0").returncode, 0)
+        self.assert_requests()
+        (self.base / "dots.json").write_text('{"auto_update": false}', encoding="utf-8")
+        self.assertEqual(self.cli().returncode, 0)
+        self.assert_requests()
+        self.assert_original()
+        self.assertFalse(self.stamp.exists())
+
+    def test_missing_base_and_read_only_tool_skip_automatic_requests(self):
+        self.assertEqual(self.cli(base=self.base / "missing").returncode, 0)
+        self.script.chmod(0o551)
+        self.assertEqual(self.cli().returncode, 0)
+        self.script.chmod(0o751)
+        self.script.parent.chmod(0o555)
+        self.addCleanup(self.script.parent.chmod, 0o755)
+        self.assertEqual(self.cli().returncode, 0)
+        self.assert_requests()
+
+    def test_daily_stamp_throttles_success_and_allows_stale_stamp(self):
+        self.publish(f"v{d.VERSION}")
+        self.assertEqual(self.cli().returncode, 0)
+        self.assertEqual(json.loads(self.stamp.read_bytes())["latest"], d.VERSION)
+        self.assertEqual(self.cli().returncode, 0)
+        self.assert_requests(self.API)
+        self.stamp.write_text('{"t": 0, "latest": "unknown"}', encoding="utf-8")
+        self.assertEqual(self.cli().returncode, 0)
+        self.assert_requests(self.API, self.API)
+
+    def test_network_failure_keeps_wait_timeout_and_throttles_next_command(self):
+        self.responses.pop(self.API)
+        result = self.cli("wait", "DOT-A", "agent-1", "--timeout", "1")
+        self.assertEqual((result.returncode, result.stderr), (3, ""))
+        self.assertTrue(result.stdout.endswith("WAIT timeout dot=DOT-A agent=agent-1 after=1s unread=0\n"))
+        self.assertEqual(json.loads(self.stamp.read_bytes())["latest"], "unknown")
+        self.assertEqual(self.cli().stdout, "MAIL none (no unread replies)\n")
+        self.assert_original()
+        self.assert_requests(self.API)
+
+    def test_wait_records_delivery_before_checking_release(self):
+        sent = self.cli("send", "proj", "agent-1", "task", "test", auto="0", stdin="do this")
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        mid = sent.stdout.splitlines()[0]
+        waited = self.cli("wait", "DOT-A", "agent-1", "--timeout", "1")
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        self.assertIn(mid, waited.stdout)
+        self.assertEqual(self.delivered, [mid])
+
+    def test_watch_never_checks_even_for_pinned_writable_copy(self):
+        result = self.cli("watch", "--expect-sha256", hashlib.sha256(self.original).hexdigest())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("WATCH_TOOL_CHANGED", result.stdout)
+        self.assert_original()
+        self.assert_requests()
+
+    def test_kit_checkout_notifies_once_without_replacing_tool(self):
+        repo = self.script.parent.parent.parent / "kit"
+        (repo / "tools").mkdir(parents=True)
+        (repo / ".git").write_text("gitdir: ../git/worktrees/test\n", encoding="utf-8")
+        script = repo / "tools" / "dots.py"
+        script.write_bytes(self.original)
+        result = self.cli(script=script)
+        self.assertEqual((result.returncode, result.stderr), (0, f"dots: {self.NEW} is available; run git pull\n"))
+        self.assertEqual(self.cli(script=script).stderr, "")
+        self.assertEqual(script.read_bytes(), self.original)
+        self.assertEqual(list((repo / "tools").iterdir()), [script])
+        self.assert_requests(self.API)
+        checked = self.cli("update", "--check", script=script)
+        self.assertEqual(checked.stdout, f"UPDATE current={d.VERSION} latest={self.NEW} action=git-pull\n")
+        self.assert_requests(self.API, self.API)
+
+    def test_copy_inside_unrelated_git_tree_still_updates(self):
+        (self.script.parent.parent / ".git").mkdir()
+        result = self.cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.script.read_bytes(), self.replacement)
+        self.assertEqual(self.backup.read_bytes(), self.original)
+
+    def test_check_ignores_opt_outs_and_daily_stamp_but_never_downloads_assets(self):
+        self.stamp.write_text(json.dumps({"t": time.time(), "latest": "unknown"}), encoding="utf-8")
+        (self.base / "dots.json").write_text('{"auto_update": false}', encoding="utf-8")
+        checked = self.cli("update", "--check", auto="0")
+        self.assertEqual((checked.returncode, checked.stderr), (0, ""))
+        self.assertEqual(checked.stdout, f"UPDATE current={d.VERSION} latest={self.NEW} action=available\n")
+        self.assert_original()
+        self.assert_requests(self.API)
+
+    def test_explicit_unavailable_release_is_informational_only_with_check(self):
+        self.responses.pop(self.API)
+        checked = self.cli("update", "--check")
+        self.assertEqual((checked.returncode, checked.stdout, checked.stderr),
+                         (0, f"UPDATE current={d.VERSION} latest=unknown action=none\n", ""))
+        applied = self.cli("update")
+        self.assertEqual(applied.returncode, 1)
+        self.assertTrue(applied.stdout.startswith(f"UPDATE current={d.VERSION} latest=unknown action=failed reason="))
+        self.assert_original()
+        self.assert_requests(self.API, self.API)
+
+    def test_explicit_install_keeps_existing_backup(self):
+        self.backup.write_bytes(b"the earlier backup")
+        result = self.cli("update", auto="0", base=self.base / "missing")
+        self.assertEqual((result.returncode, result.stdout),
+                         (0, f"UPDATE current={d.VERSION} latest={self.NEW} action=updated\n"))
+        self.assertEqual(self.backup.read_bytes(), b"the earlier backup")
+        self.assertEqual(self.script.read_bytes(), self.replacement)
+        self.assert_requests(self.API, *self.ASSETS)
+
+    def test_explicit_update_reports_asset_rejections_and_does_not_replace(self):
+        fake_version = f'"""\nVERSION = "{self.NEW}"\n"""\n'.encode()
+        for data, reason in [(self.original, "version-mismatch"),
+                             (fake_version, "version-mismatch"),
+                             (self.replacement + b"\nif\n", "SyntaxError"),
+                             (b" " * (2 * 1024 * 1024 + 1), "download-too-large")]:
+            with self.subTest(reason=reason):
+                self.publish(f"v{self.NEW}", data=data)
+                result = self.cli("update")
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (1, f"UPDATE current={d.VERSION} latest={self.NEW} action=failed reason={reason}\n", ""))
+                self.assert_original()
+
+    def test_http_asset_and_redirect_must_use_same_loopback_host(self):
+        foreign = self.url.replace("127.0.0.1", "localhost") + "/foreign"
+        for redirect, reason in [(False, "unsafe-url"), (True, "unsafe-redirect")]:
+            with self.subTest(redirect=redirect):
+                self.requests.clear()
+                self.publish(f"v{self.NEW}", script_url=None if redirect else foreign)
+                if redirect:
+                    self.responses["/dots.py"] = (302, b"", {"Location": foreign})
+                result = self.cli("update")
+                self.assertEqual((result.returncode, result.stdout),
+                                 (1, f"UPDATE current={d.VERSION} latest={self.NEW} action=failed reason={reason}\n"))
+                self.assert_original()
+                self.assert_requests(self.API, *self.ASSETS[:2 if redirect else 1])
+
+    def test_assets_can_redirect_to_same_loopback_host(self):
+        self.responses["/asset"] = self.responses["/dots.py"]
+        self.responses["/dots.py"] = (302, b"", {"Location": "/asset"})
+        result = self.cli("update")
+        self.assertEqual((result.returncode, result.stdout),
+                         (0, f"UPDATE current={d.VERSION} latest={self.NEW} action=updated\n"))
+        self.assertEqual(self.script.read_bytes(), self.replacement)
+        self.assert_requests(self.API, *self.ASSETS, "/asset")
+
+
 if __name__ == "__main__":
     unittest.main()
