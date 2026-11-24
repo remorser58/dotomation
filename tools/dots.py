@@ -1163,33 +1163,45 @@ def watch_settings(a, cfg):
             src[key] = dsrc[key]
     path = os.path.abspath(os.path.expanduser(a.state)) if a.state else state_path()
     src["state"] = "argv" if a.state else "default"
-    scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=recovery_settings(a, cfg, src))
-    for d in scan.dots:
+    for d in a.dot or []:
         token("DOT", d)
+    rc, rc_err = recovery_settings(a, cfg, src)
+    scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=rc, recovery_error=rc_err)
     return wake, notify, delays, path, src, scan
 
 def recovery_settings(a, cfg, src):
-    """The pinned recovery ledger reader: {script, sha256, ledgers} or None. The flags win over
-    dots.json `recovery`; a script without its sha256 is refused, never loaded unpinned."""
-    rc = cfg.get("recovery") if isinstance(cfg.get("recovery"), dict) else {}
-    script, sha = a.recovery_script, a.recovery_sha256
+    """The pinned recovery ledger reader: ({script, sha256, ledgers} or None, error or None). The
+    flags are all or nothing: once either --recovery-script or --recovery-sha256 is given, dots.json
+    `recovery` is never read, and the pair must be complete. A dots.json entry that is not usable is
+    reported, never fatal, because the dot root writes that file; a script is never loaded unpinned."""
     ledgers = dict(pairs(a.ledger or [], "ledger"))
-    src["recovery"] = "argv" if script else "none"
-    if not script and isinstance(rc.get("script"), str):
-        script, sha, src["recovery"] = rc["script"], rc.get("sha256"), "dots.json"
-        if not ledgers and isinstance(rc.get("ledgers"), dict):
-            ledgers = {k: v for k, v in rc["ledgers"].items() if isinstance(k, str) and isinstance(v, str)}
-    if not script:
-        if ledgers:
-            die("--ledger needs --recovery-script and --recovery-sha256")
-        return None
-    sha = sha.strip().lower() if isinstance(sha, str) else ""
-    if not re.fullmatch(r"[0-9a-f]{64}", sha):
-        die("--recovery-script needs --recovery-sha256 with the 64 hex characters of its sha256")
     for d in ledgers:
         token("DOT", d)
-    return {"script": os.path.abspath(os.path.expanduser(script)), "sha256": sha,
-            "ledgers": {d: os.path.abspath(os.path.expanduser(p)) for d, p in ledgers.items()}}
+    if a.recovery_script or a.recovery_sha256:
+        sha = (a.recovery_sha256 or "").strip().lower()
+        if not a.recovery_script or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            die("--recovery-script and --recovery-sha256 (64 hex characters) go together")
+        src["recovery"] = "argv"
+        script = a.recovery_script
+    else:
+        if ledgers:
+            die("--ledger needs --recovery-script and --recovery-sha256")
+        rc = cfg.get("recovery")
+        if rc is None:
+            src["recovery"] = "none"
+            return None, None
+        src["recovery"] = "dots.json"
+        rc = rc if isinstance(rc, dict) else {}
+        script, sha = rc.get("script"), rc.get("sha256")
+        sha = sha.strip().lower() if isinstance(sha, str) else ""
+        if not (isinstance(script, str) and script.strip() and re.fullmatch(r"[0-9a-f]{64}", sha)):
+            return None, "dots.json recovery needs a script and its 64-hex sha256; not used"
+        raw = rc.get("ledgers") if isinstance(rc.get("ledgers"), dict) else {}
+        ledgers = {k: v for k, v in raw.items() if isinstance(k, str) and TOKEN.match(k) and isinstance(v, str)}
+        if len(ledgers) != len(raw):
+            return None, "dots.json recovery ledgers must map dot ids to folders; not used"
+    return ({"script": os.path.abspath(os.path.expanduser(script)), "sha256": sha,
+             "ledgers": {d: os.path.abspath(os.path.expanduser(p)) for d, p in ledgers.items()}}, None)
 
 def state_path():
     return os.path.join(BASE, "watch", "state.json")
@@ -1218,17 +1230,16 @@ def heartbeat_error(path=None):
     named = path is not None
     path = path or heartbeat_path(state_path())
     if not os.path.exists(path):
-        return "watch: no heartbeat file; the watchdog has not run" if named else None
+        return "no heartbeat file; the watchdog has not run" if named else None
     beat = load_json(path)
     age = age_min(beat.get("t")) if isinstance(beat, dict) else None
     if age is None:
-        return "watch: heartbeat unreadable; the watchdog may be down"
+        return "heartbeat unreadable; the watchdog may be down"
     loop = beat.get("loop")
     loop = loop if isinstance(loop, (int, float)) and not isinstance(loop, bool) and loop > 0 else 0
     limit = max(HEARTBEAT_MIN, 3 * loop)
     if age > limit:
-        return (f"watch: last run {math.floor(age)}m ago (limit {limit:g}m, pid {beat.get('pid')}); "
-                f"the watchdog is down")
+        return f"last run {math.floor(age)}m ago (limit {limit:g}m, pid {beat.get('pid')}); the watchdog is down"
     return None
 
 def save_state(path, st, warn=None):
@@ -1281,19 +1292,27 @@ def scan_dots(scan, cfg):
     return sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)) and TOKEN.match(d)) \
         if os.path.isdir(root) else []
 
+def roster_key(dot, error):
+    """One report per roster state: the lag and the newest line it is measured against change every
+    time an agent posts, the roster's own updated_at does not."""
+    return f"{dot}|{re.sub(r' is [0-9]+m older than the newest live line .*', ' is older', error)}"
+
 def watch_board(scan, delays, st, st_path, cfg, warned):
     """The board half of the watchdog: wake an agent whose own files say it stopped (STALLED, or a
     CLAIM-STALE claim) every rewake_min, wake a blocked agent once per blocked line and report it once
     when it stays blocked past blocked_after_min, report a stale roster once per report, and report
-    VM work no recovery ledger tracks. Reads files only; the one thing it runs is the owner's idle argv."""
+    VM work no recovery ledger tracks. Reads files only; the one thing it runs is the owner's idle
+    argv. Like the mail half, a ledger record may only add a line: every ring or report it holds back
+    prints WATCH_SKIP."""
     rows, errors = board_rows(scan_dots(scan, cfg))
     seen = set()
     for r in rows if scan.idle else ():
         flags = [f for f in r["flags"] if f in ("STALLED", "CLAIM-STALE", "BLOCKED")]
-        if not flags or r["age_min"] is None:
+        if not flags:
             continue
         key = f"{r['dot']}/{r['agent']}"
         seen.add(key)
+        age = "-" if r["age_min"] is None else r["age_min"]   # a legacy-only line is STALLED with no v1 age
         mark = f"{r['task']}@{r['t']}"
         rec = st["agents"].get(key)
         if rec is None or rec.get("mark") != mark:
@@ -1301,38 +1320,50 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         blocked = "BLOCKED" in flags
         since = age_min(rec.get("ring_t"))
         # a blocker waits on someone else, so a second wake cannot clear it; a quiet worker may need several
-        due = not rec.get("ring_t") if blocked else since is None or since >= delays["rewake_min"]
+        due = not rec.get("ring_t") if blocked else since is None or since < 0 or since >= delays["rewake_min"]
+        task = json.dumps(r["task"] or "", ensure_ascii=False)
+        why = ",".join(flags)
         if due:
-            why = ",".join(flags)
-            values = {"project": r.get("project") or "", "agent": r["agent"], "dot": r["dot"],
-                      "age": r["age_min"], "task": r["task"] or "", "state": r["state"] or "", "why": why}
+            values = {"project": r.get("project") or "-", "agent": r["agent"], "dot": r["dot"],
+                      "age": age, "task": r["task"] or "-", "state": r["state"] or "-", "why": why}
             code, detail = ring(scan.idle, values)
             if code is not None:
                 rec["ring_t"] = now()
                 rec["rings"] = rec.get("rings", 0) + 1
                 save_state(st_path, st, warned)
-            print(f"WATCH_IDLE {r['dot']} {r['agent']} {why} age={r['age_min']}m state={r['state']} "
-                  f"task={json.dumps(r['task'] or '', ensure_ascii=False)} exit={detail or code}", flush=True)
-        if blocked and r["age_min"] >= delays["blocked_after_min"] and not rec.get("open_t"):
-            rec["open_t"] = now()
-            save_state(st_path, st, warned)
-            print(f"WATCH_BLOCKED_OPEN {r['dot']} {r['agent']} age={r['age_min']}m "
-                  f"task={json.dumps(r['task'] or '', ensure_ascii=False)} "
-                  f"blockers={json.dumps(r['blockers'][:3], ensure_ascii=False)}", flush=True)
+            print(f"WATCH_IDLE {r['dot']} {r['agent']} {why} age={age}{'' if age == '-' else 'm'} "
+                  f"state={r['state'] or '-'} "
+                  f"task={task} exit={detail or code}", flush=True)
+        else:
+            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=idle_already {why} ring_t={rec.get('ring_t')}",
+                  flush=True)
+        if not blocked or not isinstance(r["age_min"], int) or r["age_min"] < delays["blocked_after_min"]:
+            continue
+        if rec.get("open_t"):
+            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=blocked_open_already open_t={rec['open_t']}",
+                  flush=True)
+            continue
+        rec["open_t"] = now()
+        save_state(st_path, st, warned)
+        print(f"WATCH_BLOCKED_OPEN {r['dot']} {r['agent']} age={r['age_min']}m task={task} "
+              f"blockers={json.dumps(r['blockers'][:3], ensure_ascii=False)}", flush=True)
     for key in [k for k in st["agents"] if k not in seen]:
         del st["agents"][key]
         save_state(st_path, st, warned)
     reported = set()
-    for e in errors:
-        if not e["error"].startswith("roster.json:"):
+    for e in errors if scan.idle else ():
+        if "slot states" not in e["error"]:
+            # no live folder, a dropped slot: board shows it, so the watchdog does too
+            print(f"WATCH_ERROR board {e['dot']} {e['error']}", flush=True)
             continue
-        # the lag grows every run, so one report is keyed on the error without its minute count
-        key = f"{e['dot']}|{re.sub(r' is [0-9]+m older', ' is older', e['error'])}"
+        key = roster_key(e["dot"], e["error"])
         reported.add(key)
-        if key not in st["roster"]:
-            st["roster"][key] = {"t": now()}
-            save_state(st_path, st, warned)
-            print(f"WATCH_ROSTER_STALE {e['dot']} {e['error']}", flush=True)
+        if key in st["roster"]:
+            print(f"WATCH_SKIP {e['dot']} - reason=roster_reported t={st['roster'][key].get('t')}", flush=True)
+            continue
+        st["roster"][key] = {"t": now()}
+        save_state(st_path, st, warned)
+        print(f"WATCH_ROSTER_STALE {e['dot']} {e['error']}", flush=True)
     for key in [k for k in st["roster"] if k not in reported]:
         del st["roster"][key]
         save_state(st_path, st, warned)
@@ -1371,6 +1402,7 @@ def watch_vm(rc, rows, st, st_path, warned):
         mark = f"{r['task']}@{r['t']}"
         seen.add(key)
         if st["vm"].get(key, {}).get("mark") == mark:
+            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=vm_reported t={st['vm'][key].get('t')}", flush=True)
             continue
         root = rc["ledgers"].get(r["dot"])
         if root is None:
@@ -1386,8 +1418,13 @@ def watch_vm(rc, rows, st, st_path, warned):
         except Exception as exc:
             print(f"WATCH_ERROR recovery {r['dot']} {exc.__class__.__name__}: {exc}", flush=True)
             continue
-        jobs = jobs if isinstance(jobs, dict) else {}
-        if any(isinstance(s, dict) and s.get("phase") != "COMPLETE" for s in jobs.values()):
+        # inspect() returns {job: {..., "phase": "ACTIVE"|"PAUSED"|"COMPLETE"}}; any other shape is
+        # reported, never read as an unfinished job that would hide the report
+        if not (isinstance(jobs, dict) and all(isinstance(s, dict) and isinstance(s.get("phase"), str)
+                                               for s in jobs.values())):
+            print(f"WATCH_ERROR recovery {r['dot']} unexpected ledger shape", flush=True)
+            continue
+        if any(s["phase"] != "COMPLETE" for s in jobs.values()):
             continue
         st["vm"][key] = {"mark": mark, "t": now()}
         save_state(st_path, st, warned)
@@ -1398,6 +1435,8 @@ def watch_vm(rc, rows, st, st_path, warned):
         save_state(st_path, st, warned)
 
 def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
+    cfg = config()
+    board = scan.idle or scan.recovery
     print("WATCH_CONFIG " + " ".join(
         [f"wake={src['wake']}:{json.dumps(wake, ensure_ascii=False)}" if wake else "wake=none",
          f"notify={src['notify']}:{json.dumps(notify, ensure_ascii=False)}" if notify else "notify=none",
@@ -1407,7 +1446,11 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
          f"rewake_min={src['rewake_min']}:{delays['rewake_min']}",
          f"blocked_after_min={src['blocked_after_min']}:{delays['blocked_after_min']}",
          f"recovery={src['recovery']}" + (f":{scan.recovery['sha256'][:12]}" if scan.recovery else ""),
+         f"dots={'argv' if scan.dots else 'found'}:{','.join(scan_dots(scan, cfg)) or 'none'}" if board
+         else "dots=none",
          f"state={src['state']}:{st_path}"]), flush=True)
+    if scan.recovery_error:
+        print(f"WATCH_ERROR recovery {scan.recovery_error}", flush=True)
     if expected:
         path = os.path.abspath(__file__)
         actual = None
@@ -1421,7 +1464,6 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
         if actual != expected:
             print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual or 'unreadable'} "
                   f"path={path}", flush=True)
-    cfg = config()
     st = load_state(st_path)
     seen = set()
     dirty = False

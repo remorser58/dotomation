@@ -209,20 +209,28 @@ from the files alone:
   --notify-cmd '["notify-send","{agent}","{id}","{age}"]'`.
 - **The same run reads the board when it has an idle command.** With `--idle-cmd` (or `dots.json`
   `idle`) each run reads `board` for the dots named with `--dot`, else the configured dots, else every
-  `live/` folder, and acts on the agent's own files only:
+  `live/` folder (`WATCH_CONFIG` names them in `dots=`), and acts on the agent's own files only:
   - a `STALLED` or `CLAIM-STALE` row runs the idle argv, and again every `rewake_min` minutes while
-    the same live line stays newest; a newer line ends the record;
+    the same live line stays newest; a newer line ends the record. A row with only legacy lines
+    (`NO-LIVE STALLED`) is woken too, with `age=-`; an empty `{project}`, `{task}` or `{state}` is `-`;
   - a `BLOCKED` row runs it once per blocked line, because a second wake cannot clear a blocker
     someone else owns, and prints one `WATCH_BLOCKED_OPEN {dot} {agent} age=… task=… blockers=…` once
     the line is `blocked_after_min` old, so the owner sees the blocker instead of the agent being
     woken in a loop;
   - a roster report from `board` (stale or undated `updated_at`) prints one `WATCH_ROSTER_STALE`, keyed
-    on the report without its growing minute count;
-  - with `--recovery-script PATH --recovery-sha256 HEX --ledger DOT=DIR`, a `start` or `step` line
-    on `host=vm` in a dot whose ledger has no unfinished job prints one
-    `WATCH_VM_UNREGISTERED {dot} {agent} t=… task=…` per line. The script is hashed and loaded from
-    the same bytes, then its `inspect(root)` is called; a mismatch prints `WATCH_ERROR recovery …
-    sha256 mismatch` and none of it runs. Nothing is registered, attached or written there.
+    on the report without its growing minute count and the newest line it is measured against; any
+    other board error (`no live folder`, dropped slots) prints `WATCH_ERROR board {dot} …` every run;
+  - a ring or report the ledger holds back prints `WATCH_SKIP {dot} {agent} reason=idle_already|
+    blocked_open_already|roster_reported|vm_reported …`, as for mail, and a `ring_t` in the future is
+    treated as due.
+- **VM work no recovery ledger tracks is reported.** With `--recovery-script PATH --recovery-sha256
+  HEX --ledger DOT=DIR` (or `dots.json` `recovery`), a `start` or `step` line on `host=vm` in a dot
+  whose ledger has no unfinished job prints one `WATCH_VM_UNREGISTERED {dot} {agent} t=… task=…` per
+  line. The script is hashed and loaded from the same bytes, then its `inspect(root)` is called; a
+  mismatch prints `WATCH_ERROR recovery … sha256 mismatch` and none of it runs. Nothing is
+  registered, attached or written there. The two flags go together, and once either is given
+  `dots.json` `recovery` is not read; an unusable `dots.json` entry prints `WATCH_ERROR recovery …`
+  and the run goes on without it.
   Each ring prints `WATCH_IDLE {dot} {agent} {flags} age=… state=… task=… exit=…`, and the ledger keeps
   one record per agent, roster report and VM line, so a restart repeats none of them.
 - **The watchdog leaves a heartbeat, and `board` checks it.** Every run writes `heartbeat.json`

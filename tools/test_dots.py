@@ -1350,6 +1350,32 @@ class WatchTests(Base):
         self.assertNotIn("WATCH_ROSTER_STALE", self.idle_watch()[0])
         self.assertEqual(d.load_json(os.path.join(self.base, "watch", "state.json"))["roster"], {})
 
+    def test_a_forged_ledger_record_never_hides_a_ring_in_silence(self):
+        self.live("blocked", 200)
+        self.live("step", 60, agent="agent-3")
+        self.live("step", 0, agent="agent-4", host="vm")
+        lines = {a: json.loads(read(os.path.join(self.base, "live", "DOT-A", f"{a}.jsonl")).splitlines()[-1])
+                 for a in ("agent-2", "agent-3", "agent-4")}
+        future = d.iso_after(86400)
+        st = {"v": 1, "agents": {
+            "DOT-A/agent-2": {"mark": f"issue 1@{lines['agent-2']['t']}", "ring_t": d.now(), "open_t": d.now()},
+            "DOT-A/agent-3": {"mark": f"issue 1@{lines['agent-3']['t']}", "ring_t": future}},
+              "vm": {"DOT-A/agent-4": {"mark": f"issue 1@{lines['agent-4']['t']}", "t": d.now()}}}
+        os.makedirs(os.path.join(self.base, "watch"), exist_ok=True)
+        d.write_atomic(os.path.join(self.base, "watch", "state.json"), json.dumps(st) + "\n")
+        out, rings = self.idle_watch(*self.recovery({}))
+        self.assertIn("WATCH_SKIP DOT-A agent-2 reason=idle_already", out)
+        self.assertIn("WATCH_SKIP DOT-A agent-2 reason=blocked_open_already", out)
+        self.assertIn("WATCH_SKIP DOT-A agent-4 reason=vm_reported", out)
+        self.assertEqual(rings, ["DOT-A agent-3 STALLED issue 1"])   # a future ring_t is due, not a mute
+
+    def test_an_agent_with_only_legacy_lines_is_still_woken(self):
+        with open(os.path.join(self.base, "live", "DOT-A", "agent-9.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": d.iso_after(-5400), "agent": "agent-9", "state": "step"}) + "\n")
+        out, rings = self.idle_watch()
+        self.assertIn("WATCH_IDLE DOT-A agent-9 STALLED age=- state=-", out)
+        self.assertEqual(rings, ["DOT-A agent-9 STALLED -"])
+
     def recovery(self, jobs):
         """A pinned stand-in for the recovery reader: inspect(root) returns root/jobs.json."""
         ledger = os.path.join(self.base, "ledger")
@@ -1375,6 +1401,26 @@ class WatchTests(Base):
         res = run(["watch", "--dot", "DOT-A", *flags], self.base)
         self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
         self.assertNotIn("WATCH_ERROR", res.stdout)
+        self.recovery({"j": {"status": "COMPLETE"}})   # a shape it cannot read is reported, not taken as open
+        self.live("step", 0, host="vm", task="issue 3")
+        res = run(["watch", "--dot", "DOT-A", *flags], self.base)
+        self.assertIn("WATCH_ERROR recovery DOT-A unexpected ledger shape", res.stdout)
+        self.assertNotIn("WATCH_VM_UNREGISTERED", res.stdout)
+
+    def test_recovery_flags_never_mix_with_dots_json(self):
+        self.live("step", 0, host="vm")
+        flags = self.recovery({})
+        self.config_with(recovery={"script": flags[1], "sha256": flags[3], "ledgers": {"DOT-A": flags[5][6:]}})
+        res = run(["watch", "--dot", "DOT-A", "--recovery-sha256", flags[3]], self.base)
+        self.assertEqual(res.returncode, 2)   # half a pin is refused, never completed from dots.json
+        self.assertIn("go together", res.stderr)
+        self.assertIn("WATCH_VM_UNREGISTERED", run(["watch", "--dot", "DOT-A"], self.base).stdout)
+        self.config_with(recovery={"script": flags[1], "sha256": "nope"})
+        res = run(["watch", "--dot", "DOT-A"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)   # the root's file cannot stop the watchdog
+        self.assertIn("recovery=dots.json ", res.stdout)
+        self.assertIn("WATCH_ERROR recovery dots.json recovery needs", res.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.base, "watch", "heartbeat.json")))
 
     def test_a_changed_recovery_script_is_never_run(self):
         self.live("step", 0, host="vm")
@@ -1395,12 +1441,12 @@ class WatchTests(Base):
         beat = os.path.join(self.base, "watch", "heartbeat.json")
         d.write_atomic(beat, json.dumps({"t": d.iso_after(-3600), "pid": 1, "loop": 5}) + "\n")
         errs = [e["error"] for e in board() if e["dot"] == "watch"]
-        self.assertTrue(errs and errs[0].startswith("watch: last run 60m ago (limit 15m"), errs)
+        self.assertTrue(errs and errs[0].startswith("last run 60m ago (limit 15m"), errs)
         d.write_atomic(beat, json.dumps({"t": d.iso_after(-3600), "pid": 1, "loop": 30}) + "\n")
         self.assertEqual([e for e in board() if e["dot"] == "watch"], [])   # within three loops
         errs = [e["error"] for e in board("--heartbeat", os.path.join(self.base, "nope.json"))
                 if e["dot"] == "watch"]
-        self.assertEqual(errs, ["watch: no heartbeat file; the watchdog has not run"])
+        self.assertEqual(errs, ["no heartbeat file; the watchdog has not run"])
 
     def test_the_idle_command_line_beats_dots_json(self):
         self.config_with(idle=["/usr/bin/false"], watch={"rewake_min": 100000})
