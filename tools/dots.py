@@ -88,7 +88,7 @@ import sys
 if __name__ == "__main__" and sys.path:
     del sys.path[0]
 
-import argparse, contextlib, datetime, fcntl, glob, hashlib, json, os, re, secrets, signal, socket, stat, subprocess, time
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, math, os, re, secrets, signal, socket, stat, subprocess, time
 
 def default_base():
     env = os.environ.get("DOTS_OPS_BASE")
@@ -568,9 +568,11 @@ def board_rows(dots):
             errors.append({"dot": dot, "error": "no live folder"})
             continue
         mem_dir = os.path.join(BASE, "memory", dot)
-        roster, dropped = roster_states(load_json(os.path.join(live_dir, "roster.json")))
+        roster_doc = load_json(os.path.join(live_dir, "roster.json"))
+        roster, dropped = roster_states(roster_doc)
         if dropped:
             errors.append({"dot": dot, "error": f"roster.json: {dropped} slot(s) without a valid agent id skipped"})
+        newest = None   # (t, agent) of the dot's newest live line, to judge the roster's own age
         names = list(roster)
         names += sorted(f[:-6] for f in os.listdir(live_dir) if f.endswith(".jsonl") and f[:-6] not in names and TOKEN.match(f[:-6]))
         if os.path.isdir(mem_dir):
@@ -591,7 +593,10 @@ def board_rows(dots):
                 flags.append("BLOCKED")
             elif last["state"] in ("start", "step") and age is not None and age > STALL_MIN:
                 flags.append("STALLED")
-            if last and (not mem or mem.get("task") != last["task"]
+            if last and (newest is None or (parse_t(last["t"]) or last_t_min()) > newest[0]):
+                newest = (parse_t(last["t"]) or last_t_min(), agent)
+            # a memory is owed while the agent works or is blocked; a finished agent owes none
+            if last and last["state"] != "done" and (not mem or mem.get("task") != last["task"]
                          or (parse_t(mem.get("t")) or last_t_min()) < parse_t(last["t"])):
                 flags.append("MEMO-BEHIND" if mem else "NO-MEMO")
             mail = {"new": 0, "unanswered": 0, "waiting": 0, "oldest_waiting_min": None, "unread_out": 0}
@@ -621,7 +626,26 @@ def board_rows(dots):
                          "doing": (mem or {}).get("doing"), "next": (mem or {}).get("next"),
                          "blockers": (mem or {}).get("blockers") or [], "mail": mail if boxes else None,
                          "claim_stale": claim, "flags": flags})
+        stale = roster_behind(roster_doc, newest)
+        if stale:
+            errors.append({"dot": dot, "error": stale})
     return rows, errors
+
+def roster_behind(roster_doc, newest):
+    """A roster the coordinator stopped rewriting: its updated_at is more than STALL_MIN older than the
+    dot's newest live line. Its slot states then describe an earlier round, so a hold or an await read
+    from it is not current. Returns the report line, or None."""
+    if not isinstance(roster_doc, dict) or newest is None:
+        return None
+    upd = parse_t(roster_doc.get("updated_at"))
+    if upd is None:
+        return "roster.json: no valid updated_at, so its slot states cannot be dated"
+    lag = (newest[0] - upd).total_seconds() / 60
+    if lag <= STALL_MIN:
+        return None
+    newest_utc = newest[0].astimezone(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return (f"roster.json: updated_at {roster_doc.get('updated_at')} is {math.ceil(lag)}m older than the newest "
+            f"live line ({newest[1]} {newest_utc}); its slot states are stale")
 
 def claim_stale(last, waiting, roster_state):
     """A claim the evidence disproves, from the files only. The roster is the root's word and is
