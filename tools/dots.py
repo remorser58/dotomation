@@ -76,11 +76,14 @@ Owner side (the dot root is not trusted):
       unfinished job is printed once as WATCH_VM_UNREGISTERED. Lines: WATCH_IDLE, WATCH_BLOCKED_OPEN,
       WATCH_ROSTER_STALE, WATCH_VM_UNREGISTERED. Every run writes heartbeat.json beside the ledger;
       `board` reports it when it is older than max(15 minutes, three loops).
-      --keep-full DOT (repeatable, command line only) tracks that roster's free/total slots.
-      After --fill-after-min (default 30) with free slots, WATCH_UNDERFILLED runs --idle-cmd
-      for its coordinator, again every --rewake-min while underfilled. WATCH_FILLED ends the
-      episode once; the ledger keeps the first observation across restarts. Board reports counts
-      even without monitoring. Unknown counts are not proof of a full roster.
+      --keep-full DOT (repeatable, command line only) tracks free slots: unassigned plus parked.
+      Parked means a roster actor occupies a slot but has a blocked*, awaits*, *_hold, waiting
+      or idle slot_state. After --fill-after-min (default 10), WATCH_UNDERFILLED lists the parked
+      actors and runs --idle-cmd for the coordinator, not for those actors. Repeats every
+      --rewake-min while underfilled (keep-full default 10; ordinary idle-wake default still 120).
+      WATCH_FILLED ends the episode once; the ledger keeps the first observation across restarts.
+      Board shows free, unassigned, parked and total counts even without monitoring. No roster
+      or hold is changed, and unknown counts are not proof of a full roster.
 
 Setup (once per machine; idempotent, adds only):
   dots.py init [--base DIR] [--dot ID]... [--project ID=MAIN]... [--host LABEL=PURPOSE]...
@@ -665,18 +668,40 @@ def roster_capacity(roster):
             free = total - used
     return (free, total) if 0 <= free <= total else (None, None)
 
+def roster_slot_summary(roster):
+    unassigned, total = roster_capacity(roster)
+    actors = (roster or {}).get("actors")
+    parked, other = set(), set()
+    for actor in actors if isinstance(actors, list) else ():
+        if not isinstance(actor, dict):
+            continue
+        name = actor.get("agent") or actor.get("agent_id") or actor.get("id")
+        if not isinstance(name, str) or not TOKEN.fullmatch(name):
+            continue
+        state = actor.get("slot_state")
+        if actor.get("occupies_slot") is True and isinstance(state, str) and (
+                state.startswith(("blocked", "awaits")) or state.endswith("_hold")
+                or state in ("waiting", "idle")):
+            parked.add(name)
+        else:
+            other.add(name)
+    names = sorted(parked - other)  # repeated ids are one slot; conflicting claims do not park it
+    if unassigned is None or len(names) > total - unassigned:
+        return {"free": None, "unassigned": unassigned, "total": total, "parked": None, "parked_agents": []}
+    return {"free": unassigned + len(names), "unassigned": unassigned, "total": total,
+            "parked": len(names), "parked_agents": names}
+
 def board_rows(dots):
     rows, errors, slots = [], [], {}
     for dot in dots:
-        slots[dot] = {"free": None, "total": None}
         live_dir = os.path.join(BASE, "live", dot)
         if not os.path.isdir(live_dir):
+            slots[dot] = roster_slot_summary(None)
             errors.append({"dot": dot, "error": "no live folder"})
             continue
         mem_dir = os.path.join(BASE, "memory", dot)
         roster_doc = load_json(os.path.join(live_dir, "roster.json"))
-        free, total = roster_capacity(roster_doc)
-        slots[dot] = {"free": free, "total": total}
+        slots[dot] = roster_slot_summary(roster_doc)
         roster, dropped = roster_states(roster_doc)
         if dropped:
             errors.append({"dot": dot, "error": f"roster.json: {dropped} slot(s) without a valid agent id skipped"})
@@ -802,8 +827,9 @@ def board(a):
         return
     print(f"board {now()}  stall>{STALL_MIN}min")
     for dot, count in slots.items():
-        free, total = count["free"], count["total"]
-        print(f"{dot} slots free={free if free is not None else '?'} total={total if total is not None else '?'}")
+        values = " ".join(f"{k}={count[k] if count[k] is not None else '?'}"
+                          for k in ("free", "total", "unassigned", "parked"))
+        print(f"{dot} slots {values}")
     for e in errors:
         print(f"{e['dot']}: {e['error']}")
     for r in rows:
@@ -1274,8 +1300,10 @@ def watch_settings(a, cfg):
         token("DOT", d)
     if a.fill_after_min is not None and a.fill_after_min < 0:
         die("--fill-after-min takes minutes, 0 or more")
-    delays["fill_after_min"] = 30 if a.fill_after_min is None else a.fill_after_min
+    delays["fill_after_min"] = 10 if a.fill_after_min is None else a.fill_after_min
     src["fill_after_min"] = "default" if a.fill_after_min is None else "argv"
+    src["keep_full_rewake_min"] = src["rewake_min"]
+    delays["keep_full_rewake_min"] = 10 if src["rewake_min"] == "default" else delays["rewake_min"]
     scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=recovery_settings(a, src),
                                  keep_full=list(dict.fromkeys(a.keep_full or [])))
     return wake, notify, delays, path, src, scan
@@ -1480,7 +1508,8 @@ def watch_capacity(scan, delays, st, st_path, warned):
     """Track each explicitly named dot independently of board discovery, with a durable episode start."""
     for dot in scan.keep_full:
         roster = load_json(os.path.join(BASE, "live", dot, "roster.json"))
-        free, total = roster_capacity(roster)
+        summary = roster_slot_summary(roster)
+        free, total = summary["free"], summary["total"]
         if free is None:
             print(f"WATCH_ERROR keep-full {dot} unknown slot counts", flush=True)
             continue  # an unreadable roster is not a recovery
@@ -1504,10 +1533,12 @@ def watch_capacity(scan, delays, st, st_path, warned):
             print(f"WATCH_ERROR keep-full {dot} invalid coordinator", flush=True)
             continue
         since_ring = age_min(rec.get("ring_t"))
-        if since_ring is not None and 0 <= since_ring < delays["rewake_min"]:
+        if since_ring is not None and 0 <= since_ring < delays["keep_full_rewake_min"]:
             print(f"WATCH_SKIP {dot} reason=fill_rewake ring_t={rec['ring_t']}", flush=True)
             continue
-        print(f"WATCH_UNDERFILLED {dot} free={free} total={total} age={int(age)}m coordinator={coordinator}",
+        names = ",".join(summary["parked_agents"]) or "-"
+        print(f"WATCH_UNDERFILLED {dot} free={free} total={total} age={int(age)}m coordinator={coordinator} "
+              f"parked={summary['parked']} parked_agents={names}",
               flush=True)
         code, detail = ring(scan.idle, {"dot": dot, "agent": coordinator, "age": int(age), "why": "UNDERFILLED",
                                         "project": "-", "task": "keep-full", "state": "underfilled"})
@@ -1596,6 +1627,7 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallb
          f"blocked_after_min={src['blocked_after_min']}:{delays['blocked_after_min']}",
          f"keep_full={'argv:' + ','.join(scan.keep_full) if scan.keep_full else 'none'}",
          f"fill_after_min={src['fill_after_min']}:{delays['fill_after_min']}",
+         f"keep_full_rewake_min={src['keep_full_rewake_min']}:{delays['keep_full_rewake_min']}",
          f"recovery={src['recovery']}" + (f":{scan.recovery['sha256'][:12]}" if scan.recovery else ""),
          f"dots={'argv' if scan.dots else 'found'}:{','.join(scan_dots(scan, cfg)) or 'none'}" if board
          else "dots=none",
@@ -2344,7 +2376,7 @@ def main(argv):
                    help='argv list as JSON run for a STALLED, CLAIM-STALE or BLOCKED board row; placeholders '
                         '{dot} {agent} {project} {task} {state} {age} {why}; command line only, never dots.json')
     c.add_argument("--rewake-min", dest="rewake_min", type=int,
-                   help="minutes between idle wakes of the same quiet task (wins over dots.json; default 120)")
+                   help="minutes between repeats (wins over dots.json; default 10 for keep-full, 120 otherwise)")
     c.add_argument("--blocked-after-min", dest="blocked_after_min", type=int,
                    help="minutes a blocked line stays before one WATCH_BLOCKED_OPEN (wins over dots.json; default 120)")
     c.add_argument("--dot", action="append", default=[],
@@ -2352,7 +2384,7 @@ def main(argv):
     c.add_argument("--keep-full", action="append", metavar="DOT",
                    help="report free slots and ring the roster coordinator via --idle-cmd; repeatable, CLI only")
     c.add_argument("--fill-after-min", type=int,
-                   help="minutes of observed free slots before WATCH_UNDERFILLED; CLI only (default 30)")
+                   help="minutes of observed free slots before WATCH_UNDERFILLED; CLI only (default 10)")
     c.add_argument("--recovery-script", dest="recovery_script",
                    help="recovery ledger reader with inspect(root); loaded only when its sha256 matches")
     c.add_argument("--recovery-sha256", dest="recovery_sha256", help="sha256 of --recovery-script")
