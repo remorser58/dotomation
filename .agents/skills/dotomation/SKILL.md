@@ -11,7 +11,7 @@ Start at [dispatch](../../../workflows/dispatch.md#confirm-the-run-and-target): 
 
 ## Start with the observable outcome
 
-Name a coordinator (the root), one writer per output and a verifier distinct from its writer. Keep one `work_id` per approved intent. An owner correction to the same intent increments the shared `revision` through a new coordinator brief; it does not create a competing writer. A distinct request gets its own ID. Include the fixed **kit commit**, authorized action/surface, exclusions, deliverable, named participants and a non-empty checklist of mandatory gates. Each gate needs a unique ID and an observable pass condition.
+Name a coordinator (a separate `ultra` agent; the root only assigns, relays and checks), one writer per output and a verifier distinct from its writer. Keep one `work_id` per approved intent. An owner correction to the same intent increments the shared `revision` through a new coordinator brief; it does not create a competing writer. A distinct request gets its own ID. Include the fixed **kit commit**, authorized action/surface, exclusions, deliverable, named participants and a non-empty checklist of mandatory gates. Each gate needs a unique ID and an observable pass condition.
 
 A native message can use plain language: the essential fields are those in the [v1 schema](../../../protocol/handoff-v1.schema.json). The parties must still agree on identities and the fixed version. If a recipient cannot open the kit, include its bounded operating rules in the brief and label the pin as not independently loaded, rather than claiming it was installed.
 

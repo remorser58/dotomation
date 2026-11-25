@@ -16,8 +16,8 @@ jobs:
       matrix:
         python: ['3.9', '3.12']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python }}
       - name: Verify release tag
@@ -42,11 +42,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Publish release assets
         env:
           TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum tools/dots.py | sed 's#tools/##' > tools/dots.py.sha256
-          gh release create "$TAG" tools/dots.py tools/dots.py.sha256 --generate-notes
+          # a re-run after a failed upload finds the release already there: create it only once,
+          # then upload (or replace) both assets so the pair always matches this commit
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+          gh release upload "$TAG" tools/dots.py tools/dots.py.sha256 --clobber

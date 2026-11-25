@@ -108,7 +108,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 VERSION_LINE = re.compile(rb'^VERSION = "([0-9]+(?:\.[0-9]+)+)"\r?$', re.MULTILINE)
 UPDATE_API = "https://api.github.com/repos/remorser58/dotomation/releases/latest"
 UPDATE_LIMIT = 2 * 1024 * 1024
@@ -123,6 +123,8 @@ def default_base():
 BASE = default_base()
 TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ID = re.compile(r"^m-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$")
+RFC3339 = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+                     r"(\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$")
 STATES = ("start", "step", "blocked", "done")
 FIELDS = ("t", "agent", "role", "model", "project", "task", "state", "host", "note", "evidence")
 MAIL_FIELDS = ("v", "id", "t", "from", "to", "task", "kind", "re", "text", "refs")
@@ -304,9 +306,19 @@ def jsonl(path):
     skipped_lines(path, skipped)
     return out
 
+def one_line(value, limit=None):
+    """A non-empty single-line string within limit: the schema's line and item shape."""
+    return (isinstance(value, str) and bool(value.strip()) and "\n" not in value and "\r" not in value
+            and (limit is None or len(value) <= limit))
+
+def is_v1(x):
+    """The live-record-v1 schema: ten non-empty single-line strings, a token agent, an RFC 3339 t."""
+    return (set(x) == set(FIELDS) and all(one_line(x[f]) for f in FIELDS) and x["state"] in STATES
+            and bool(TOKEN.match(x["agent"])) and bool(RFC3339.match(x["t"])) and parse_t(x["t"]) is not None)
+
 def v1_lines(path):
     """Live lines that are live-record-v1 shaped; legacy lines are left out, never repaired."""
-    return [x for x in jsonl(path) if set(x) == set(FIELDS) and x.get("state") in STATES and parse_t(x.get("t"))]
+    return [x for x in jsonl(path) if is_v1(x)]
 
 def legacy_t(path):
     """Newest time on a non-v1 line (t, timestamp, time, at, datetime), for the legacy stall clock only."""
@@ -356,16 +368,33 @@ def marker(path):
 
 def after(msgs, last):
     """Lines after the marker id. A duplicate id already on disk resolves to its last occurrence,
-    so a marker can never stop short of a later line that repeats it."""
+    so a marker can never stop short of a later line that repeats it. No marker yet means every line:
+    a hand-written line with no id must not stand in for the marker and hide the lines before it."""
     ids = [m.get("id") for m in msgs]
-    return msgs if last not in ids else msgs[len(ids) - ids[::-1].index(last):]
+    return msgs if not last or last not in ids else msgs[len(ids) - ids[::-1].index(last):]
 
 def project_of(box):
     return os.path.basename(os.path.dirname(os.path.dirname(box)))
 
+def base_glob(*parts):
+    """Glob under the base. The base is a user path and may hold `[`, `]` or `?`, so it is escaped
+    here; each caller escapes its own variable part."""
+    return glob.glob(os.path.join(glob.escape(BASE), *parts))
+
+def ensure_dir(path):
+    """Create a folder the tool writes into, or exit 2 when the root left a file in its place."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        die(f"cannot create {path} ({exc.__class__.__name__})")
+
+def str_list(value):
+    """The strings of a list read from a root-writable file; any other shape is no items."""
+    return [x for x in value if isinstance(x, str)] if isinstance(value, list) else []
+
 def mailboxes(agent):
     token("agent", agent)
-    return sorted(d for d in glob.glob(os.path.join(BASE, "*", "mail", glob.escape(agent))) if os.path.isdir(d))
+    return sorted(d for d in base_glob("*", "mail", glob.escape(agent)) if os.path.isdir(d))
 
 def answered_ids(outbox):
     """Ids that a line in `outbox` answers. Only a string `re` can match an inbox id, so a line the
@@ -392,7 +421,7 @@ def unread_upto(box, took):
     """Unread messages in one box, minus the ones this tick is marking read with --took."""
     msgs = mail_state(box)["new"]
     ids = [m.get("id") for m in msgs]
-    return msgs[len(ids) - ids[::-1].index(took):] if took in ids else msgs
+    return msgs[len(ids) - ids[::-1].index(took):] if took and took in ids else msgs
 
 def unread_all(agent):
     """(box, project, message) for every unread line in every mailbox of that agent id."""
@@ -408,14 +437,20 @@ def waiting_on(box):
 def write_atomic(path, data):
     """Replace `path` with `data` through a temp file beside it. The temp name is opened non-blocking
     on purpose: a FIFO planted at that name would otherwise hold the open until a reader appears, and
-    a failed open is reported as the OSError the callers already handle."""
+    a failed open is reported as the OSError the callers already handle. A failed write or rename
+    removes the temp file, so a refused path leaves nothing behind."""
     tmp = f"{path}.tmp.{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK, 0o666)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 def append_fd(path):
     """A descriptor to append one line through, or exit 2. O_NONBLOCK on top of O_APPEND is what makes
@@ -511,10 +546,13 @@ def tick_locked(a, dot, agent, live_dir):
     for f, limit in (("goal", MAX_TEXT), ("doing", MAX_TEXT), ("next", MAX_TEXT)):
         v = getattr(a, f) or (prev.get(f) if same_task else None)
         mem[f] = text(f, v, limit)
-    decisions = [d for d in (prev.get("decisions") if same_task else None) or [] if isinstance(d, dict)]
+    # carried values come from a root-writable file: keep only the memory-v1 shapes, drop the rest
+    decisions = [d for d in (prev.get("decisions") if same_task else None) or []
+                 if isinstance(d, dict) and set(d) == {"t", "text"} and isinstance(d["t"], str)
+                 and parse_t(d["t"]) is not None and one_line(d["text"], MAX_ITEM)]
     decisions += [{"t": line["t"], "text": text("decision", d, MAX_ITEM)} for d in a.decision]
     mem["decisions"] = decisions[-MAX_DECISIONS:]
-    blockers = [] if a.unblock or not same_task else [b for b in prev.get("blockers") or [] if isinstance(b, str)]
+    blockers = [] if a.unblock or not same_task else [b for b in str_list(prev.get("blockers")) if one_line(b, MAX_ITEM)]
     for b in a.blocker:
         b = text("blocker", b, MAX_ITEM)
         if b not in blockers:
@@ -548,11 +586,16 @@ def tick_locked(a, dot, agent, live_dir):
     # Read before the write: this is the mail that arrived since the agent's last tick.
     steer = [(project_of(box), m) for box in boxes for m in unread_upto(box, a.took)]
 
-    os.makedirs(mem_dir, exist_ok=True)
+    ensure_dir(mem_dir)
     append_line(live_path, line)
     write_atomic(mem_path, json.dumps(mem, ensure_ascii=False, indent=1) + "\n")
     if took_box:
-        write_atomic(os.path.join(took_box, ".agent-read"), a.took + "\n")
+        try:
+            write_atomic(os.path.join(took_box, ".agent-read"), a.took + "\n")
+        except OSError as exc:
+            # the step is already recorded; the mail stays unread and the next tick shows it again
+            print(f"dots: cannot mark {took_box} read ({exc.__class__.__name__}); it stays unread",
+                  file=sys.stderr)
     if steer:
         print(f"MAIL_FIRST {len(steer)} unread for {agent} — handle these before your next step")
         for project, m in steer:
@@ -651,7 +694,7 @@ def board_rows(dots):
                          "age_min": None if age is None else round(age), "task": last["task"] if last else None,
                          "host": last["host"] if last else None,
                          "doing": (mem or {}).get("doing"), "next": (mem or {}).get("next"),
-                         "blockers": (mem or {}).get("blockers") or [], "mail": mail if boxes else None,
+                         "blockers": str_list((mem or {}).get("blockers")), "mail": mail if boxes else None,
                          "claim_stale": claim, "flags": flags})
         stale = roster_behind(roster_doc, newest)
         if stale:
@@ -705,7 +748,10 @@ def clip(s, n=110):
 
 def board(a):
     live_root = os.path.join(BASE, "live")
-    dots = a.dots or sorted(d for d in os.listdir(live_root) if os.path.isdir(os.path.join(live_root, d)))
+    # a configured dot whose live folder is gone is reported as "no live folder", not left out
+    found = (d for d in os.listdir(live_root) if os.path.isdir(os.path.join(live_root, d)) and TOKEN.match(d)) \
+        if os.path.isdir(live_root) else ()
+    dots = a.dots or sorted(set(found) | set(configured_dots()))
     for d in dots:
         token("DOT", d)
     rows, errors = board_rows(dots)
@@ -770,7 +816,7 @@ def configured_dots(cfg=None):
 def last_tick(agent):
     """(datetime, dot) of the agent's newest v1 live line in any dot, or None."""
     best = None
-    for path in glob.glob(os.path.join(BASE, "live", "*", glob.escape(agent) + ".jsonl")):
+    for path in base_glob("live", "*", glob.escape(agent) + ".jsonl"):
         lines = v1_lines(path)
         if not lines:
             continue
@@ -798,7 +844,7 @@ def marker_paths(agent):
     """Every `wait` marker for that agent: one file per waiting process, so two waiters never collide.
     Only `<agent>.<digits>.json` matches, so a dotted id such as `agent-1.x` never shadows `agent-1`."""
     exact = re.compile(re.escape(agent) + r"\.[0-9]+\.json\Z")
-    return sorted(p for p in glob.glob(os.path.join(BASE, "listen", glob.escape(agent) + ".*.json"))
+    return sorted(p for p in base_glob("listen", glob.escape(agent) + ".*.json")
                   if exact.match(os.path.basename(p)))
 
 def marker_live(m):
@@ -871,11 +917,11 @@ def mail_line(project, agent, kind, task, re_id, refs, body, sender):
 def mail_box(project, agent, create=False):
     box = os.path.join(BASE, project, "mail", agent)
     if create:
-        os.makedirs(box, exist_ok=True)
+        ensure_dir(box)
     return box
 
 def project_dirs():
-    return sorted(os.path.basename(os.path.dirname(d)) for d in glob.glob(os.path.join(BASE, "*", "mail")) if os.path.isdir(d))
+    return sorted(os.path.basename(os.path.dirname(d)) for d in base_glob("*", "mail") if os.path.isdir(d))
 
 def send(a):
     project, agent = token("project", a.project), token("agent", a.agent)
@@ -977,7 +1023,10 @@ def read(a):
     box = mail_box(project, agent)
     if mid not in [m.get("id") for m in jsonl(os.path.join(box, "out.jsonl"))]:
         die(f"{mid} is not in {project}/mail/{agent}/out.jsonl")
-    write_atomic(os.path.join(box, ".main-read"), mid + "\n")
+    try:
+        write_atomic(os.path.join(box, ".main-read"), mid + "\n")
+    except OSError as exc:
+        die(f"cannot mark {project}/{agent} read ({exc.__class__.__name__}); it stays unread")
     print(f"READ {project}/{agent} {mid}")
 
 def reply(a):
@@ -1008,7 +1057,7 @@ def reply(a):
         if not dot:
             die(f"no dot for {agent}: pass --dot (no live/ folder names it)")
     new_box = not os.path.isdir(box)
-    os.makedirs(box, exist_ok=True)   # a first result may be the first line in this mailbox
+    ensure_dir(box)   # a first result may be the first line in this mailbox
     msg = mail_line(project, agent, a.kind, task, re_id, refs, body, agent)
     append_unique(os.path.join(box, "out.jsonl"), msg)
     print(msg["id"], flush=True)
@@ -1260,7 +1309,7 @@ def owed_mail():
     mail folders only: no roster, no live line and no dots.json entry decides what is listed. A line
     is owed until an out.jsonl line answers it, whether or not it was marked read."""
     out = []
-    for box in sorted(glob.glob(os.path.join(BASE, "*", "mail", "*"))):
+    for box in sorted(base_glob("*", "mail", "*")):
         agent = os.path.basename(box)
         if not (os.path.isdir(box) and TOKEN.match(agent)):
             continue
@@ -1509,6 +1558,11 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
             print(f"WATCH_HELD {project} {agent} {mid} age={round(age)}m pid={held.get('pid')} "
                   f"host={held.get('host') or '-'} until={held.get('until') or '-'} "
                   f"read={'no' if unread_in(box, mid) else 'yes'}", flush=True)
+            if not rec.get("held_t"):
+                # a marker the root can forge must not keep the owner from ever being told: the
+                # notify clock starts at the first WATCH_HELD as it would at a wake
+                rec["held_t"] = now()
+                save_state(st_path, st, ledger_warned)
         if held is None and age >= delays["after_min"]:
             if rec.get("wake_t"):
                 # the ledger, not the evidence, is why no wake runs: say so, then go on to notify
@@ -1526,18 +1580,27 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
                         save_state(st_path, st, ledger_warned)
                     print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
                           f"exit={detail or code}", flush=True)
-        if not rec.get("wake_t"):
+        starts = [(k, rec[k]) for k in ("wake_t", "held_t") if rec.get(k)]
+        if not starts:
             continue
-        since = age_min(rec["wake_t"])
-        if since is None or since < delays["notify_after_min"]:
+        ages_since = {k: age_min(v) for k, v in starts}
+        bad = [(k, v) for k, v in starts if ages_since[k] is None or ages_since[k] < 0]
+        if bad:
+            # the ledger may not hold the notify back with a time that is no age: say so, and treat
+            # the notify as due, the rule the idle half applies to its own ring time
+            for k, v in bad:
+                print(f"WATCH_ERROR {project} {agent} {mid} unusable {k}={v!r}; notify is due", flush=True)
+        elif max(ages_since.values()) < delays["notify_after_min"]:
+            # the earlier of the wake and the first WATCH_HELD starts the clock
             continue
+        since = ages_since.get("wake_t")
         # A message is owed until it is answered, read or not. A read marker lives in the same folder
         # as the mail, so it can add a visible event here, never silence this one.
         if not unread_in(box, mid) and not rec.get("stuck_t"):
             rec["stuck_t"] = now()
             save_state(st_path, st, ledger_warned)
             print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
-                  f"wake_t={rec['wake_t']}", flush=True)
+                  f"wake_t={rec.get('wake_t') or '-'}", flush=True)
         if rec.get("notify_t"):
             print(f"WATCH_SKIP {project} {agent} {mid} reason=notify_already notify_t={rec['notify_t']}",
                   flush=True)
@@ -1551,8 +1614,10 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
         if code is not None:
             rec["notify_t"] = now()
             save_state(st_path, st, ledger_warned)
-        print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={round(since)}m "
-              f"read={'no' if unread_in(box, mid) else 'yes'} exit={detail or code}", flush=True)
+        after_wake = "-" if since is None or since < 0 else round(since)
+        print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={after_wake}m "
+              f"read={'no' if unread_in(box, mid) else 'yes'} held={'yes' if held else 'no'} "
+              f"exit={detail or code}", flush=True)
     if dirty:
         save_state(st_path, st, ledger_warned)   # first sight is a ledger write: a vanished line must resolve, not vanish
     for mid, rec in sorted(st["messages"].items()):
