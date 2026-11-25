@@ -108,7 +108,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 VERSION_LINE = re.compile(rb'^VERSION = "([0-9]+(?:\.[0-9]+)+)"\r?$', re.MULTILINE)
 UPDATE_API = "https://api.github.com/repos/remorser58/dotomation/releases/latest"
 UPDATE_LIMIT = 2 * 1024 * 1024
@@ -168,6 +168,14 @@ def parse_t(s):
     except ValueError:
         return None
     return t if t.tzinfo else None
+
+def rfc_time(s):
+    """Parse a schema date-time; older Pythons only accept 3 or 6 fraction digits."""
+    if not isinstance(s, str) or not RFC3339.fullmatch(s):
+        return None
+    s = re.sub(r"\.([0-9]+)", lambda m: "." + m[1][:6].ljust(6, "0"), s)
+    return parse_t(s)
+
 
 def age_min(s):
     t = parse_t(s)
@@ -547,9 +555,10 @@ def tick_locked(a, dot, agent, live_dir):
         v = getattr(a, f) or (prev.get(f) if same_task else None)
         mem[f] = text(f, v, limit)
     # carried values come from a root-writable file: keep only the memory-v1 shapes, drop the rest
-    decisions = [d for d in (prev.get("decisions") if same_task else None) or []
-                 if isinstance(d, dict) and set(d) == {"t", "text"} and isinstance(d["t"], str)
-                 and parse_t(d["t"]) is not None and one_line(d["text"], MAX_ITEM)]
+    prior = prev.get("decisions") if same_task else None
+    decisions = [d for d in prior if isinstance(d, dict) and set(d) == {"t", "text"}
+                 and rfc_time(d["t"]) is not None and one_line(d["text"], MAX_ITEM)
+                 ] if isinstance(prior, list) else []
     decisions += [{"t": line["t"], "text": text("decision", d, MAX_ITEM)} for d in a.decision]
     mem["decisions"] = decisions[-MAX_DECISIONS:]
     blockers = [] if a.unblock or not same_task else [b for b in str_list(prev.get("blockers")) if one_line(b, MAX_ITEM)]
@@ -1302,7 +1311,12 @@ def save_state(path, st, warn=None):
         if warn is not None and path not in warn:
             warn.add(path)
             print(f"dots: cannot write the ledger {path} ({exc.__class__.__name__}); "
-                  f"every run rings again until it is writable", file=sys.stderr)
+                  "state is process-local; on restart every run rings again until it is writable",
+                  file=sys.stderr, flush=True)
+        return False
+    if warn is not None:
+        warn.discard(path)
+    return True
 
 def owed_mail():
     """(project, agent, box, message) for every inbox line that still owes an answer, read from the
@@ -1491,7 +1505,7 @@ def watch_vm(rc, rows, st, st_path, warned, scope):
         del st["vm"][key]
         save_state(st_path, st, warned)
 
-def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
+def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallback=None, ledger_warned=None):
     cfg = config()
     board = scan.idle or scan.recovery
     print("WATCH_CONFIG " + " ".join(
@@ -1519,11 +1533,11 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
         if actual != expected:
             print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual or 'unreadable'} "
                   f"path={path}", flush=True)
-    st = load_state(st_path)
+    ledger_warned = set() if ledger_warned is None else ledger_warned
+    st = load_state(st_path) if fallback is None else fallback
     seen = set()
-    dirty = False
+    dirty = fallback is not None   # retry persistence even when no new action is due
     no_wake = no_notify = False
-    ledger_warned = set()
     for project, agent, box, m in owed_mail():
         mid = m.get("id")
         if not isinstance(mid, str) or not TOKEN.match(mid):
@@ -1558,38 +1572,47 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
             print(f"WATCH_HELD {project} {agent} {mid} age={round(age)}m pid={held.get('pid')} "
                   f"host={held.get('host') or '-'} until={held.get('until') or '-'} "
                   f"read={'no' if unread_in(box, mid) else 'yes'}", flush=True)
-            if not rec.get("held_t"):
+            if "held_t" not in rec:
                 # a marker the root can forge must not keep the owner from ever being told: the
                 # notify clock starts at the first WATCH_HELD as it would at a wake
                 rec["held_t"] = now()
                 save_state(st_path, st, ledger_warned)
-        if held is None and age >= delays["after_min"]:
-            if rec.get("wake_t"):
-                # the ledger, not the evidence, is why no wake runs: say so, then go on to notify
-                print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={rec['wake_t']} "
-                      f"wake_age_min={rec.get('wake_age_min', '-')}", flush=True)
+        wake_due = held is None and age >= delays["after_min"]
+        wake_skipped = wake_due and "wake_t" in rec
+        if wake_due and not wake_skipped:
+            code, detail = ring(wake, values)
+            if detail == "not_configured":
+                if not no_wake:
+                    print("WATCH_ERROR no wake command; an ended agent cannot be restarted", flush=True)
+                    no_wake = True
             else:
-                code, detail = ring(wake, values)
-                if detail == "not_configured":
-                    if not no_wake:
-                        print("WATCH_ERROR no wake command; an ended agent cannot be restarted", flush=True)
-                        no_wake = True
-                else:
-                    if code is not None:
-                        rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
-                        save_state(st_path, st, ledger_warned)
-                    print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
-                          f"exit={detail or code}", flush=True)
-        starts = [(k, rec[k]) for k in ("wake_t", "held_t") if rec.get(k)]
+                if code is not None:
+                    rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
+                    save_state(st_path, st, ledger_warned)
+                print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
+                      f"exit={detail or code}", flush=True)
+        starts = [(k, rec[k]) for k in ("wake_t", "held_t") if k in rec]
         if not starts:
             continue
-        ages_since = {k: age_min(v) for k, v in starts}
-        bad = [(k, v) for k, v in starts if ages_since[k] is None or ages_since[k] < 0]
+        current = datetime.datetime.now(datetime.timezone.utc)
+        clocks = {k: rfc_time(v) for k, v in starts}
+        ages_since = {k: (current - t).total_seconds() / 60 if t is not None else None
+                      for k, t in clocks.items()}
+        bad = {k: "invalid" if a is None else "future" for k, a in ages_since.items()
+               if a is None or a < 0}
+        wake_time = bad.get("wake_t", rec.get("wake_t", "-"))
+        if wake_skipped:
+            # The ledger suppresses a second wake. Show only a validated timestamp or its status.
+            print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={wake_time} "
+                  f"wake_age_min={rec.get('wake_age_min', '-')}", flush=True)
         if bad:
             # the ledger may not hold the notify back with a time that is no age: say so, and treat
             # the notify as due, the rule the idle half applies to its own ring time
-            for k, v in bad:
-                print(f"WATCH_ERROR {project} {agent} {mid} unusable {k}={v!r}; notify is due", flush=True)
+            for k, reason in bad.items():
+                print(f"WATCH_ERROR {project} {agent} {mid} unusable {k}={reason}; notify is due", flush=True)
+        elif st_path in ledger_warned and not loop:
+            # A one-shot watch cannot keep its clock until the next invocation.
+            print(f"WATCH_ERROR {project} {agent} {mid} ledger not saved; notify is due", flush=True)
         elif max(ages_since.values()) < delays["notify_after_min"]:
             # the earlier of the wake and the first WATCH_HELD starts the clock
             continue
@@ -1600,7 +1623,7 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
             rec["stuck_t"] = now()
             save_state(st_path, st, ledger_warned)
             print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
-                  f"wake_t={rec.get('wake_t') or '-'}", flush=True)
+                  f"wake_t={wake_time}", flush=True)
         if rec.get("notify_t"):
             print(f"WATCH_SKIP {project} {agent} {mid} reason=notify_already notify_t={rec['notify_t']}",
                   flush=True)
@@ -1633,6 +1656,7 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0):
         write_atomic(heartbeat_path(st_path), json.dumps({"t": now(), "pid": os.getpid(), "loop": loop}) + "\n")
     except OSError as exc:
         print(f"WATCH_ERROR heartbeat {exc.__class__.__name__}", flush=True)
+    return st if st_path in ledger_warned else None
 
 def stop_quiet(signum, frame):
     raise SystemExit(0)
@@ -1646,8 +1670,10 @@ def watch(a):
     wake, notify, delays, st_path, src, scan = watch_settings(a, config())
     for s in SIGNALS:
         signal.signal(s, stop_quiet)
+    fallback, ledger_warned = None, set()
     while True:
-        watch_once(expected, wake, notify, delays, st_path, src, scan, a.loop)
+        fallback = watch_once(expected, wake, notify, delays, st_path, src, scan, a.loop,
+                              fallback, ledger_warned)
         if a.loop == 0:
             return 0
         time.sleep(a.loop * 60)

@@ -260,8 +260,10 @@ def parse_ledger_dump(text, nonce):
         if line == nodir_tag:
             dots[current]["nodir"] = True
             continue
-        if name is None and line.startswith(unread_tag):
+        if line.startswith(unread_tag):
             dots[current]["unreadable"].append(line[len(unread_tag):])
+            name = None
+            buf = []
             continue
         if name is None and line == too_many_tag:
             dots[current]["too_many"] = True
@@ -282,9 +284,29 @@ def parse_ledger_dump(text, nonce):
     return dots
 
 
+def probe_reader(tail_bytes, nonce):
+    """One bounded read. A failed tail aborts its frame, even after partial output."""
+    return """read_probe() {
+  if [ -r "$1" ] && size=$(wc -c 2>&1 < "$1"); then
+    while [ "${size# }" != "$size" ]; do size=${size# }; done
+    case "$size" in ''|*[!0-9]*) ;; *)
+      printf '%%s %%s\\n' "$2" "$size"
+      # fd 3 streams file bytes; only the utility's diagnostic stays in the shell.
+      if diagnostic=$(tail -c %d "$1" 2>&1 >&3) && [ -z "$diagnostic" ]; then
+        printf '\\n==END %s\\n'
+      else
+        printf '\\n%%s\\n' "$3"
+      fi
+      return
+    esac
+  fi
+  printf '%%s\\n' "$3"
+} 3>&1""" % (tail_bytes, nonce)
+
+
 def ledger_script(root, dots, tail_bytes, nonce):
     quoted_root = _remote_path(root)
-    parts = ["set -u", "export LC_ALL=C", 'root=%s' % quoted_root]
+    parts = ["set -u", "export LC_ALL=C", 'root=%s' % quoted_root, probe_reader(tail_bytes, nonce)]
     parts.append("for dot in %s; do" % " ".join(shlex.quote(d) for d in dots))
     parts.append("""  printf '==DOT %s %%s\\n' "$dot" """ % nonce)
     parts.append('  d="$root/$dot"')
@@ -295,20 +317,11 @@ def ledger_script(root, dots, tail_bytes, nonce):
     parts.append('    n=$((n+1))')
     parts.append("""    [ "$n" -le %d ] || { printf '==TOOMANY %s\\n'; break; }"""
                  % (MAX_LIVE_FILES, nonce))
-    parts.append("""    [ -r "$f" ] || { printf '==UNREAD %s %%s\\n' "${f##*/}"; continue; }"""
-                 % nonce)
-    parts.append("""    printf '==FILE %s %%s %%s\\n' "${f##*/}" "$(wc -c < "$f" | tr -d ' ')" """
-                 % nonce)
-    parts.append('    tail -c %d "$f"' % tail_bytes)
-    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
+    parts.append('    read_probe "$f" "==FILE %s ${f##*/}" "==UNREAD %s ${f##*/}"' % (nonce, nonce))
     parts.append('  done')
     parts.append('  if [ -f "$d/roster.json" ]; then')
-    parts.append("""    [ -r "$d/roster.json" ] || { printf '==UNREAD %s roster.json\\n'; continue; }"""
-                 % nonce)
-    parts.append("""    printf '==FILE %s roster.json %%s\\n' "$(wc -c < "$d/roster.json" | tr -d ' ')" """
-                 % nonce)
-    parts.append('    tail -c %d "$d/roster.json"' % tail_bytes)
-    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
+    parts.append('    read_probe "$d/roster.json" "==FILE %s roster.json" "==UNREAD %s roster.json"'
+                 % (nonce, nonce))
     parts.append('  fi')
     parts.append('done')
     return "\n".join(parts)
@@ -475,15 +488,12 @@ LOG_LINE_RE = re.compile(
 
 
 def activity_script(paths, tail_bytes, nonce):
-    parts = ["set -u", "export LC_ALL=C", "i=0"]
+    parts = ["set -u", "export LC_ALL=C", "i=0", probe_reader(tail_bytes, nonce)]
     parts.append("for p in %s; do" % " ".join(_remote_path(p) for p in paths))
     parts.append("""  printf '==LOG %s %%s\\n' "$i" """ % nonce)
     parts.append("  i=$((i+1))")
     parts.append('  if [ -f "$p" ]; then')
-    parts.append("""    [ -r "$p" ] || { printf '==UNREAD %s\\n'; continue; }""" % nonce)
-    parts.append("""    printf '==SIZE %s %%s\\n' "$(wc -c < "$p" | tr -d ' ')" """ % nonce)
-    parts.append('    tail -c %d "$p"' % tail_bytes)
-    parts.append("""    printf '\\n==END %s\\n' """ % nonce)
+    parts.append('    read_probe "$p" "==SIZE %s" "==UNREAD %s"' % (nonce, nonce))
     parts.append('  else')
     parts.append("""    printf '==MISSING %s\\n' """ % nonce)
     parts.append('  fi')
@@ -514,7 +524,7 @@ def parse_activity_dump(text, nonce):
             continue
         if path is None:
             continue
-        if size is None and line in (missing_tag, unread_tag):
+        if line == unread_tag or (size is None and line == missing_tag):
             if line == unread_tag:
                 out[path]["error"] = "unreadable"
             path = None
@@ -640,28 +650,30 @@ def evidence_refs(text):
     refs = []
     for match in GH_URL_RE.finditer(text):
         owner, repo, rest = match.group(1), match.group(2), (match.group(3) or "")
-        segs = [s for s in rest.split("/") if s]
+        path, _, anchor = rest.partition("#")
+        segs = [s for s in path.partition("?")[0].split("/") if s]
         base = "repos/%s/%s" % (owner, repo)
-        issue = segs[1] if len(segs) >= 2 and segs[0] == "issues" else ""
-        issue_path, fragment_sep, anchor = issue.partition("#")
-        if len(segs) >= 2 and segs[0] == "pull" and segs[1].isdigit():
+        repository = "%s/%s" % (owner, repo)
+        conversation = bool(segs) and segs[0] in ("issues", "pull")
+        if conversation and ("issuecomment-" in anchor or any("issuecomment-" in s for s in segs[1:])):
+            comment = re.fullmatch(r"issuecomment-([0-9]+)", anchor)
+            if len(segs) == 2 and comment and re.fullmatch(r"[0-9]+", segs[1]):
+                cid = comment[1]
+                refs.append({"kind": "comment", "endpoint": "%s/issues/comments/%s" % (base, cid),
+                             "id": cid, "permalink": "https://github.com/%s/%s/%s#issuecomment-%s"
+                             % (repository, segs[0], segs[1], cid),
+                             "label": "%s comment %s" % (repository, cid), "repo": repository})
+            else:
+                refs.append({"kind": "invalid", "label": "%s issue comment" % repository})
+        elif len(segs) >= 2 and segs[0] == "pull" and segs[1].isdigit():
             refs.append({"kind": "pull", "endpoint": "%s/pulls/%s" % (base, segs[1]),
-                         "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": "%s/%s" % (owner, repo)})
-        elif len(segs) >= 3 and segs[0] == "issues" and segs[1] == "comments" and segs[2].isdigit():
+                         "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": repository})
+        elif len(segs) == 3 and segs[:2] == ["issues", "comments"] and segs[2].isdigit():
             refs.append({"kind": "comment", "endpoint": "%s/issues/comments/%s" % (base, segs[2]),
-                         "label": "%s/%s comment %s" % (owner, repo, segs[2]),
-                         "repo": "%s/%s" % (owner, repo)})
-        elif "issuecomment-" in anchor:
-            comment = anchor.split("issuecomment-", 1)[1]
-            refs.append({"kind": "comment",
-                         "endpoint": "%s/issues/comments/%s" % (base, comment),
-                         "label": "%s/%s comment %s" % (owner, repo, comment),
-                         "repo": "%s/%s" % (owner, repo)})
-        elif fragment_sep and "issuecomment-" in issue_path:
-            refs.append({"kind": "invalid", "label": "%s/%s issue comment" % (owner, repo)})
+                         "id": segs[2], "label": "%s comment %s" % (repository, segs[2]), "repo": repository})
         elif len(segs) >= 2 and segs[0] == "issues" and segs[1].isdigit():
             refs.append({"kind": "issue", "endpoint": "%s/issues/%s" % (base, segs[1]),
-                         "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": "%s/%s" % (owner, repo)})
+                         "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": repository})
         elif len(segs) >= 2 and segs[0] == "commit":
             refs.append({"kind": "commit", "endpoint": "%s/commits/%s" % (base, segs[1]),
                          "label": "%s/%s@%s" % (owner, repo, segs[1][:7]), "repo": "%s/%s" % (owner, repo)})
@@ -745,7 +757,12 @@ class EvidenceResolver:
                 ref["state"] = data.get("state")
             return status, detail
         if kind == "comment":
-            data, status, detail = self._lookup(ref["endpoint"], "{id: .id}")
+            data, status, detail = self._lookup(ref["endpoint"], "{id: .id, html_url: .html_url}")
+            if status == "resolved":
+                if not isinstance(data, dict) or str(data.get("id")) != ref["id"]:
+                    return "unresolved", "response does not identify this comment"
+                if "permalink" in ref and str(data.get("html_url")).lower() != ref["permalink"].lower():
+                    return "unresolved", "comment does not identify the cited parent"
             return status, detail
         if kind == "commit":
             data, status, detail = self._lookup(ref["endpoint"], "{sha: .sha}")
@@ -1201,9 +1218,10 @@ class Transport:
             return None, "ssh not found"
         except subprocess.TimeoutExpired:
             return None, "timed out after %ss" % self.timeout
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-            return None, "exit %s: %s" % (proc.returncode, one_line(detail[-1], 160) if detail else "")
+        # Shell/SSH diagnostics can contain private paths or arbitrary file data.
+        # Neither a successful final printf nor captured stdout proves a clean probe.
+        if proc.returncode != 0 or (proc.stderr or "").strip():
+            return None, "probe exit %s%s" % (proc.returncode, " (stderr)" if proc.stderr else "")
         return proc.stdout, None
 
     def gh(self, endpoint, jq):

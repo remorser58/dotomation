@@ -122,7 +122,7 @@ While `wait` blocks it holds one marker per waiting process, `<base>/listen/<age
 | `projects` | `id`, plus `main`, the session id that appears as `from` in that project's `in.jsonl`. |
 | `hosts` | `label`, the value a live record's `host` uses, plus what that host is for. `vm` and `local` are always there; `init --host` adds the user's own ([hosts](hosts.md#placement-the-vm-first-then-the-one-local-machine)). |
 | `wake` | Optional argv list, no shell. `{project}`, `{agent}`, `{id}` and `{dot}` are substituted; a command that names `{dot}` is not run when the dot is unknown. One run per `send`, 25-second timeout (under the connector's 30-second yield, so the result is not lost), never retried. |
-| `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, when a wake ran and the message is still unanswered. |
+| `notify` | Optional argv list, same placeholders plus `{age}`. Run by `watch`, never by `send`, if the message is still unanswered after a wake or the first `WATCH_HELD` starts the notification clock. |
 | `watch` | `after_min` (default 10), `notify_after_min` (default 20), `rewake_min` (default 120) and `blocked_after_min` (default 120), the delays `watch` uses. Integers, 0 or more; anything else is ignored and the default stays. |
 | `auto_update` | Set to `false` to disable automatic release checks. `DOTS_AUTO_UPDATE=0` does the same; neither affects an explicit `update`. |
 
@@ -202,7 +202,7 @@ from the files alone:
   prints `WATCH_ERROR … no usable time t=… seen_t=…` instead of staying silent. The ledger records
   that first sight, so a line deleted before its first ring still ends as `WATCH_RESOLVED`; the cost
   is one `WATCH_RESOLVED` per answered message. Its ledger defaults to `<base>/watch/state.json`, so
-  a restart never rings twice, and `--state PATH` keeps it outside the folder the root writes. The
+  a successful ledger write survives a restart, and `--state PATH` keeps it outside the folder the root writes. The
   ledger may only add a line: every step it suppresses prints
   `WATCH_SKIP … reason=wake_already|notify_already`, and a `wake_t` or `held_t` in the ledger that is
   no time, or one in the future, prints `WATCH_ERROR … unusable wake_t=…; notify is due` (or
@@ -318,9 +318,11 @@ wake command ran.
   of taking the line, and the temp file `write_atomic` writes is opened non-blocking for the same
   reason. A read marker that cannot be written prints
   `dots: cannot mark … read (…)` once and the mail stays unread; a ledger that cannot be written
-  prints `dots: cannot write the ledger …` once and says `every run rings again until it is
-  writable`, which is the safe direction. A ledger record that is not an object is dropped, so that
-  run rings again instead of dying. Nothing is repaired, and an unreadable mailbox hides its mail
+  prints `dots: cannot write the ledger …`. A running loop retains the first held time and notification
+  receipt in memory and retries persistence; on restart that memory is lost and an action can repeat.
+  A one-shot watch cannot retain its clock, so if it cannot save a new start it makes the notification
+  due immediately. A ledger record that is not an object is dropped, so that run rings again instead of
+  dying. Nothing is repaired, and an unreadable mailbox hides its mail
   from `watch` the same way a deleted line does.
 - **A line whose bytes are not UTF-8, and where lines end.** A mailbox is bytes the root appends to,
   so one damaged line is expected. It costs that line and nothing else: each line is decoded on its

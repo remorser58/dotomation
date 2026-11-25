@@ -24,7 +24,7 @@ Python 3.9 or newer, standard library only. `ssh` is used for a remote ledger or
 
 Only the last 256 KiB of each file is read, so a multi-gigabyte daemon log costs the same as a small one. A byte tail that starts mid-line drops that line instead of inventing one. Every `ssh` and `gh` call has a timeout, and a failed source becomes a `DOTS_ERROR` line rather than a wrong answer.
 
-Each dot's scan considers only the first 200 `.jsonl` files in filename order and still reads `roster.json` separately. The monitor reports overflow and unreadable files as `DOTS_ERROR`.
+Each dot's scan considers only the first 200 `.jsonl` files in filename order and still reads `roster.json` separately. The monitor reports overflow and unreadable files as `DOTS_ERROR`. The limit is per dot, not per probe: two dots can supply 400 live files plus two rosters. If the byte count or tail fails after the permission check, the monitor discards the incomplete file; unexpected probe stderr invalidates the source without displaying its contents.
 
 Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mcp/plugins` requests are not counted as work. A daemon log that starts inside the 60-minute window is reported with `partial_window` so a low count is not mistaken for idleness.
 

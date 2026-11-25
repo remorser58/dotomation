@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -965,6 +966,117 @@ class BoardEvidenceTests(Base):
         after = d.load_json(path)
         self.assertEqual(after["decisions"], [good])
         self.assertEqual(after["blockers"], ["a real blocker"])
+
+
+class Release103Tests(Base):
+    def test_tick_filters_decisions_before_appending_next_step(self):
+        self.assertEqual(self.tick().returncode, 0)
+        memory = os.path.join(self.base, "memory", "DOT-A", "agent-1.json")
+        live = os.path.join(self.base, "live", "DOT-A", "agent-1.jsonl")
+        valid = [{"t": "2026-06-10t11:22:33.4z", "text": "first"},
+                 {"t": "2026-06-10T11:22:33+09:00", "text": "second"}]
+        wrong = [{"t": "2026-06-10 11:22:33+00:00", "text": "space"},
+                 {"t": "2026-02-30T11:22:33Z", "text": "date"}]
+        for prior, expected in ((23, []), ({"t": "bad"}, []), (None, []), (wrong + valid, valid)):
+            with self.subTest(prior=prior):
+                before = lines(live)
+                mem = d.load_json(memory)
+                mem["decisions"] = prior
+                d.write_atomic(memory, json.dumps(mem))
+                res = self.tick("--decision", "new", state="step")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                after = d.load_json(memory)
+                self.assertEqual(lines(live)[:-1], before)
+                self.assertEqual(after["t"], lines(live)[-1]["t"])
+                self.assertEqual(after["decisions"], expected + [{"t": after["t"], "text": "new"}])
+
+    def test_unwritable_ledger_retains_loop_clock_and_notification(self):
+        self.send()
+        ledger = d.state_path()
+        write = d.write_atomic
+        def write_fixture(path, data):
+            if path == ledger:
+                raise OSError("test ledger unavailable")
+            return write(path, data)
+        initial = d.datetime.datetime.now(d.datetime.timezone.utc)
+        minutes = [0]
+        class Clock(d.datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return initial + d.datetime.timedelta(minutes=minutes[0])
+        def advance(_seconds):
+            minutes[0] += 10
+            if minutes[0] == 40:
+                raise StopIteration
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(d, "write_atomic", side_effect=write_fixture), \
+                mock.patch.object(d.datetime, "datetime", Clock), \
+                mock.patch.object(d.signal, "signal"), mock.patch.object(d.time, "sleep", side_effect=advance), \
+                mock.patch.object(d, "listen_state", return_value={"pid": 1}), \
+                mock.patch.object(d, "ring", return_value=(0, None)) as ring, \
+                redirect_stdout(out), redirect_stderr(err), self.assertRaises(StopIteration):
+            d.main(["watch", "--loop", "10", "--after-min", "0", "--notify-after-min", "20",
+                    "--notify-cmd", '["notify-test"]'])
+        self.assertEqual(ring.call_count, 1)
+        scans = out.getvalue().split("WATCH_CONFIG")[1:]
+        self.assertEqual(["WATCH_NOTIFY" in scan for scan in scans], [False, False, True, False])
+        self.assertIn("reason=notify_already", scans[-1])
+        self.assertEqual(err.getvalue().count("cannot write the ledger"), 1)
+
+    def test_one_shot_without_persistence_notifies_even_with_positive_delay(self):
+        self.send()
+        with mock.patch.object(d, "write_atomic", side_effect=OSError()), \
+                mock.patch.object(d.signal, "signal"), mock.patch.object(d, "listen_state", return_value={"pid": 1}), \
+                mock.patch.object(d, "ring", return_value=(0, None)) as ring, \
+                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            d.main(["watch", "--after-min", "0", "--notify-after-min", "20", "--notify-cmd", '["notify-test"]'])
+        self.assertEqual(ring.call_count, 1)
+        self.assertIn("ledger not saved; notify is due", out.getvalue())
+        self.assertIn("WATCH_NOTIFY", out.getvalue())
+
+    def test_missing_and_damaged_clocks_have_distinct_outcomes(self):
+        mid = self.send()
+        self.take(mid)
+        ledger = d.state_path()
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        cases = ((None, "invalid"), ("", "invalid"), ("not a time", "invalid"),
+                 (d.iso_after(3600), "future"), (d.iso_after(-3600), None))
+        for key in ("wake_t", "held_t"):
+            for value, reason in cases:
+                with self.subTest(key=key, value=value):
+                    d.write_atomic(ledger, json.dumps({"messages": {mid: {key: value}}}))
+                    held = {"pid": 1} if key == "held_t" else None
+                    with mock.patch.object(d.signal, "signal"), \
+                            mock.patch.object(d, "listen_state", return_value=held), \
+                            mock.patch.object(d, "ring", return_value=(0, None)) as ring, \
+                            redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+                        d.main(["watch", "--after-min", "0", "--notify-after-min", "20",
+                                "--notify-cmd", '["notify-test"]'])
+                    self.assertEqual(ring.call_count, 1)
+                    output = out.getvalue()
+                    self.assertIn("WATCH_NOTIFY", output)
+                    if reason:
+                        self.assertIn(f"unusable {key}={reason}; notify is due", output)
+                        if value:
+                            self.assertNotIn(value, output)
+                    else:
+                        self.assertNotIn("unusable " + key, output)
+                    wake_time = (reason or value) if key == "wake_t" else "-"
+                    self.assertIn(f"read=yes unanswered=yes wake_t={wake_time}\n", output)
+                    if key == "wake_t":
+                        self.assertIn(f"reason=wake_already wake_t={wake_time} ", output)
+                    if key == "held_t" or reason:
+                        self.assertIn("after_wake=-m", output)
+
+    def test_init_reports_the_actual_key_and_change(self):
+        for flag, other in (("wake", "notify"), ("notify", "wake")):
+            for command, expected in (("one", "set"), ("one", "kept"), ("two", "replaced")):
+                res = run(["init", "--base", self.base, "--dot", "DOT-A", "--yes", "--" + flag + "-cmd",
+                           json.dumps([command])], self.base)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn(f"INIT {flag} ({expected})", res.stdout)
+                if expected == "replaced":
+                    self.assertNotIn(f"INIT {other} (replaced)", res.stdout)
 
 
 class WatchTests(Base):

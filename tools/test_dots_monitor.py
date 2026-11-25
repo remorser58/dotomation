@@ -356,6 +356,7 @@ class TestLedgerFraming(unittest.TestCase):
             other = Path(tmp) / "DOT-B"
             other.mkdir()
             (other / "writer.jsonl").write_text(record(), encoding="utf-8")
+            (other / "roster.json").write_text('{"coordinator": "second"}', encoding="utf-8")
             config = base_config(dots=("DOT-A", "DOT-B"), activity=[])
             config["ledger"]["root"] = tmp
             snapshot = dm.build_snapshot(config, dm.Transport(10, 10), NOW)
@@ -363,6 +364,7 @@ class TestLedgerFraming(unittest.TestCase):
         self.assertEqual(set(rows(snapshot)), {"writer-%03d" % i for i in range(1, 201)})
         self.assertEqual(list(rows(snapshot, "DOT-B")), ["writer"])
         self.assertEqual(snapshot["dots"]["DOT-A"]["roster"]["coordinator"], "lead")
+        self.assertEqual(snapshot["dots"]["DOT-B"]["roster"]["coordinator"], "second")
         self.assertEqual(len(snapshot["errors"]), 1)
         self.assertIn("DOTS_ERROR ledger DOT-A: more than 200 live files", dm.render_table(snapshot))
 
@@ -658,6 +660,59 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertNotIn("fake line", json.dumps(errors))
 
 
+class TestRelease103(unittest.TestCase):
+    def test_conversation_permalink_resolves_only_the_exact_comment_and_parent(self):
+        endpoint = "repos/o/r/issues/comments/123"
+        for route in ("issues", "pull"):
+            url = f"https://github.com/o/r/{route}/24#issuecomment-123"
+            for data, error, expected in (({"id": 123, "html_url": url}, None, "resolved"),
+                                          ({"id": 124, "html_url": url}, None, "unresolved"),
+                                          ({"id": 123, "html_url": url.replace("/24#", "/25#")}, None, "unresolved"),
+                                          ({"id": 123}, None, "unresolved"), (None, "HTTP 404", "unresolved")):
+                with self.subTest(route=route, data=data, error=error):
+                    transport = FakeTransport(gh={endpoint: (data, error)})
+                    resolver = dm.EvidenceResolver(base_config(), transport, NOW, [])
+                    self.assertEqual(dm.evidence_status(url, resolver)[0], expected)
+                    self.assertEqual(transport.gh_calls, [endpoint])
+
+    def test_post_permission_io_failure_discards_incomplete_samples(self):
+        # Ordinary count/read errors in a local shell; every fixture path is readable.
+        for failed_tool, result in (("wc", "printf partial; return 1"), ("tail", "printf partial; return 1"),
+                                    ("tail", "printf fixture-diagnostic >&2; return 0")):
+            with self.subTest(tool=failed_tool, result=result), tempfile.TemporaryDirectory() as root:
+                dot = Path(root) / "DOT-A"
+                dot.mkdir()
+                (dot / "writer.jsonl").write_text(record(), encoding="utf-8")
+                (dot / "roster.json").write_text("{}", encoding="utf-8")
+                log = Path(root) / "activity.log"
+                log.write_text(log_line(1), encoding="utf-8")
+                config = base_config(activity=[{"dot": "DOT-A", "host": "local", "path": str(log)}])
+                config["ledger"]["root"] = root
+                class FailedRead(dm.Transport):
+                    def run(self, host, script):
+                        stub = failed_tool + "() { " + result + "; }\n"
+                        return super().run(host, stub + script)
+                snap = dm.build_snapshot(config, FailedRead(), NOW)
+                table = dm.render_table(snap)
+                self.assertIn("DOTS_ERROR ledger DOT-A: writer.jsonl unreadable", table)
+                self.assertIn("DOTS_ERROR ledger DOT-A: roster.json unreadable", table)
+                self.assertIn("DOTS_ERROR activity " + str(log) + " unreadable", table)
+                self.assertNotIn("partial", json.dumps(snap["errors"]))
+                self.assertNotIn("fixture-diagnostic", json.dumps(snap))
+                self.assertEqual(rows(snap), {})
+                self.assertEqual(snap["dots"]["DOT-A"]["activity"], {})
+
+    def test_stderr_with_zero_status_is_visible_but_not_echoed(self):
+        class Diagnostic(dm.Transport):
+            def run(self, host, script):
+                return super().run(host, "printf fixture-diagnostic >&2; :")
+        snap = dm.build_snapshot(base_config(), Diagnostic(), NOW)
+        table = dm.render_table(snap)
+        for source in ("ledger", "activity"):
+            self.assertIn("DOTS_ERROR " + source + " probe exit 0 (stderr)", table)
+        self.assertNotIn("fixture-diagnostic", json.dumps(snap))
+
+
 class TestEvidence(unittest.TestCase):
     def test_reference_shapes(self):
         refs, bare = dm.evidence_refs(
@@ -672,7 +727,8 @@ class TestEvidence(unittest.TestCase):
 
     def test_issue_comment_marker_must_be_in_the_fragment(self):
         gh = {"repos/o/r": ({"full_name": "o/r"}, None),
-              "repos/o/r/issues/comments/7086145047": ({"id": 7086145047}, None)}
+              "repos/o/r/issues/comments/7086145047": ({"id": 7086145047,
+                  "html_url": "https://github.com/o/r/issues/24#issuecomment-7086145047"}, None)}
         resolver = dm.EvidenceResolver(base_config(), FakeTransport(gh=gh), NOW, [])
         for suffix, expected in (("issuecomment-1#2", "unresolved"),
                                  ("24#issuecomment-7086145047", "resolved")):
