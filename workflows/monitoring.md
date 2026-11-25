@@ -24,6 +24,8 @@ Python 3.9 or newer, standard library only. `ssh` is used for a remote ledger or
 
 Only the last 256 KiB of each file is read, so a multi-gigabyte daemon log costs the same as a small one. A byte tail that starts mid-line drops that line instead of inventing one. Every `ssh` and `gh` call has a timeout, and a failed source becomes a `DOTS_ERROR` line rather than a wrong answer.
 
+Each dot's scan considers only the first 200 `.jsonl` files in filename order and still reads `roster.json` separately. The monitor reports overflow and unreadable files as `DOTS_ERROR`.
+
 Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mcp/plugins` requests are not counted as work. A daemon log that starts inside the 60-minute window is reported with `partial_window` so a low count is not mistaken for idleness.
 
 ## Classes
@@ -31,7 +33,8 @@ Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mc
 | Class | Meaning |
 |---|---|
 | `WORKING` | Newest v1 record is at most 30 minutes old and the dot's account made at least one `mcp/core` request at or after that record |
-| `QUIET` | Newest record is at most 30 minutes old and no tool request happened since it: the record says working, the account is not calling tools |
+| `QUIET` | Newest record is at most 30 minutes old and the activity sources that answered show no tool request since it |
+| `ACTIVITY_UNKNOWN` | Newest record would otherwise be `WORKING` or `QUIET`, but no activity source answered |
 | `STALLED` | Newest record is `start` or `step` and older than 30 minutes, per [live-status](live-status.md#when-to-append); also an agent with only off-format lines whose newest readable timestamp is older than 30 minutes, or that has no readable timestamp at all |
 | `BLOCKED` | Newest record is `blocked`; reported whatever its age |
 | `DONE` | Newest record is `done` and its evidence resolves, or GitHub could not be asked (`unknown`, also printed as `DOTS_ERROR github`). **Without `gh`, or with `--no-github`, every `done` that cites a SHA or URL shows as `DONE`; a `done` whose evidence is only a local label stays `UNPROVEN`**: read the `EVID` column, not the class |
@@ -41,7 +44,7 @@ Tunnel probes (`mcp/core` requests marked `tunnel probe`), `mcp/desktop` and `mc
 
 The 30 minutes are `thresholds.stall_minutes` (or `--stall-minutes`); the legend under the table prints the value in use.
 
-`EVIDENCE` is one of `resolved` (the reference exists), `stale` (a cited pull-request head SHA is no longer that pull request's head or merge commit; a `done` on it is `UNPROVEN`), `local` (a bare label such as `MATCH-CHECK`, not checkable), `unresolved` (GitHub says it does not exist), `unknown` (not checked: no `gh`, network failure, or the lookup budget ran out), or `missing`.
+`EVIDENCE` is one of `resolved` (the reference exists), `stale` (a cited pull-request head SHA is no longer that pull request's head or merge commit; a `done` on it is `UNPROVEN`), `local` (a bare label such as `MATCH-CHECK`, not checkable), `unresolved` (the reference is malformed or GitHub says it does not exist), `unknown` (not checked: no `gh`, network failure, or the lookup budget ran out), or `missing`.
 
 On a [direct mail](direct-mail.md) task, a `done` or `step` that cites a SHA not yet published to GitHub is `UNPROVEN` by design until the main session publishes it. For that window, read the agent's newest `result` and the main session's `review` or `answer` in `mail/<agentId>/` to tell a pending handover from bad evidence.
 
@@ -51,9 +54,11 @@ They are per **account and host**, not per agent. A dot whose account is calling
 
 A request count is not a result. It does not show what was run, whether a gate passed, or that a PR is correct — the handoff checks and the reviewer do that. `WORKING` means "this dot is not idle and its newest claim is recent", nothing more.
 
+The table says `activity unknown` when sources are configured but none can be read, and `activity none configured` when the dot has no activity sources. In both cases the JSON snapshot reports `activity_since_record` as `null` rather than zero.
+
 ## Config
 
-`tools/dots-monitor.example.json` is the template, and an instance keeps its own filled-in copy outside this repository: host names, paths, account numbers and repository names only, no secrets. Copy the template to that file and pass it with `--config PATH`, before the subcommand as in [Run it](#run-it); without a config the tool falls back to the template's placeholder dots and reports each one as `DOTS_ERROR ... live directory missing`. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
+`tools/dots-monitor.example.json` is the template, and an instance keeps its own filled-in copy outside this repository: host names, paths, account numbers and repository names only, no secrets. Pass your copy with `--config PATH`, before the subcommand as in [Run it](#run-it). Without `--config`, the monitor looks beside the script for `dots-monitor.owner.json` first (ignored by Git in this checkout), then the example template. A missing or unreadable config produces `config not found: <path>`. `--no-github` skips evidence resolution; `--stall-minutes N` changes the stall threshold.
 
 ```json
 {
@@ -73,7 +78,7 @@ A request count is not a result. It does not show what was run, whether a gate p
 DOTS_STALLED DOT-A example-23-engine from=WORKING state=step age=34m evidence=resolved task="issue #23" note="..."
 DOTS_QUIET DOT-A example-ultra from=WORKING state=step age=6m evidence=resolved task=DOT-A-RESEARCH+DRAFTS/r1 note="..."
 DOTS_WORKING DOT-A example_item_owner from=UNPROVEN state=start age=4s evidence=resolved task=EXAMPLE-62438-Q29-MATCH/r2 note="..."
-DOTS_BLOCKED, DOTS_DONE, DOTS_UNPROVEN, DOTS_LEGACY, DOTS_NO_RECORD: same fields
+DOTS_BLOCKED, DOTS_DONE, DOTS_UNPROVEN, DOTS_ACTIVITY_UNKNOWN, DOTS_LEGACY, DOTS_NO_RECORD: same fields
 DOTS_NEW_AGENT DOT-A example_drafts class=WORKING evidence=local role=구현 task=DOT-A-DRAFTS/r1
 DOTS_ACTIVE DOT-B - calls_15m=15          # dot went from no tool request in 15 minutes to calling tools
 DOTS_IDLE DOT-B - calls_15m=0             # no tool request in the last 15 minutes any more
@@ -84,6 +89,8 @@ DOTS_DOT DOT-A - calls_15m=16             # first scan only, one per dot
 
 `DOTS_MONITOR started ...` opens the stream. `--json` prints one JSON object per line with the same `event` name.
 
+An unread activity source cannot trigger `DOTS_QUIET` or `DOTS_IDLE` if no other source for that dot answered. Watch compares the next successful count with the last observed count's active/idle state. The initial `DOTS_DOT` omits `calls_15m` if no activity source answered.
+
 ## Boundaries
 
 - Read-only: the remote side runs only `wc -c` and `tail -c` over the configured files. The tool never appends, edits, renames or deletes a record, and writes nothing on any host it reads; output goes to the reader's terminal. The `ssh` host is passed after `--`, so a config value cannot become an `ssh` option.
@@ -93,6 +100,6 @@ DOTS_DOT DOT-A - calls_15m=16             # first scan only, one per dot
 - Not resident: `watch` is a foreground command the reader starts and stops. Nothing installs, schedules or restarts it.
 - It is not a coordinator. It reports; a coordinator still decides to reassign a stalled slot or to close a task.
 - It does not contact a dot. Nothing here sends a message to a dot's chat, and nothing assigns work.
-- It prints no secret. Values are redacted before display, in the table, in `--json` output and in `watch` lines and JSON events; the JSON paths redact every string of the document recursively. Covered: GitHub tokens, `sk-` keys, `token=`/`api_key=` pairs, MCP path tokens, and any long mixed-case alphanumeric run. Commit SHAs and hyphenated task ids survive.
+- It prints no secret. Values are redacted before display, in the table, in `--json` output and in `watch` lines and JSON events; the JSON paths redact every string of the document recursively. Covered: GitHub tokens, `sk-` keys, `token=`/`api_key=` pairs (including prefixed names such as `DATABASE_PASSWORD=` and `OPENAI_API_KEY=`), `Authorization: Bearer` tokens, MCP path tokens, and any long mixed-case alphanumeric run. Commit SHAs and hyphenated task ids survive.
 - Legacy lines are shown, counted and left exactly as written, because the log is append-only.
-- Tests: `python3 tools/test_dots_monitor.py` — stdlib `unittest`, synthetic fixtures, a fake transport and a fake `gh`; no network. One test runs the generated dump scripts with the local `/bin/sh` against a temporary directory.
+- Tests: `python3 tools/test_dots_monitor.py` — stdlib `unittest`, synthetic fixtures, a fake transport and a fake `gh`; no network. Some tests run the generated dump scripts with the local `/bin/sh` against temporary files.

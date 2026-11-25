@@ -46,7 +46,9 @@ TS_RE = re.compile(
 )
 FRACTION_RE = re.compile(r"\.([0-9]+)")
 
-CLASS_ORDER = ("BLOCKED", "UNPROVEN", "DONE", "STALLED", "WORKING", "QUIET", "LEGACY", "NO_RECORD")
+CLASS_ORDER = ("BLOCKED", "UNPROVEN", "DONE", "STALLED", "WORKING", "QUIET",
+               "ACTIVITY_UNKNOWN", "LEGACY", "NO_RECORD")
+MAX_LIVE_FILES = 200
 
 DEFAULT_CONFIG = {
     "ledger": {"host": "local", "root": "~/.dots-ops/live", "dots": ["DOT-A", "DOT-B"]},
@@ -66,10 +68,11 @@ REDACT_RULES = (
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "[REDACTED]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED]"),
+    (re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+[^\s\"',;]+"), r"\1 [REDACTED]"),
     (
         re.compile(
-            r"(?i)\b(bearer|token|secret|password|passwd|api[_-]?key|control_token|"
-            r"client_secret|access_token)\b\s*[:=]\s*[\"']?[^\s\"',;]+"
+            r"(?i)\b((?:[a-z0-9_]+_)?(?:bearer|token|secret|password|passwd|api[_-]?key)"
+            r"|[a-z0-9_]+_key)\b\s*[:=]\s*[\"']?[^\s\"',;]+"
         ),
         r"\1=[REDACTED]",
     ),
@@ -236,6 +239,8 @@ def parse_ledger_dump(text, nonce):
     """
     dot_tag = "==DOT %s " % nonce
     nodir_tag = "==NODIR %s" % nonce
+    unread_tag = "==UNREAD %s " % nonce
+    too_many_tag = "==TOOMANY %s" % nonce
     file_re = re.compile(r"^==FILE %s (.+) ([0-9]+)$" % re.escape(nonce))
     end_tag = "==END %s" % nonce
     dots = {}
@@ -246,13 +251,20 @@ def parse_ledger_dump(text, nonce):
     for line in text.splitlines():
         if line.startswith(dot_tag):
             current = line[len(dot_tag):].strip()
-            dots.setdefault(current, {"files": {}, "nodir": False})
+            dots.setdefault(current, {"files": {}, "nodir": False,
+                                      "unreadable": [], "too_many": False})
             name = None
             continue
         if current is None:
             continue
         if line == nodir_tag:
             dots[current]["nodir"] = True
+            continue
+        if name is None and line.startswith(unread_tag):
+            dots[current]["unreadable"].append(line[len(unread_tag):])
+            continue
+        if name is None and line == too_many_tag:
+            dots[current]["too_many"] = True
             continue
         match = file_re.match(line)
         if match and name is None:
@@ -277,14 +289,22 @@ def ledger_script(root, dots, tail_bytes, nonce):
     parts.append("""  printf '==DOT %s %%s\\n' "$dot" """ % nonce)
     parts.append('  d="$root/$dot"')
     parts.append("""  if [ ! -d "$d" ]; then printf '==NODIR %s\\n'; continue; fi""" % nonce)
+    parts.append('  n=0')
     parts.append('  for f in "$d"/*.jsonl; do')
     parts.append('    [ -f "$f" ] || continue')
+    parts.append('    n=$((n+1))')
+    parts.append("""    [ "$n" -le %d ] || { printf '==TOOMANY %s\\n'; break; }"""
+                 % (MAX_LIVE_FILES, nonce))
+    parts.append("""    [ -r "$f" ] || { printf '==UNREAD %s %%s\\n' "${f##*/}"; continue; }"""
+                 % nonce)
     parts.append("""    printf '==FILE %s %%s %%s\\n' "${f##*/}" "$(wc -c < "$f" | tr -d ' ')" """
                  % nonce)
     parts.append('    tail -c %d "$f"' % tail_bytes)
     parts.append("""    printf '\\n==END %s\\n' """ % nonce)
     parts.append('  done')
     parts.append('  if [ -f "$d/roster.json" ]; then')
+    parts.append("""    [ -r "$d/roster.json" ] || { printf '==UNREAD %s roster.json\\n'; continue; }"""
+                 % nonce)
     parts.append("""    printf '==FILE %s roster.json %%s\\n' "$(wc -c < "$d/roster.json" | tr -d ' ')" """
                  % nonce)
     parts.append('    tail -c %d "$d/roster.json"' % tail_bytes)
@@ -348,11 +368,20 @@ def collect_ledger(config, transport, errors):
     # too: a mistyped root, an unmounted share or a renamed dot must not render
     # as an empty table that looks like "nothing to report".
     for dot in dots:
-        dump.setdefault(dot, {"files": {}, "nodir": True})
-        if dump[dot].get("nodir"):
+        entry = dump.setdefault(dot, {"files": {}, "nodir": True})
+        if entry["nodir"]:
             errors.append({"source": "ledger", "host": ledger["host"],
                            "detail": "%s: live directory missing under %s"
                                      % (dot, ledger["root"])})
+        for name in entry.get("unreadable", ()):
+            if name != "roster.json" and not (name.endswith(".jsonl") and TOKEN_RE.fullmatch(name[:-6])):
+                name = "live file with invalid agent name"
+            errors.append({"source": "ledger", "host": ledger["host"],
+                           "detail": "%s: %s unreadable" % (dot, name)})
+        if entry.get("too_many"):
+            errors.append({"source": "ledger", "host": ledger["host"],
+                           "detail": "%s: more than %d live files; read the first %d"
+                                     % (dot, MAX_LIVE_FILES, MAX_LIVE_FILES)})
     return dump
 
 
@@ -367,9 +396,14 @@ def read_dot(dot, dump, tail_bytes):
         text = split_tail(info["text"], info["size"], tail_bytes)
         if name == "roster.json":
             try:
-                roster = json.loads(text)
+                value = json.loads(text)
             except ValueError:
                 roster_error = "roster.json is not JSON"
+            else:
+                if isinstance(value, dict):
+                    roster = value
+                else:
+                    roster_error = "roster.json is not an object"
             continue
         agent = name[:-6] if name.endswith(".jsonl") else name
         # The file name becomes the AGENT column; hold it to the same token rule
@@ -392,7 +426,7 @@ def read_dot(dot, dump, tail_bytes):
         agents[agent] = {"records": records, "legacy": legacy}
     return {
         "agents": agents,
-        "roster": roster if isinstance(roster, dict) else None,
+        "roster": roster,
         "roster_error": roster_error,
         "dropped_files": dropped_files,
         "nodir": entry.get("nodir", False),
@@ -412,7 +446,13 @@ def roster_slots(roster):
     if not isinstance(roster, dict):
         return slots, dropped
     for key in ("slots", "agents", "actors"):
-        for slot in roster.get(key) or []:
+        if key not in roster:
+            continue
+        entries = roster[key]
+        if not isinstance(entries, list):
+            dropped += 1
+            continue
+        for slot in entries:
             if not (isinstance(slot, dict) and isinstance(slot.get("agent"), str)
                     and TOKEN_RE.match(slot["agent"])):
                 dropped += 1
@@ -440,6 +480,7 @@ def activity_script(paths, tail_bytes, nonce):
     parts.append("""  printf '==LOG %s %%s\\n' "$i" """ % nonce)
     parts.append("  i=$((i+1))")
     parts.append('  if [ -f "$p" ]; then')
+    parts.append("""    [ -r "$p" ] || { printf '==UNREAD %s\\n'; continue; }""" % nonce)
     parts.append("""    printf '==SIZE %s %%s\\n' "$(wc -c < "$p" | tr -d ' ')" """ % nonce)
     parts.append('    tail -c %d "$p"' % tail_bytes)
     parts.append("""    printf '\\n==END %s\\n' """ % nonce)
@@ -451,12 +492,13 @@ def activity_script(paths, tail_bytes, nonce):
 
 
 def parse_activity_dump(text, nonce):
-    """Parse the framed dump into {index: {"size": int|None, "text": str|None}}.
+    """Parse per-index byte sizes and log text, marking unreadable logs.
 
     Sentinels carry this run's nonce, so log content cannot end a section.
     """
     log_tag = "==LOG %s " % nonce
     missing_tag = "==MISSING %s" % nonce
+    unread_tag = "==UNREAD %s" % nonce
     size_re = re.compile(r"^==SIZE %s ([0-9]+)$" % re.escape(nonce))
     end_tag = "==END %s" % nonce
     out = {}
@@ -472,8 +514,9 @@ def parse_activity_dump(text, nonce):
             continue
         if path is None:
             continue
-        if line == missing_tag:
-            out[path]["text"] = None
+        if size is None and line in (missing_tag, unread_tag):
+            if line == unread_tag:
+                out[path]["error"] = "unreadable"
             path = None
             continue
         match = size_re.match(line)
@@ -524,7 +567,7 @@ def count_calls(text, size, tail_bytes, now, windows, exclude_probes=True):
 
 
 def collect_activity(config, transport, now, errors):
-    """Return {dot: {"by_host": {label: counts}, "since": {label: [timestamps]}}}."""
+    """Return host counts and request timestamps for dots with a readable log."""
     windows = {
         "short": timedelta(minutes=config["thresholds"]["active_window_minutes"]),
         "long": timedelta(minutes=config["thresholds"]["long_window_minutes"]),
@@ -550,7 +593,7 @@ def collect_activity(config, transport, now, errors):
                 continue
             if info["text"] is None:
                 errors.append({"source": "activity", "host": host,
-                               "detail": "%s missing" % src["path"]})
+                               "detail": "%s %s" % (src["path"], info.get("error", "missing"))})
                 continue
             counted = count_calls(info["text"], info["size"], config["limits"]["tail_bytes"],
                                   now, windows)
@@ -591,7 +634,7 @@ SHA_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{40}(?![0-9A-Za-z])")
 
 
 def evidence_refs(text):
-    """Return (endpoint refs, bare commit SHAs) named by an evidence string."""
+    """Return GitHub references and bare commit SHAs named by an evidence string."""
     if not text:
         return [], []
     refs = []
@@ -599,6 +642,8 @@ def evidence_refs(text):
         owner, repo, rest = match.group(1), match.group(2), (match.group(3) or "")
         segs = [s for s in rest.split("/") if s]
         base = "repos/%s/%s" % (owner, repo)
+        issue = segs[1] if len(segs) >= 2 and segs[0] == "issues" else ""
+        issue_path, fragment_sep, anchor = issue.partition("#")
         if len(segs) >= 2 and segs[0] == "pull" and segs[1].isdigit():
             refs.append({"kind": "pull", "endpoint": "%s/pulls/%s" % (base, segs[1]),
                          "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": "%s/%s" % (owner, repo)})
@@ -606,14 +651,14 @@ def evidence_refs(text):
             refs.append({"kind": "comment", "endpoint": "%s/issues/comments/%s" % (base, segs[2]),
                          "label": "%s/%s comment %s" % (owner, repo, segs[2]),
                          "repo": "%s/%s" % (owner, repo)})
-        elif len(segs) >= 2 and segs[0] == "issues" and "#" in segs[1] \
-                and "issuecomment-" in segs[1]:
-            number, anchor = segs[1].split("#", 1)
+        elif "issuecomment-" in anchor:
             comment = anchor.split("issuecomment-", 1)[1]
             refs.append({"kind": "comment",
                          "endpoint": "%s/issues/comments/%s" % (base, comment),
                          "label": "%s/%s comment %s" % (owner, repo, comment),
                          "repo": "%s/%s" % (owner, repo)})
+        elif fragment_sep and "issuecomment-" in issue_path:
+            refs.append({"kind": "invalid", "label": "%s/%s issue comment" % (owner, repo)})
         elif len(segs) >= 2 and segs[0] == "issues" and segs[1].isdigit():
             refs.append({"kind": "issue", "endpoint": "%s/issues/%s" % (base, segs[1]),
                          "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": "%s/%s" % (owner, repo)})
@@ -682,6 +727,8 @@ class EvidenceResolver:
 
     def resolve(self, ref):
         kind = ref["kind"]
+        if kind == "invalid":
+            return "unresolved", "malformed issue comment URL"
         if kind == "pull":
             data, status, detail = self._lookup(
                 ref["endpoint"], "{state: .state, draft: .draft, merged: .merged, "
@@ -806,6 +853,8 @@ def classify(row, stall_minutes):
         return "UNPROVEN"
     if stalled:
         return "STALLED"
+    if row["activity_since_record"] is None:
+        return "ACTIVITY_UNKNOWN"
     return "WORKING" if row["activity_since_record"] > 0 else "QUIET"
 
 
@@ -815,6 +864,7 @@ def build_snapshot(config, transport, now, errors=None):
     stall = config["thresholds"]["stall_minutes"]
     ledger = collect_ledger(config, transport, errors)
     activity = collect_activity(config, transport, now, errors)
+    activity_configured = {src["dot"] for src in config["activity"]}
     resolver = EvidenceResolver(config, transport, now, errors)
     dots = {}
     for dot in config["ledger"]["dots"]:
@@ -825,14 +875,14 @@ def build_snapshot(config, transport, now, errors=None):
                            "detail": "%s: %s" % (dot, data["roster_error"])})
         if dropped_slots:
             errors.append({"source": "roster", "host": config["ledger"]["host"],
-                           "detail": "%s: %d roster slot(s) dropped: agent id is not a token"
+                           "detail": "%s: %d roster slot(s) dropped: expected lists with valid agent ids"
                                      % (dot, dropped_slots)})
         if data["dropped_files"]:
             errors.append({"source": "ledger", "host": config["ledger"]["host"],
                            "detail": "%s: %d live file(s) skipped: name is not an agent token"
                                      % (dot, len(data["dropped_files"]))})
-        dot_activity = activity.get(dot) or {"by_host": {}, "timestamps": []}
-        stamps = dot_activity.get("timestamps") or []
+        dot_activity = activity.get(dot, {"by_host": {}, "timestamps": []})
+        stamps = dot_activity["timestamps"]
         rows = []
         agent_ids = sorted(set(data["agents"]) | set(slots))
         for agent in agent_ids:
@@ -866,9 +916,9 @@ def build_snapshot(config, transport, now, errors=None):
             # falls back to its newest off-format line that still has a time.
             clock_t = last_t if last_t is not None else legacy_t
             age = (now - clock_t).total_seconds() if clock_t else None
-            since = 0
-            if clock_t is not None:
-                since = sum(1 for ts in stamps if ts >= clock_t)
+            since = None
+            if dot in activity:
+                since = 0 if clock_t is None else sum(1 for ts in stamps if ts >= clock_t)
             status, detail, refs = evidence_status(evidence, resolver)
             row = {
                 "dot": dot,
@@ -908,6 +958,7 @@ def build_snapshot(config, transport, now, errors=None):
                 "updated_at": (data["roster"] or {}).get("updated_at"),
                 "slots": len(slots),
             },
+            "activity_configured": dot in activity_configured,
             "activity": {
                 label: {
                     "calls_15m": value["calls"].get("short", 0),
@@ -967,7 +1018,8 @@ def render_table(snapshot):
                 label, act["calls_15m"], act["calls_60m"], act["last_call_at"] or "-",
                 act["covered_since"] or "-", " (window clipped by log rotation)" if act["partial_window"] else ""))
         if not data["activity"]:
-            lines.append("  activity none configured")
+            lines.append("  activity unknown" if data["activity_configured"]
+                         else "  activity none configured")
         headers = ("AGENT", "CLASS", "STATE", "AGE", "EVID", "ROLE", "TASK")
         rows = []
         for row in data["agents"]:
@@ -1002,6 +1054,7 @@ def render_table(snapshot):
     stall = (snapshot.get("thresholds") or {}).get("stall_minutes", 30)
     lines.append("")
     lines.append("classes: WORKING record<=%dm and tool calls since it | QUIET record<=%dm, no calls since it | "
+                 "ACTIVITY_UNKNOWN no activity source answered | "
                  "STALLED start/step older than %dm, or only off-format lines and none in %dm | BLOCKED | "
                  "DONE evidence resolves or GitHub was unreachable | UNPROVEN evidence missing/unresolved, "
                  "or done on local-only or stale evidence | LEGACY recent off-format lines only | "
@@ -1044,6 +1097,11 @@ def diff_events(previous, snapshot):
                                "age": row["age"], "task": row["task"],
                                "evidence": row["evidence_status"], "note": row["note"]},
                 })
+        if not data["activity"]:
+            # Compare the next successful read with the last observed activity.
+            if dot in previous["activity"]:
+                state["activity"][dot] = previous["activity"][dot]
+            continue
         calls = sum(act["calls_15m"] for act in data["activity"].values())
         active = calls > 0
         old_active = previous["activity"].get(dot)
@@ -1108,10 +1166,10 @@ def watch(config, transport, interval, as_json, out=sys.stdout):
                 print("DOTS_MONITOR started at %s interval=%ss" % (snapshot["generated_at"], interval),
                       flush=True)
             for dot, data in snapshot["dots"].items():
-                calls = sum(a["calls_15m"] for a in data["activity"].values())
-                emit_event({"event": "DOTS_DOT", "dot": dot, "agent": "-",
-                            "detail": {"agents": len(data["agents"]), "calls_15m": calls}},
-                           as_json)
+                detail = {"agents": len(data["agents"])}
+                if data["activity"]:
+                    detail["calls_15m"] = sum(a["calls_15m"] for a in data["activity"].values())
+                emit_event({"event": "DOTS_DOT", "dot": dot, "agent": "-", "detail": detail}, as_json)
         for event in events:
             emit_event(event, as_json)
         elapsed = time.time() - started
@@ -1183,8 +1241,11 @@ def default_config_path():
 
 
 def load_config(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = json.load(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except OSError:
+        raise SystemExit("config not found: %s" % path) from None
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     for key, value in raw.items():
         if isinstance(value, dict) and isinstance(config.get(key), dict):
