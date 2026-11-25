@@ -1101,6 +1101,151 @@ class WatchTests(Base):
             self.assertEqual(self.tick("--took", mid, agent=agent).returncode, 0)
         return mid
 
+    def put_roster(self, dot="DOT-A", **fields):
+        self.make_dot(dot)
+        path = os.path.join(self.base, "live", dot, "roster.json")
+        d.write_atomic(path, json.dumps(dict({"coordinator": "lead"}, **fields)))
+
+    def keep_full(self, *args):
+        res = run(["watch", "--keep-full", "DOT-A", *args], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def test_keep_full_wakes_coordinator_and_reports_filled_once(self):
+        self.put_roster(slots_total=7, slots_unassigned=5)
+        target, cmd = self.recorder("rings", ("{dot}", "{agent}", "{why}"))
+        args = ["--fill-after-min", "0", "--idle-cmd", json.dumps(cmd)]
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=5 total=7 age=0m coordinator=lead",
+                      self.keep_full(*args))
+        self.put_roster(slots_total=7, slots_unassigned=0)
+        self.assertIn("WATCH_FILLED DOT-A", self.keep_full(*args))
+        self.assertNotIn("WATCH_FILLED DOT-A", self.keep_full(*args))
+        self.assertEqual(read(target).splitlines(), ["DOT-A lead UNDERFILLED"])
+        self.put_roster(slots_total=7, slots_unassigned=2)
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=2", self.keep_full(*args))
+
+    def test_keep_full_restarts_keep_first_observation_and_rewake_interval(self):
+        self.put_roster(slots_total=7, slots_unassigned=5)
+        target, cmd = self.recorder("rings", ("{agent}",))
+        args = ["--idle-cmd", json.dumps(cmd), "--rewake-min", "120"]
+        self.assertIn("WATCH_SKIP DOT-A", self.keep_full(*args))
+        self.assertFalse(os.path.exists(target))
+        path = os.path.join(self.base, "watch", "state.json")
+        state = d.load_json(path)
+        state["capacity"]["DOT-A"]["since"] = d.iso_after(-31 * 60)
+        d.write_atomic(path, json.dumps(state))
+        self.put_roster(slots_total=7, slots_unassigned=4)
+        self.assertIn("free=4 total=7 age=31m", self.keep_full(*args))
+        self.assertIn("WATCH_SKIP DOT-A", self.keep_full(*args))
+        self.assertEqual(read(target).split(), ["lead"])
+        state = d.load_json(path)
+        state["capacity"]["DOT-A"]["ring_t"] = d.iso_after(-121 * 60)
+        d.write_atomic(path, json.dumps(state))
+        self.assertIn("WATCH_UNDERFILLED DOT-A", self.keep_full(*args))
+        self.assertEqual(read(target).split(), ["lead", "lead"])
+
+    def test_keep_full_is_only_enabled_by_repeatable_explicit_cli_dot(self):
+        for dot in ("DOT-A", "DOT-B", "DOT-C"):
+            self.put_roster(dot, slots_total=7, slots_unassigned=3)
+        self.config_with(dots=["DOT-C"], watch={"keep_full": ["DOT-C"]}, keep_full=["DOT-C"])
+        args = ["--fill-after-min", "0"]
+        self.assertNotIn("WATCH_UNDERFILLED", run(["watch", *args], self.base).stdout)
+        out = self.keep_full("--keep-full", "DOT-A", "--keep-full", "DOT-B", *args)
+        self.assertEqual(out.count("WATCH_UNDERFILLED DOT-A"), 1)
+        self.assertIn("WATCH_UNDERFILLED DOT-B", out)
+        self.assertNotIn("WATCH_UNDERFILLED DOT-C", out)
+
+    def test_slot_counts_use_only_occupancy_not_activity_in_board_and_watch(self):
+        self.put_roster(actors=[{"agent": "a", "occupies_slot": True, "state": "idle"},
+                                {"agent": "b", "occupies_slot": False, "state": "working"}])
+        self.put_roster("DOT-B", slots_total=7, actors=[{"agent": "lead", "occupies_slot": True}])
+        for fmt in ([], ["--json"]):
+            res = run(["board", "DOT-A", "DOT-B", *fmt], self.base)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            if fmt:
+                slots = json.loads(res.stdout)["slots"]
+                self.assertEqual((slots["DOT-A"]["free"], slots["DOT-A"]["total"]), (1, 2))
+                self.assertEqual((slots["DOT-B"]["free"], slots["DOT-B"]["total"]), (6, 7))
+            else:
+                self.assertIn("DOT-A slots free=1 total=2", res.stdout)
+                self.assertIn("DOT-B slots free=6 total=7", res.stdout)
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=1 total=2", self.keep_full("--fill-after-min", "0"))
+
+    def test_keep_full_bad_roster_never_wakes_or_declares_recovery(self):
+        target, cmd = self.recorder("rings", ("{agent}",))
+        args = ["--idle-cmd", json.dumps(cmd), "--fill-after-min", "0"]
+        self.put_roster(slots_total=7, slots_unassigned=1)
+        self.keep_full(*args)
+        for bad in ({"slots_total": 1, "slots_unassigned": 2},
+                    {"actors": [{"agent": "lead"}]},
+                    {"slots_total": True, "slots_unassigned": 0},
+                    {"slots_total": 7, "slots_unassigned": 3, "coordinator": "-bad"}):
+            self.put_roster(**bad)
+            out = self.keep_full(*args)
+            self.assertIn("WATCH_ERROR", out)
+            self.assertNotIn("WATCH_FILLED", out)
+        self.assertEqual(read(target).split(), ["lead"])
+
+    def test_keep_full_uses_ten_minute_defaults_without_changing_other_idle_wakes(self):
+        self.put_roster(slots_total=7, slots_unassigned=5)
+        target, cmd = self.recorder("rings", ("{agent}",))
+        args = ["--idle-cmd", json.dumps(cmd)]
+        first = self.keep_full(*args)
+        self.assertIn("fill_after_min=default:10", first)
+        self.assertIn("keep_full_rewake_min=default:10", first)
+        self.assertIn(" rewake_min=default:120 ", first)
+        self.assertFalse(os.path.exists(target))
+        path = os.path.join(self.base, "watch", "state.json")
+
+        def set_age(key, minutes):
+            state = d.load_json(path)
+            state["capacity"]["DOT-A"][key] = d.iso_after(-minutes * 60)
+            d.write_atomic(path, json.dumps(state))
+
+        set_age("since", 9)
+        self.assertIn("reason=fill_grace", self.keep_full(*args))
+        set_age("since", 11)
+        self.assertIn("WATCH_UNDERFILLED DOT-A", self.keep_full(*args))
+        set_age("ring_t", 9)
+        self.assertIn("reason=fill_rewake", self.keep_full(*args))
+        set_age("ring_t", 11)
+        self.assertIn("WATCH_UNDERFILLED DOT-A", self.keep_full(*args))
+        self.assertEqual(read(target).split(), ["lead", "lead"])
+
+    def test_keep_full_counts_parked_slots_once_without_reassigning_them(self):
+        actors = [{"agent": name, "occupies_slot": occupies, "slot_state": state}
+                  for name, occupies, state in [
+                      ("a", True, "blocked_component"), ("b", True, "awaits_review"),
+                      ("c", True, "owner_hold"), ("d", True, "waiting"), ("e", True, "idle"),
+                      ("e", True, "idle"), ("active", True, "working"), ("not-occupied", False, "idle"),
+                      ("contradiction", True, "idle"), ("contradiction", True, "working"),
+                  ]]
+        # A parked classification is about slot_state: a live wait alone is not an idle claim.
+        waiter = self.start_wait(agent="active")
+        waiter.stdin.close()
+        waiter.stdin = None
+        self.put_roster(slots_total=8, slots_unassigned=1, actors=actors)
+        roster = pathlib.Path(self.base) / "live" / "DOT-A" / "roster.json"
+        untouched = roster.read_bytes()
+        target, cmd = self.recorder("rings", ("{agent}", "{why}"))
+        args = ["--fill-after-min", "0", "--idle-cmd", json.dumps(cmd)]
+        out = self.keep_full(*args)
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=6 total=8 age=0m coordinator=lead "
+                      "parked=5 parked_agents=a,b,c,d,e", out)
+        self.assertEqual(untouched, roster.read_bytes())
+        board = json.loads(run(["board", "DOT-A", "--json"], self.base).stdout)
+        self.assertEqual(board["slots"]["DOT-A"]["free"], 6)
+        self.assertEqual(board["slots"]["DOT-A"]["unassigned"], 1)
+        self.assertEqual(board["slots"]["DOT-A"]["parked"], 5)
+        self.assertEqual(read(target).splitlines(), ["lead UNDERFILLED"])
+        self.assertIsNone(waiter.poll())
+        self.put_roster(slots_total=8, slots_unassigned=0, actors=actors)
+        self.assertNotIn("WATCH_FILLED", self.keep_full(*args))
+        self.put_roster(slots_total=8, slots_unassigned=0,
+                        actors=[dict(a, slot_state="working") for a in actors])
+        self.assertIn("WATCH_FILLED DOT-A", self.keep_full(*args))
+        self.assertNotIn("WATCH_FILLED DOT-A", self.keep_full(*args))
+
     def test_a_wake_runs_once_for_a_message_nobody_answered(self):
         mid = self.waiting_message(read=False)
         target, argv = self.recorder("wake.txt")
