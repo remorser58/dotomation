@@ -4,8 +4,10 @@
 
 - **Owner-private directory:** `~/.subdots` (or `--state-dir` / `$SUBDOTS_STATE_DIR`), enforced mode `0700`, non-symlink, owned by current UID.
   - Strictly separate from any Dots-root-writable `.dots-ops/` folder so a Dots root cannot forge hub state, wake commands, or delivery markers.
-- **`runtime.json` (`0600`):** Written atomically with `O_NONBLOCK`. Holds `pid`, `socket_path`, `http_host`, `http_port`, `token`, `http_url`, `mcp_url`, `public_host`, `ops_base`.
-- **Unix control socket (`c.sock`, `0600`):** Uses `<state_dir>/c.sock` when UTF-8 path length is `<= 96` bytes, else `/tmp/sd-<sha256[:12]>/c.sock` inside a `0700` dir (preventing macOS `ENAMETOOLONG`).
+  - **Same-UID trust boundary:** All processes running as the owner UID share access to `c.sock`, `runtime.json`, and `sessions/<agent>.json`. When isolating untrusted sub-agent processes locally, run them under a separate OS user or container/VM and issue only the per-session `(hub_url, epoch, session_token)` rather than sharing `$SUBDOTS_STATE_DIR`.
+  - **Hook placeholders:** `{task}` and `{why}` are allowlist-sanitized before argv substitution and must never be interpolated into remote shell commands (e.g., `ssh ... sh -c`) or script interpreters (`osascript -e`); pass them strictly as standalone argv items.
+- **`runtime.json` (`0600`):** Written atomically with `O_NONBLOCK` + `O_NOFOLLOW`. Holds `pid`, `socket_path`, `http_host`, `http_port`, `token`, `http_url`, `mcp_url`, `public_host`, `ops_base`.
+- **Unix control socket (`c.sock`, `0600`):** Uses `<state_dir>/c.sock` when UTF-8 path length is `<= 96` bytes, else `/tmp/sd-<sha256[:8]>-<random>/c.sock` inside an unpredictable `0700` `mkdtemp` dir (preventing macOS `ENAMETOOLONG` and shared-`/tmp` pre-creation races).
 - **SQLite WAL ledger (`subdots.sqlite`):** `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, serialized through a single `RLock` without holding the lock across `Condition.wait()` or subprocess calls.
 
 ## 2. Two-Phase Guaranteed Delivery & Piggyback

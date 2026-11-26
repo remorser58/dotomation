@@ -107,7 +107,7 @@ import sys
 if __name__ == "__main__" and sys.path:
     del sys.path[0]
 
-import argparse, contextlib, datetime, fcntl, glob, hashlib, json, math, os, pathlib, re, secrets, signal, socket, stat, subprocess, time, types
+import argparse, contextlib, datetime, fcntl, glob, hashlib, json, math, os, pathlib, re, secrets, shlex, signal, socket, stat, subprocess, time, types
 import ast
 import tempfile
 import urllib.error
@@ -130,8 +130,8 @@ def default_base():
     return os.path.expanduser("~/.dots-ops")
 
 BASE = default_base()
-TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-ID = re.compile(r"^m-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$")
+TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+ID = re.compile(r"^m-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}\Z")
 RFC3339 = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
                      r"(\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$")
 STATES = ("start", "step", "blocked", "done")
@@ -208,7 +208,7 @@ def block(name, value):
     return value.strip("\r\n")
 
 def token(name, value):
-    if not TOKEN.match(value or ""):
+    if not isinstance(value, str) or not TOKEN.fullmatch(value):
         die(f"bad {name} {value!r}")
     return value
 
@@ -1954,6 +1954,15 @@ def init(a):
     if not dots:
         die("no dots: pass --dot ID at least once")
 
+    for d in dots:
+        if isinstance(d, dict) and d.get("id") is not None:
+            token("dot", d["id"])
+    for p in projects:
+        if isinstance(p, dict) and p.get("id") is not None:
+            token("project", p["id"])
+        if isinstance(p, dict) and p.get("main") is not None:
+            token("main", p["main"])
+
     os.makedirs(base, exist_ok=True)   # only once the input is accepted
     for d in dots:
         if isinstance(d, dict) and isinstance(d.get("id"), str):
@@ -1977,7 +1986,7 @@ def init(a):
         write_atomic(path, data)
     print(f"INIT base={base}")
     if os.path.abspath(base) != os.path.abspath(default_base()):
-        print(f"INIT export DOTS_OPS_BASE={base} (every other command resolves this folder)")
+        print(f"INIT export DOTS_OPS_BASE={shlex.quote(base)} (every other command resolves this folder)")
     for line in report:
         print(line)
     print(f"INIT config {path} ({'unchanged' if current == data else 'written'})")
@@ -2009,12 +2018,14 @@ def rules_lines(script):
 
 def announce_rules(a):
     """Before the first output of an agent that has no memory yet, print the rules it must follow.
-    Read from the memory file, not from dots.json or the roster: the root may never pass a brief."""
+    Read from the memory file and owner-controlled env, not from dots.json or the roster: the root may never silence rules."""
     agent = getattr(a, "agent", None)
-    if a.cmd not in ("tick", "reply", "wait") or not isinstance(agent, str) or not TOKEN.match(agent):
+    if a.cmd not in ("tick", "reply", "wait") or not isinstance(agent, str) or not TOKEN.fullmatch(agent):
+        return
+    if os.environ.get("DOTS_MODE") in ("dots-only", "1"):
         return
     dot = getattr(a, "dot", None) or dot_for(agent)
-    if not (isinstance(dot, str) and TOKEN.match(dot)):
+    if not (isinstance(dot, str) and TOKEN.fullmatch(dot)):
         return
     if tool_memory(dot, agent):
         return
@@ -2052,31 +2063,45 @@ def brief(base, dots, projects, cfg, script):
         print("- Require explicit user approval before destructive actions and before pushing, merging, releasing, or deploying.")
         print("- Report only checks actually run and real remaining risks. Do not turn investigation tools into mandatory proof-of-absence ceremonies.")
         print("# Core Operating Instructions")
-        print("- Scope and Autonomy: complete the user's full requested outcome, act independently within established permissions, ask only on missing essentials / material scope change / genuine blocker.")
-        print("- Execution and Engineering: ground decisions in evidence, isolate root causes, favor the simplest complete solution, avoid speculative abstractions.")
-        print("- Persistence and Verification: continue through all authorized steps; reassess up to 3 meaningfully different approaches when blocked; verify through proportionate checks.")
-        print("- Continuity and Communication: reuse history/constraints, report verified work, assumptions, and remaining limits in the user's language.")
-        print("- Guiding Principle: maximize completed, verified work within intent/scope; stop only when achieved or genuinely blocked.")
-        print("Quota boundary: Dots quota only (zero local session quota). Do not run subdots.py or direct-mail polling.")
+        print("## Scope and Autonomy")
+        print("- Complete the user's full requested outcome, not merely a plan or suggested next step. Stay strictly within scope. Inspect existing context, prior work, and current state before acting. Never repeat completed work or modify anything during read-only tasks.")
+        print("- Act independently within established permissions. Make reasonable, reversible assumptions and continue without routine confirmation. Ask only when essential information is missing, a material scope change is needed, or a genuine blocker requires user input. Obtain approval before destructive or irreversible actions, external communications, deployments, or purchases.")
+        print("## Execution and Engineering")
+        print("- Use available tools proactively and ground decisions in actual evidence. Investigate root causes, distinguish facts from hypotheses, and favor the simplest complete solution.")
+        print("- For coding, follow repository conventions, reuse existing logic and APIs, preserve established behavior, and keep changes readable and maintainable. Avoid unnecessary abstractions, defensive scaffolding, speculative refactoring, and redundant tests. Add focused tests when needed to verify behavior or prevent specific regressions.")
+        print("## Persistence and Verification")
+        print("- Continue through all authorized steps until the requested outcome is fully delivered. Do not stop after intermediate milestones or hand execution back to the user unnecessarily.")
+        print("- When blocked, reassess evidence and try up to three meaningfully different approaches. Complete independent work if a blocker remains.")
+        print("- Verify outcomes through proportionate tests, inspection, or direct observation. Never claim success, tool results, or verification that did not occur. Do not promise background execution without actual scheduling capabilities.")
+        print("## Continuity and Communication")
+        print("- Reuse relevant history, decisions, preferences, and project constraints. Refresh time-sensitive information when necessary.")
+        print("- For substantial tasks, provide concise progress updates without interrupting execution. Keep the final response self-contained, using the user's language and appropriate technical terminology. Report completed work, verification, consequential assumptions, and remaining limitations clearly.")
+        print("## Guiding Principle")
+        print("- Maximize completed, verified work within the user's intent and authorized scope. Minimize friction, avoid unnecessary confirmation, and stop only when the requested objective is achieved or genuinely blocked.")
+        print("# Dots-Only Execution Context")
+        print("- Quota boundary: Dots quota only (zero local session quota). Do not install or run subdots.py or direct-mail polling.")
+        print("- Model & Effort: GPT-6.2 Astra (`ultra` for coordinator, `xhigh` for workers/reviewers). Never use Codex on any host.")
         return
 
     if mode == "sub-dots":
+        q_base = shlex.quote(base)
+        q_subdots = shlex.quote(subdots_script)
         print("Mode 2: sub-dots (Reverse web-gpt-agent steering + harness). Start Hub on local, then paste brief:")
         print()
-        print(f"Local Hub start: python3 {subdots_script} hub start --ops-base {base}")
-        print(f"Local stdio MCP: python3 {subdots_script} mcp-stdio")
-        print(f"Local steering:  python3 {subdots_script} send <agentId> task <TASK> --text ... | steer <agentId> --interrupt --text ...")
+        print(f"Local Hub start: python3 {q_subdots} hub start --ops-base {q_base}")
+        print(f"Local stdio MCP: python3 {q_subdots} mcp-stdio")
+        print(f"Local steering:  python3 {q_subdots} send <agentId> task <TASK> --text ... | steer <agentId> --interrupt --text ...")
         print()
         print("Paste this to the Dots sub-agent / root (fill <kit commit SHA>):")
         print("Dotomation Mode 2: sub-dots @ <kit commit SHA>")
         print(f"Dots: {', '.join(names)}")
         print("Projects: " + (", ".join(f"{k} (main {v})" for k, v in sorted(main_by.items())) or "none"))
-        print(f"Reverse bridge helper: python3 {subdots_script}")
-        print(f"  1) register: python3 {subdots_script} agent register <agentId> --dot <DOT> --project <project>")
-        print(f"  2) wait:     python3 {subdots_script} agent wait <agentId> --timeout 3300")
-        print(f"  3) exec:     python3 {subdots_script} agent exec <agentId> -- <command...>")
-        print(f"  4) step:     python3 {subdots_script} agent step <agentId> <start|step|blocked|done> --task T --note N --evidence E --goal G --doing D --next X [--ack ID]")
-        print(f"  5) reply:    python3 {subdots_script} agent reply <agentId> <result|question|block|ack|answer|note> <task> --re ID --ref R --text ...")
+        print(f"Reverse bridge helper: python3 {q_subdots}")
+        print(f"  1) register: python3 {q_subdots} agent register <agentId> --dot <DOT> --project <project>")
+        print(f"  2) wait:     python3 {q_subdots} agent wait <agentId> --timeout 3300")
+        print(f"  3) exec:     python3 {q_subdots} agent exec <agentId> -- <command...>")
+        print(f"  4) step:     python3 {q_subdots} agent step <agentId> <start|step|blocked|done> --task T --note N --evidence E --goal G --doing D --next X [--ack ID]")
+        print(f"  5) reply:    python3 {q_subdots} agent reply <agentId> <result|question|block|ack|answer|note> <task> --re ID --ref R --text ...")
         print("Full brief & protocol: modes/sub-dots/AGENT-BRIEF.md, modes/sub-dots/PROTOCOL.md")
         return
 

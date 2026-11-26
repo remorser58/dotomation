@@ -2139,8 +2139,44 @@ class InitTests(Base):
             self.assertIn("# Coding Philosophy", res.stdout)
             self.assertIn("# Safety", res.stdout)
             self.assertIn("# Core Operating Instructions", res.stdout)
+            self.assertIn("Scope and Autonomy", res.stdout)
+            self.assertIn("GPT-6.2 Astra", res.stdout)
+            self.assertIn("Never use Codex", res.stdout)
             self.assertNotIn("hub start", res.stdout)
             self.assertNotIn("AGENT_RULES", res.stdout)
+
+    def test_mode1_skips_direct_mail_rules_and_rejects_poisoned_dots_json(self):
+        sub_base = os.path.join(self.base, "m-dotsonly-rules")
+        self.assertEqual(
+            run(["init", "--yes", "--mode", "dots-only", "--base", sub_base, "--dot", "DOT-A"], sub_base).returncode,
+            0,
+        )
+        # Root-writable dots.json alone cannot silence AGENT_RULES; owner-controlled DOTS_MODE=dots-only does.
+        t_root = run(["tick", "DOT-A", "a1", "start", "--task", "T1", "--project", "proj", "--host", "local", "--role", "구현",
+                      "--model", "requested gpt-6.2-astra xhigh; runtime does not display effective",
+                      "--note", "n", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n"], sub_base)
+        self.assertEqual(t_root.returncode, 0, t_root.stderr)
+        self.assertIn("AGENT_RULES", t_root.stdout)
+
+        t_owner = subprocess.run(
+            [sys.executable, d.__file__, "tick", "DOT-A", "a2", "start", "--task", "T1", "--project", "proj", "--host", "local",
+             "--role", "구현", "--model", "requested gpt-6.2-astra xhigh; runtime does not display effective",
+             "--note", "n", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n"],
+            env=dict(os.environ, DOTS_OPS_BASE=sub_base, DOTS_MODE="dots-only", DOTS_AUTO_UPDATE="0", PYTHONDONTWRITEBYTECODE="1"),
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(t_owner.returncode, 0, t_owner.stderr)
+        self.assertNotIn("AGENT_RULES", t_owner.stdout)
+
+        for idx, bad_dot in enumerate(("../escape", 123, "DOT1\n")):
+            poison_base = os.path.join(self.base, f"m-poison-{idx}")
+            os.makedirs(poison_base, exist_ok=True)
+            pathlib.Path(os.path.join(poison_base, "dots.json")).write_text(
+                json.dumps({"v": 1, "dots": [{"id": bad_dot}], "projects": [], "hosts": []})
+            )
+            p = run(["init", "--yes", "--base", poison_base, "--dot", "DOT-A"], poison_base)
+            self.assertEqual(p.returncode, 2)
+            self.assertFalse(os.path.exists(os.path.join(poison_base, "live", "..", "escape")))
 
     def test_init_mode_sub_dots_sets_config_and_prints_reverse_bridge(self):
         for flag in ("sub-dots", "2"):

@@ -36,7 +36,6 @@ import sys
 # Drop script directory from sys.path[0] when invoked directly so a sibling file
 # (e.g. json.py or sqlite3.py) in a writable folder cannot shadow the stdlib.
 if __name__ == "__main__" and sys.path:
-    _script_dir = os_path_dirname = None
     import os as _os
     _script_dir = _os.path.dirname(_os.path.abspath(__file__))
     if sys.path[0] == _script_dir:
@@ -48,12 +47,16 @@ import contextlib
 import datetime
 import hashlib
 import hmac
+import http.client
 import http.server
+import ipaddress
 import json
+import math
 import os
 import pathlib
 import re
 import secrets
+import shlex
 import signal
 import socket
 import socketserver
@@ -131,23 +134,59 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "spin_poll_burst": 12,
 }
 
+_SECRET_KEY_RE = re.compile(r"(?i)(?:token|api[_-]?key|secret|password|passwd|credential|session)")
+_ASSIGN_SECRET_RE = re.compile(
+    r"""(?i)\b([A-Za-z0-9_]{1,96})([ \t]*[=:][ \t]*)(?:"([^"\r\n]{1,512})"|'([^'\r\n]{1,512})'|([^\s,;\"']{1,512}))"""
+)
+_JSON_SECRET_RE = re.compile(
+    r"""(?i)"([A-Za-z0-9_-]{1,96})"([ \t]*:[ \t]*)"([^"\r\n]{1,512})" """.strip()
+)
+
 REDACT_RULES = (
-    (re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{20,})\b"), "[REDACTED]"),
-    (re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})\b"), "[REDACTED]"),
-    (re.compile(r"(?i)\b(authorization:\s*bearer\s+)[^\s,;]+"), r"\1[REDACTED]"),
     (
         re.compile(
-            r"(?i)\b([A-Za-z0-9_]*(?:token|api[_-]?key|secret|password|passwd|credential)[A-Za-z0-9_]*\s*[=:]\s*)[^\s,;\"']+"
+            r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]{0,16384}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----"
         ),
-        r"\1[REDACTED]",
+        "[REDACTED_PRIVATE_KEY]",
     ),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[^\r\n]*"), "[REDACTED_PRIVATE_KEY]"),
+    (re.compile(r"(https?://[^/\s]+/)[0-9a-f]{48}(?=/|$|\b)"), r"\1[REDACTED]"),
+    (re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{20,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[REDACTED]"),
+    (re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)\b(authorization:\s*(?:bearer|basic)\s+)[^\s,;]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._+/=-]{16,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([?&](?:token|key|secret|password|passwd|auth|access_token|api_key)=)[^&\s]+"), r"\1[REDACTED]"),
 )
+
+
+def _redact_assign_match(m: re.Match) -> str:
+    key, sep, dq, sq, uq = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+    if not _SECRET_KEY_RE.search(key):
+        return m.group(0)
+    if dq is not None:
+        return f'{key}{sep}"[REDACTED]"'
+    if sq is not None:
+        return f"{key}{sep}'[REDACTED]'"
+    return f"{key}{sep}[REDACTED]"
+
+
+def _redact_json_match(m: re.Match) -> str:
+    key, sep = m.group(1), m.group(2)
+    if not _SECRET_KEY_RE.search(key):
+        return m.group(0)
+    return f'"{key}"{sep}"[REDACTED]"'
 
 
 def redact(value: str) -> str:
     out = value
     for pat, repl in REDACT_RULES:
         out = pat.sub(repl, out)
+    out = _ASSIGN_SECRET_RE.sub(_redact_assign_match, out)
+    out = _JSON_SECRET_RE.sub(_redact_json_match, out)
     return out
 
 
@@ -178,8 +217,8 @@ def validate_token(name: str, value: Any) -> str:
 def validate_one_line(name: str, value: Any, limit: int = MAX_TEXT_LEN) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
-    if "\n" in value or "\r" in value:
-        raise ValueError(f"{name} must be a single line")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must be a single line without NUL bytes")
     if not value.strip():
         raise ValueError(f"{name} must not be empty")
     if len(value) > limit:
@@ -187,10 +226,50 @@ def validate_one_line(name: str, value: Any, limit: int = MAX_TEXT_LEN) -> str:
     return value
 
 
-def validate_body(name: str, value: Any) -> str:
+def validate_body(name: str, value: Any, limit: int = MAX_HTTP_BODY_BYTES) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must not be empty")
+    if "\x00" in value:
+        raise ValueError(f"{name} must not contain NUL bytes")
+    if len(value) > limit:
+        raise ValueError(f"{name} exceeds {limit} chars")
     return value
+
+
+def validate_finite_float(
+    name: str,
+    value: Any,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be a finite number")
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and out > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return out
+
+
+def validate_str_list(
+    name: str,
+    value: Any,
+    max_items: int = 32,
+    item_limit: int = MAX_ITEM_LEN,
+) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a list of strings")
+    if len(value) > max_items:
+        raise ValueError(f"{name} exceeds {max_items} items")
+    out: List[str] = []
+    for item in value:
+        out.append(validate_one_line(f"{name}[]", item, item_limit))
+    return out
 
 
 def default_state_dir() -> str:
@@ -202,28 +281,61 @@ def ensure_private_dir(path: str) -> str:
     if os.path.islink(path):
         raise OSError(f"{path} must not be a symlink")
     os.makedirs(path, mode=0o700, exist_ok=True)
-    if os.path.islink(path) or not os.path.isdir(path):
-        raise OSError(f"{path} is not a directory")
-    st = os.lstat(path)
-    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-        raise OSError(f"{path} is not owned by current user")
-    os.chmod(path, 0o700)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, os.O_RDONLY | o_dir | nofollow)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{path} is not a directory")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise OSError(f"{path} is not owned by current user")
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o700)
+        else:
+            os.chmod(path, 0o700)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
     return path
 
 
-def write_private_atomic(path: str, data: str, mode: int = 0o600) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    ensure_private_dir(parent)
-    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK, mode)
+def write_private_atomic(
+    path: str,
+    data: str,
+    mode: int = 0o600,
+    enforce_parent_dir: bool = True,
+) -> None:
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    if enforce_parent_dir:
+        ensure_private_dir(parent)
+    else:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.islink(abs_path):
+        raise OSError(f"{abs_path} must not be a symlink")
+    tmp = f"{abs_path}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | os.O_NONBLOCK
+    fd = os.open(tmp, flags, mode)
+    opened = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            opened = True
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), mode)
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        if not hasattr(os, "fchmod"):
+            os.chmod(tmp, mode)
+        if os.path.islink(abs_path):
+            raise OSError(f"{abs_path} must not be a symlink")
+        os.replace(tmp, abs_path)
     except BaseException:
+        if not opened:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
@@ -236,66 +348,166 @@ def read_regular_text(path: str, max_bytes: int = MAX_HTTP_BODY_BYTES) -> Option
         return None
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise OSError(f"{path} is not a regular file")
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, os.O_RDONLY | nofollow | os.O_NONBLOCK)
+    opened = False
     try:
         fst = os.fstat(fd)
         if not stat.S_ISREG(fst.st_mode):
             raise OSError(f"{path} is not a regular file")
         with os.fdopen(fd, "rb") as fh:
+            opened = True
             data = fh.read(max_bytes + 1)
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(fd)
+        if not opened:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         raise
     if len(data) > max_bytes:
         raise OSError(f"{path} exceeds {max_bytes} bytes")
     return data.decode("utf-8")
 
 
-def append_regular_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    if os.path.exists(path):
-        st = os.lstat(path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise OSError(f"{path} is not a regular file")
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o644)
+@contextlib.contextmanager
+def open_ops_dir_nofollow(base_dir: str, rel_parts: Sequence[str]):
+    """Create and traverse a relative ops directory chain rejecting symlinks at every segment."""
+    os.makedirs(base_dir, exist_ok=True)
+    bst = os.lstat(base_dir)
+    if stat.S_ISLNK(bst.st_mode) or not stat.S_ISDIR(bst.st_mode):
+        raise OSError(f"{base_dir} must be a non-symlink directory")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    cur_fd = os.open(base_dir, os.O_RDONLY | o_dir | nofollow)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(f"{path} is not a regular file")
-        line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-        with os.fdopen(fd, "ab") as fh:
-            import fcntl
-
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
-    except BaseException:
+        for part in rel_parts:
+            if not part or part in (".", "..") or "/" in part or "\\" in part or "\x00" in part:
+                raise OSError(f"unsafe ops path component: {part!r}")
+            try:
+                os.mkdir(part, 0o755, dir_fd=cur_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | o_dir | nofollow, dir_fd=cur_fd)
+            os.close(cur_fd)
+            cur_fd = next_fd
+        yield cur_fd
+    finally:
         with contextlib.suppress(OSError):
-            os.close(fd)
-        raise
+            os.close(cur_fd)
 
 
-def write_ops_atomic(path: str, data: str) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    if os.path.exists(path):
-        st = os.lstat(path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise OSError(f"{path} is not a regular file")
-    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK, 0o644)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+def _flock_nb_with_retry(fh: Any, timeout_s: float = 0.05) -> None:
+    import fcntl
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError("ops file lock busy")
+            time.sleep(0.005)
+
+
+def append_regular_jsonl(path: str, obj: Dict[str, Any], base_dir: Optional[str] = None) -> None:
+    abs_path = os.path.abspath(path)
+    filename = os.path.basename(abs_path)
+    parent = os.path.dirname(abs_path)
+    if base_dir is not None:
+        abs_base = os.path.abspath(base_dir)
+        rel_dir = os.path.relpath(parent, abs_base)
+        if rel_dir.startswith(".."):
+            raise OSError(f"{abs_path} escapes base_dir {abs_base}")
+        rel_parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        dir_ctx = open_ops_dir_nofollow(abs_base, rel_parts)
+    else:
+        os.makedirs(parent, exist_ok=True)
+        rel_parts = []
+        dir_ctx = open_ops_dir_nofollow(parent, rel_parts)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    with dir_ctx as dir_fd:
+        try:
+            st = os.lstat(filename, dir_fd=dir_fd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{abs_path} is not a regular file")
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            filename,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | nofollow | os.O_NONBLOCK,
+            0o644,
+            dir_fd=dir_fd,
+        )
+        opened = False
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"{abs_path} is not a regular file")
+            with os.fdopen(fd, "ab") as fh:
+                opened = True
+                _flock_nb_with_retry(fh)
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            if not opened:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            raise
+
+
+def write_ops_atomic(path: str, data: str, base_dir: Optional[str] = None) -> None:
+    abs_path = os.path.abspath(path)
+    filename = os.path.basename(abs_path)
+    parent = os.path.dirname(abs_path)
+    if base_dir is not None:
+        abs_base = os.path.abspath(base_dir)
+        rel_dir = os.path.relpath(parent, abs_base)
+        if rel_dir.startswith(".."):
+            raise OSError(f"{abs_path} escapes base_dir {abs_base}")
+        rel_parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        dir_ctx = open_ops_dir_nofollow(abs_base, rel_parts)
+    else:
+        os.makedirs(parent, exist_ok=True)
+        dir_ctx = open_ops_dir_nofollow(parent, [])
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    tmp_name = f".{filename}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    with dir_ctx as dir_fd:
+        try:
+            st = os.lstat(filename, dir_fd=dir_fd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{abs_path} is not a regular file")
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | os.O_NONBLOCK,
+            0o644,
+            dir_fd=dir_fd,
+        )
+        opened = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                opened = True
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                st = os.lstat(filename, dir_fd=dir_fd)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{abs_path} is not a regular file")
+            except FileNotFoundError:
+                pass
+            os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            if not opened:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            raise
 
 
 def socket_path_for(state_dir: str) -> Tuple[str, Optional[str]]:
@@ -304,10 +516,16 @@ def socket_path_for(state_dir: str) -> Tuple[str, Optional[str]]:
     candidate = os.path.join(real, "c.sock")
     if len(candidate.encode("utf-8")) <= 96:
         return candidate, None
-    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:12]
-    sock_dir = os.path.join(tempfile.gettempdir(), f"sd-{digest}")
-    ensure_private_dir(sock_dir)
-    return os.path.join(sock_dir, "c.sock"), sock_dir
+    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
+    sock_dir = tempfile.mkdtemp(prefix=f"sd-{digest}-")
+    sock_path = os.path.join(sock_dir, "c.sock")
+    if len(sock_path.encode("utf-8")) > 96:
+        with contextlib.suppress(OSError):
+            os.rmdir(sock_dir)
+        sock_dir = tempfile.mkdtemp(prefix=f"sd-{digest}-", dir="/tmp")
+        sock_path = os.path.join(sock_dir, "c.sock")
+    os.chmod(sock_dir, 0o700)
+    return sock_path, sock_dir
 
 
 def runtime_path_for(state_dir: str) -> str:
@@ -315,32 +533,57 @@ def runtime_path_for(state_dir: str) -> str:
 
 
 def read_runtime(state_dir: str) -> Dict[str, Any]:
+    if os.path.islink(state_dir):
+        raise OSError(f"{state_dir} must not be a symlink")
+    dst = os.lstat(state_dir)
+    if not stat.S_ISDIR(dst.st_mode):
+        raise OSError(f"{state_dir} is not a directory")
+    if hasattr(os, "geteuid") and dst.st_uid != os.geteuid():
+        raise OSError(f"{state_dir} owner mismatch")
     path = runtime_path_for(state_dir)
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise OSError(f"{path} is not a regular file")
-    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-        raise OSError(f"{path} owner mismatch")
-    if (st.st_mode & 0o077) != 0:
-        raise OSError(f"{path} permissions too open")
-    raw = read_regular_text(path, max_bytes=65536)
-    if raw is None:
-        raise FileNotFoundError(path)
-    doc = json.loads(raw)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, os.O_RDONLY | nofollow | os.O_NONBLOCK)
+    opened = False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path} is not a regular file")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise OSError(f"{path} owner mismatch")
+        if (st.st_mode & 0o077) != 0:
+            raise OSError(f"{path} permissions too open")
+        with os.fdopen(fd, "rb") as fh:
+            opened = True
+            raw_bytes = fh.read(65537)
+    except BaseException:
+        if not opened:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        raise
+    if len(raw_bytes) > 65536:
+        raise OSError(f"{path} exceeds 65536 bytes")
+    doc = json.loads(raw_bytes.decode("utf-8"))
     if not isinstance(doc, dict) or doc.get("v") != 1:
         raise ValueError("invalid runtime.json")
+    pid = doc.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ValueError("invalid pid in runtime.json")
     sock = doc.get("socket_path")
-    if isinstance(sock, str) and os.path.exists(sock):
-        sst = os.lstat(sock)
-        if stat.S_ISLNK(sst.st_mode) or not stat.S_ISSOCK(sst.st_mode):
-            raise OSError(f"control socket {sock} is invalid")
-        if hasattr(os, "geteuid") and sst.st_uid != os.geteuid():
-            raise OSError(f"control socket {sock} owner mismatch")
+    if isinstance(sock, str) and sock:
+        try:
+            sst = os.lstat(sock)
+        except FileNotFoundError:
+            sst = None
+        if sst is not None:
+            if stat.S_ISLNK(sst.st_mode) or not stat.S_ISSOCK(sst.st_mode):
+                raise OSError(f"control socket {sock} is invalid")
+            if hasattr(os, "geteuid") and sst.st_uid != os.geteuid():
+                raise OSError(f"control socket {sock} owner mismatch")
     return doc
 
 
 def pid_alive(pid: int) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
@@ -370,9 +613,25 @@ def parse_cmd_argv(spec: Optional[str], flag: str) -> Optional[List[str]]:
     if not isinstance(argv, list) or not argv or len(argv) > 32:
         raise ValueError(f"{flag} must be a non-empty list of <=32 strings")
     for item in argv:
-        if not isinstance(item, str) or not item.strip() or "\n" in item or "\r" in item:
-            raise ValueError(f"{flag} items must be non-empty single-line strings")
+        if not isinstance(item, str) or not item.strip() or "\x00" in item or "\n" in item or "\r" in item:
+            raise ValueError(f"{flag} items must be non-empty single-line strings without NUL bytes")
     return argv
+
+
+def _sanitize_argv_value(key: str, raw: Any) -> str:
+    text = str(raw)
+    text = text.replace("\x00", "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+    if key in ("task", "why"):
+        text = redact(text)
+        text = re.sub(r"[^A-Za-z0-9._:/@#+, -]+", "_", text)
+        text = " ".join(text.split())
+        if len(text) > 200:
+            text = text[:197] + "..."
+        while text.startswith("-"):
+            text = text.lstrip("-").strip()
+        if not text:
+            text = "item"
+    return text
 
 
 def render_argv(argv: Sequence[str], values: Dict[str, Any]) -> Optional[List[str]]:
@@ -380,7 +639,7 @@ def render_argv(argv: Sequence[str], values: Dict[str, Any]) -> Optional[List[st
         val = values.get(key)
         if val is None or val == "":
             return None
-    return [PLACEHOLDER_RE.sub(lambda m: str(values[m.group(1)]), part) for part in argv]
+    return [PLACEHOLDER_RE.sub(lambda m: _sanitize_argv_value(m.group(1), values[m.group(1)]), part) for part in argv]
 
 
 # ---------------------------------------------------------------------------
@@ -407,20 +666,42 @@ class OpsMirror:
 
     def __init__(self, ops_base: Optional[str]) -> None:
         self.ops_base = os.path.abspath(os.path.expanduser(ops_base)) if ops_base else None
+        self._cfg_main_cache: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
         return bool(self.ops_base)
 
-    def mirror_mail(self, direction: str, msg: Dict[str, Any], dot_main: Optional[str] = None) -> Optional[str]:
+    def _resolve_main_name(self, dot: str) -> str:
+        if self._cfg_main_cache:
+            return self._cfg_main_cache
+        if self.ops_base:
+            cfg_path = os.path.join(self.ops_base, "dots.json")
+            with contextlib.suppress(OSError, ValueError):
+                raw = read_regular_text(cfg_path, max_bytes=65536)
+                if raw:
+                    cfg = json.loads(raw)
+                    if isinstance(cfg, dict):
+                        candidate = cfg.get("main")
+                        if isinstance(candidate, str) and TOKEN_RE.fullmatch(candidate):
+                            self._cfg_main_cache = candidate
+                            return candidate
+        return f"{dot}-main" if dot else "main"
+
+    def mirror_mail(self, direction: str, msg: Dict[str, Any], dot_main: Optional[str] = None, dot: Optional[str] = None) -> Optional[str]:
         if not self.ops_base:
             return None
-        project = msg.get("project") or "default"
-        agent = msg["agent_id"]
+        try:
+            project = validate_token("project", msg.get("project") or "default")
+            agent = validate_token("agent_id", msg["agent_id"])
+            dot_tok = validate_token("dot", dot) if dot else None
+        except ValueError as exc:
+            return f"mirror_mail skipped: {exc}"
         box = os.path.join(self.ops_base, project, "mail", agent)
         filename = "in.jsonl" if direction == "to_agent" else "out.jsonl"
-        sender = (dot_main or f"{project}-main") if direction == "to_agent" else agent
-        recipient = agent if direction == "to_agent" else (dot_main or f"{project}-main")
+        resolved_main = dot_main or self._resolve_main_name(dot_tok or project)
+        sender = resolved_main if direction == "to_agent" else agent
+        recipient = agent if direction == "to_agent" else resolved_main
         kind = msg["kind"]
         if direction == "to_agent" and kind not in ("task", "question", "answer", "review", "note"):
             kind = "note"
@@ -432,14 +713,14 @@ class OpsMirror:
             "t": msg["created_at_iso"],
             "from": sender,
             "to": recipient,
-            "task": msg["task"],
+            "task": redact(str(msg["task"])),
             "kind": kind,
             "re": msg.get("re_id"),
-            "text": msg["text"],
-            "refs": msg.get("refs") or [],
+            "text": redact(str(msg["text"])),
+            "refs": [redact(str(r)) for r in (msg.get("refs") or [])],
         }
         try:
-            append_regular_jsonl(os.path.join(box, filename), line)
+            append_regular_jsonl(os.path.join(box, filename), line, base_dir=self.ops_base)
             return None
         except OSError as exc:
             return f"mirror_mail {filename}: {exc}"
@@ -453,41 +734,50 @@ class OpsMirror:
     ) -> Optional[str]:
         if not self.ops_base:
             return None
-        dot = agent.get("dot") or "DOT"
-        agent_id = agent["agent_id"]
+        try:
+            dot = validate_token("dot", agent.get("dot") or "DOT")
+            agent_id = validate_token("agent_id", agent["agent_id"])
+            project = validate_token("project", agent.get("project") or "default")
+        except ValueError as exc:
+            return f"mirror_step skipped: {exc}"
         live_path = os.path.join(self.ops_base, "live", dot, f"{agent_id}.jsonl")
         mem_path = os.path.join(self.ops_base, "memory", dot, f"{agent_id}.json")
         ts_iso = step_data["t"]
         live_line = {
             "t": ts_iso,
             "agent": agent_id,
-            "role": agent.get("role") or "구현",
-            "model": agent.get("model") or "requested gpt-6.2-astra xhigh; runtime does not display effective",
-            "project": agent.get("project") or "default",
-            "task": step_data["task"],
+            "role": redact(str(agent.get("role") or "구현")),
+            "model": redact(str(agent.get("model") or "requested gpt-6.2-astra xhigh; runtime does not display effective")),
+            "project": project,
+            "task": redact(str(step_data["task"])),
             "state": step_data["state"],
-            "host": step_data["host"],
-            "note": step_data["note"],
-            "evidence": step_data["evidence"],
+            "host": redact(str(step_data["host"])),
+            "note": redact(str(step_data["note"])),
+            "evidence": redact(str(step_data["evidence"])),
         }
+        redacted_decisions = [
+            {"t": str(d.get("t") or ts_iso), "text": redact(str(d.get("text", "")))}
+            for d in decisions[-MAX_DECISIONS:]
+        ]
+        redacted_blockers = [redact(str(b)) for b in blockers[:MAX_BLOCKERS]]
         mem_doc = {
             "v": 1,
             "t": ts_iso,
             "dot": dot,
             "agent": agent_id,
-            "project": live_line["project"],
-            "task": step_data["task"],
+            "project": project,
+            "task": redact(str(step_data["task"])),
             "state": step_data["state"],
-            "host": step_data["host"],
-            "goal": step_data["goal"],
-            "doing": step_data["doing"],
-            "next": step_data["next_step"],
-            "decisions": decisions[-MAX_DECISIONS:],
-            "blockers": blockers[:MAX_BLOCKERS],
+            "host": redact(str(step_data["host"])),
+            "goal": redact(str(step_data["goal"])),
+            "doing": redact(str(step_data["doing"])),
+            "next": redact(str(step_data["next_step"])),
+            "decisions": redacted_decisions,
+            "blockers": redacted_blockers,
         }
         try:
-            append_regular_jsonl(live_path, live_line)
-            write_ops_atomic(mem_path, json.dumps(mem_doc, ensure_ascii=False, indent=1) + "\n")
+            append_regular_jsonl(live_path, live_line, base_dir=self.ops_base)
+            write_ops_atomic(mem_path, json.dumps(mem_doc, ensure_ascii=False, indent=1) + "\n", base_dir=self.ops_base)
             return None
         except OSError as exc:
             return f"mirror_step: {exc}"
@@ -649,13 +939,32 @@ class Ledger:
 # ---------------------------------------------------------------------------
 
 
+_VOLATILE_OUTPUT_PATTERNS = (
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b"), "<TS>"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b"), "<TIME>"),
+    (re.compile(r"\b\d+(?:\.\d+)?(?:ms|us|ns|s|m)\b"), "<DUR>"),
+    (re.compile(r"\b0x[0-9a-fA-F]{4,}\b"), "<HEX>"),
+    (re.compile(r"(?i)\bpid[=:\s]+\d+\b"), "pid=<PID>"),
+    (re.compile(r"/(?:tmp|var/folders)/[^\s'\"]+"), "<TMP>"),
+)
+
+
+def normalize_spin_output(value: str) -> str:
+    out = value
+    for pat, repl in _VOLATILE_OUTPUT_PATTERNS:
+        out = pat.sub(repl, out)
+    return normalize_text_sig(out)
+
+
 class WakeHub:
-    """Thread-safe condition signals for sub-agent long-polls and local event followers."""
+    """Generation-tracked condition signals preventing lost wakeups for polls and event followers."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._agent_conds: Dict[str, threading.Condition] = {}
+        self._agent_gen: Dict[str, int] = {}
         self.events_cond = threading.Condition(self._lock)
+        self.events_gen = 0
         self.stop_event = threading.Event()
 
     def cond_for(self, agent_id: str) -> threading.Condition:
@@ -666,19 +975,52 @@ class WakeHub:
                 self._agent_conds[agent_id] = cond
             return cond
 
+    def agent_gen(self, agent_id: str) -> int:
+        with self._lock:
+            return self._agent_gen.get(agent_id, 0)
+
+    def current_events_gen(self) -> int:
+        with self._lock:
+            return self.events_gen
+
+    def wait_agent(self, agent_id: str, observed_gen: int, timeout_s: float) -> None:
+        if timeout_s <= 0.0:
+            return
+        with self._lock:
+            if self.stop_event.is_set() or self._agent_gen.get(agent_id, 0) != observed_gen:
+                return
+            cond = self._agent_conds.get(agent_id)
+            if cond is None:
+                cond = threading.Condition(self._lock)
+                self._agent_conds[agent_id] = cond
+            cond.wait(timeout=timeout_s)
+
+    def wait_events(self, observed_gen: int, timeout_s: float) -> None:
+        if timeout_s <= 0.0:
+            return
+        with self._lock:
+            if self.stop_event.is_set() or self.events_gen != observed_gen:
+                return
+            self.events_cond.wait(timeout=timeout_s)
+
     def wake_agent(self, agent_id: str) -> None:
         with self._lock:
+            self._agent_gen[agent_id] = self._agent_gen.get(agent_id, 0) + 1
             cond = self._agent_conds.get(agent_id)
             if cond is not None:
                 cond.notify_all()
 
     def wake_events(self) -> None:
         with self._lock:
+            self.events_gen += 1
             self.events_cond.notify_all()
 
     def stop_all(self) -> None:
         self.stop_event.set()
         with self._lock:
+            self.events_gen += 1
+            for aid in list(self._agent_conds.keys()):
+                self._agent_gen[aid] = self._agent_gen.get(aid, 0) + 1
             for cond in self._agent_conds.values():
                 cond.notify_all()
             self.events_cond.notify_all()
@@ -706,9 +1048,11 @@ class HubCore:
         self.public_host = public_host
         self.http_url = ""
         self.mcp_url = ""
+        self._hub_token = ""
         self.started_at = iso_utc()
         self._action_pool: List[threading.Thread] = []
         self._action_lock = threading.Lock()
+        self._action_sem = threading.Semaphore(8)
 
         # Reconcile stale active_poll_count / running execs after an unclean hub restart
         with self.ledger.tx() as conn:
@@ -726,44 +1070,72 @@ class HubCore:
             th.join(timeout=2.0)
         self.ledger.close()
 
+    def _scrub_hook_text(self, value: str) -> str:
+        out = redact(value)
+        if self._hub_token:
+            out = out.replace(self._hub_token, "[REDACTED]")
+        return out
+
     def _spawn_cmd_hook(self, argv: List[str], values: Dict[str, Any], event_type: str, agent_id: str) -> None:
+        if self.wake_hub.stop_event.is_set():
+            return
         rendered = render_argv(argv, values)
         if not rendered:
-            with self.ledger.tx() as conn:
-                self.ledger.emit_event_locked(
-                    conn,
-                    agent_id,
-                    f"{event_type}_skipped",
-                    {"reason": "missing_placeholder", "argv": argv},
-                )
-            self.wake_hub.wake_events()
+            with contextlib.suppress(sqlite3.Error, ValueError, RuntimeError):
+                with self.ledger.tx() as conn:
+                    self.ledger.emit_event_locked(
+                        conn,
+                        agent_id,
+                        f"{event_type}_skipped",
+                        {"reason": "missing_placeholder", "argv": [self._scrub_hook_text(a) for a in argv]},
+                    )
+                self.wake_hub.wake_events()
+            return
+        if not self._action_sem.acquire(blocking=False):
+            with contextlib.suppress(sqlite3.Error, ValueError, RuntimeError):
+                with self.ledger.tx() as conn:
+                    self.ledger.emit_event_locked(
+                        conn,
+                        agent_id,
+                        f"{event_type}_skipped",
+                        {"reason": "hook_concurrency_limit", "argv": [self._scrub_hook_text(a) for a in rendered]},
+                    )
+                self.wake_hub.wake_events()
             return
 
         def _runner() -> None:
             rc: Any = None
             err = ""
             try:
-                proc = subprocess.run(
-                    rendered,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=WAKE_TIMEOUT_S,
-                )
-                rc = proc.returncode
-            except subprocess.TimeoutExpired:
-                rc = "timeout"
-            except OSError as exc:
-                rc = "error"
-                err = str(exc)
-            with self.ledger.tx() as conn:
-                self.ledger.emit_event_locked(
-                    conn,
-                    agent_id,
-                    event_type,
-                    {"argv": rendered, "exit": rc, "error": redact(err)} if err else {"argv": rendered, "exit": rc},
-                )
-            self.wake_hub.wake_events()
+                try:
+                    proc = subprocess.run(
+                        rendered,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=WAKE_TIMEOUT_S,
+                    )
+                    rc = proc.returncode
+                except subprocess.TimeoutExpired:
+                    rc = "timeout"
+                except OSError as exc:
+                    rc = "error"
+                    err = str(exc)
+                if not self.wake_hub.stop_event.is_set():
+                    with contextlib.suppress(sqlite3.Error, ValueError, RuntimeError):
+                        safe_argv = [self._scrub_hook_text(p) for p in rendered]
+                        with self.ledger.tx() as conn:
+                            self.ledger.emit_event_locked(
+                                conn,
+                                agent_id,
+                                event_type,
+                                {"argv": safe_argv, "exit": rc, "error": self._scrub_hook_text(err)}
+                                if err
+                                else {"argv": safe_argv, "exit": rc},
+                            )
+                        self.wake_hub.wake_events()
+            finally:
+                self._action_sem.release()
 
         th = threading.Thread(target=_runner, daemon=True)
         with self._action_lock:
@@ -822,10 +1194,14 @@ class HubCore:
     ) -> Dict[str, Any]:
         agent = self._agent_exists(conn, agent_id)
         if require_fencing:
-            if epoch is None or session_token is None:
+            if epoch is None or isinstance(epoch, bool) or not isinstance(session_token, str) or not session_token:
                 raise HubError("MISSING_FENCE", "epoch and session_token are required", status=401)
-            if int(epoch) != int(agent["epoch"]) or not hmac.compare_digest(
-                str(session_token), str(agent["session_token"])
+            try:
+                epoch_int = int(epoch)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("epoch must be an integer") from exc
+            if epoch_int != int(agent["epoch"]) or not hmac.compare_digest(
+                session_token.encode("utf-8"), str(agent["session_token"]).encode("utf-8")
             ):
                 raise HubError(
                     "STALE_EPOCH",
@@ -835,13 +1211,103 @@ class HubCore:
                 )
         return agent
 
+    def _recover_agent_liveness_locked(
+        self,
+        conn: sqlite3.Connection,
+        agent: Dict[str, Any],
+        via: str,
+        now_ts: float,
+        override_state: Optional[str] = None,
+        recent_steps_json: Optional[str] = None,
+        recent_execs_json: Optional[str] = None,
+    ) -> bool:
+        agent_id = agent["agent_id"]
+        ttl = float(agent["lease_ttl_s"])
+        recovered = agent["state"] in ("stalled", "dead", "disconnected")
+        new_state = "working" if recovered else (override_state if override_state is not None else agent["state"])
+        sets = [
+            "state = ?",
+            "last_seen_at = ?",
+            "lease_expires_at = ?",
+            "wake_count = 0",
+            "stalled_since = NULL",
+            "notified_dead_at = NULL",
+            "updated_at = ?",
+        ]
+        vals: List[Any] = [new_state, now_ts, now_ts + ttl, now_ts]
+        if recent_steps_json is not None:
+            sets.append("recent_steps_json = ?")
+            vals.append(recent_steps_json)
+        if recent_execs_json is not None:
+            sets.append("recent_execs_json = ?")
+            vals.append(recent_execs_json)
+        vals.append(agent_id)
+        conn.execute(f"UPDATE agents SET {', '.join(sets)} WHERE agent_id = ?", vals)
+        if recovered:
+            self.ledger.emit_event_locked(conn, agent_id, "agent_recovered", {"via": via}, now_ts)
+        return recovered
+
+    def _insert_message_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_id: Optional[str],
+        payload_hash: str,
+        direction: str,
+        agent_id: str,
+        project: str,
+        task: str,
+        kind: str,
+        priority: int,
+        interrupt: int,
+        re_id: Optional[str],
+        text_body: str,
+        refs_json: str,
+        delivery_state: str,
+        created_at: float,
+        created_at_iso: str,
+    ) -> str:
+        for attempt in range(8):
+            mid = new_msg_id()
+            try:
+                conn.execute(
+                    "INSERT INTO messages(id, request_id, payload_hash, direction, agent_id, project, task, kind, "
+                    "priority, interrupt, re_id, text, refs_json, delivery_state, created_at, created_at_iso) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        mid,
+                        request_id,
+                        payload_hash,
+                        direction,
+                        agent_id,
+                        project,
+                        task,
+                        kind,
+                        priority,
+                        interrupt,
+                        re_id,
+                        text_body,
+                        refs_json,
+                        delivery_state,
+                        created_at,
+                        created_at_iso,
+                    ),
+                )
+                return mid
+            except sqlite3.IntegrityError:
+                if attempt < 7 and conn.execute("SELECT 1 FROM messages WHERE id = ?", (mid,)).fetchone() is not None:
+                    continue
+                raise
+        raise HubError("INTERNAL_ERROR", "failed to allocate unique message ID", status=500)
+
     def _apply_acks_locked(self, conn: sqlite3.Connection, agent_id: str, ack_ids: Sequence[str], now_ts: float) -> List[str]:
         acked: List[str] = []
         for mid in ack_ids:
             if not isinstance(mid, str) or not mid:
                 continue
             row = conn.execute(
-                "SELECT id, kind, delivery_state FROM messages WHERE id = ? AND agent_id = ? AND direction = 'to_agent'",
+                "SELECT id, kind, delivery_state, created_at, rowid FROM messages "
+                "WHERE id = ? AND agent_id = ? AND direction = 'to_agent'",
                 (mid, agent_id),
             ).fetchone()
             if row is None:
@@ -854,12 +1320,13 @@ class HubCore:
                 acked.append(mid)
                 self.ledger.emit_event_locked(conn, agent_id, "message_acked", {"id": mid}, now_ts)
                 if row["kind"] == "cancel":
-                    # Acknowledging a cancel clears earlier unanswered work so the agent can exit cleanly.
+                    # Acknowledging a cancel clears earlier unanswered work, leaving newer messages intact.
                     conn.execute(
                         "UPDATE messages SET delivery_state = 'cancelled' "
                         "WHERE agent_id = ? AND direction = 'to_agent' AND id != ? "
-                        "AND delivery_state IN ('queued', 'offered', 'acked')",
-                        (agent_id, mid),
+                        "AND delivery_state IN ('queued', 'offered', 'acked') "
+                        "AND (created_at < ? OR (created_at = ? AND rowid <= ?))",
+                        (agent_id, mid, row["created_at"], row["created_at"], row["rowid"]),
                     )
         return acked
 
@@ -960,32 +1427,34 @@ class HubCore:
             "AND kind = 'intervention' AND delivery_state IN ('queued', 'offered') AND task = ?",
             (agent_id, f"SPIN:{reason}"),
         ).fetchone()
-        msg_dict: Optional[Dict[str, Any]] = None
         if existing is None:
-            mid = new_msg_id()
             body = (
                 f"[HARNESS_INTERVENTION:{reason}] {detail}. "
                 f"Stop repeating this loop immediately. Report your blocker via `subdots.py agent reply {agent_id} block` "
                 f"(or `subdots_reply`) and wait for local-session steering."
             )
             p_hash = hash_payload({"intervention": reason, "strikes": strikes, "agent": agent_id})
-            conn.execute(
-                "INSERT INTO messages(id, request_id, payload_hash, direction, agent_id, project, task, kind, "
-                "priority, interrupt, re_id, text, refs_json, delivery_state, created_at, created_at_iso) "
-                "VALUES (?, ?, ?, 'to_agent', ?, ?, ?, 'intervention', 10, 1, NULL, ?, '[]', 'queued', ?, ?)",
-                (
-                    mid,
-                    f"spin-{agent_id}-{strikes}-{uuid.uuid4().hex[:8]}",
-                    p_hash,
-                    agent_id,
-                    agent.get("project") or "default",
-                    f"SPIN:{reason}",
-                    body,
-                    now_ts,
-                    iso_utc(now_ts),
-                ),
+            mid = self._insert_message_locked(
+                conn,
+                request_id=f"spin-{agent_id}-{strikes}-{uuid.uuid4().hex[:8]}",
+                payload_hash=p_hash,
+                direction="to_agent",
+                agent_id=agent_id,
+                project=agent.get("project") or "default",
+                task=f"SPIN:{reason}",
+                kind="intervention",
+                priority=10,
+                interrupt=1,
+                re_id=None,
+                text_body=body,
+                refs_json="[]",
+                delivery_state="queued",
+                created_at=now_ts,
+                created_at_iso=iso_utc(now_ts),
             )
-            msg_dict = {"id": mid, "reason": reason, "detail": detail, "strikes": strikes}
+            msg_dict: Dict[str, Any] = {"id": mid, "reason": reason, "detail": detail, "strikes": strikes, "is_new": True}
+        else:
+            msg_dict = {"id": existing["id"], "reason": reason, "detail": detail, "strikes": strikes, "is_new": False}
         return msg_dict, strikes
 
     # ---------------- Agent Operations ----------------
@@ -1001,15 +1470,21 @@ class HubCore:
             params.get("model") or "requested gpt-6.2-astra xhigh; runtime does not display effective",
             256,
         )
-        lease_ttl_s = float(params.get("lease_ttl_s") or self.settings["lease_ttl_s"])
-        if lease_ttl_s <= 0 or lease_ttl_s > 3600:
-            raise ValueError("lease_ttl_s must be in (0, 3600]")
+        raw_ttl = params.get("lease_ttl_s")
+        lease_ttl_s = validate_finite_float(
+            "lease_ttl_s",
+            self.settings["lease_ttl_s"] if raw_ttl is None else raw_ttl,
+            minimum=0.1,
+            maximum=3600.0,
+        )
         now_ts = utc_now_ts()
         session_token = secrets.token_hex(24)
 
         with self.ledger.tx() as conn:
             prev = conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
             if prev is None:
+                if conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] >= 256:
+                    raise HubError("TOO_MANY_AGENTS", "maximum agent limit (256) reached", status=429)
                 epoch = 1
                 conn.execute(
                     "INSERT INTO agents(agent_id, dot, project, role, host, model, epoch, session_token, state, "
@@ -1035,7 +1510,7 @@ class HubCore:
                 epoch = int(prev["epoch"]) + 1
                 conn.execute(
                     "UPDATE agents SET dot = ?, project = ?, role = ?, host = ?, model = ?, epoch = ?, "
-                    "session_token = ?, state = CASE WHEN state = 'paused' THEN 'paused' ELSE 'registered' END, "
+                    "session_token = ?, state = CASE WHEN state IN ('paused', 'spinning') THEN state ELSE 'registered' END, "
                     "lease_ttl_s = ?, last_seen_at = ?, lease_expires_at = ?, active_poll_count = 0, "
                     "wake_count = 0, stalled_since = NULL, notified_dead_at = NULL, "
                     "poll_timestamps_json = '[]', updated_at = ? WHERE agent_id = ?",
@@ -1054,7 +1529,12 @@ class HubCore:
                         agent_id,
                     ),
                 )
-                # Re-queue any unacked offered messages so the fresh worker receives them immediately.
+                # Close stale running execs from previous epochs and re-queue offered messages.
+                conn.execute(
+                    "UPDATE exec_runs SET status = 'failed', ended_at = ? "
+                    "WHERE agent_id = ? AND status = 'running'",
+                    (now_ts, agent_id),
+                )
                 conn.execute(
                     "UPDATE messages SET delivery_state = 'queued' "
                     "WHERE agent_id = ? AND direction = 'to_agent' AND delivery_state = 'offered'",
@@ -1107,24 +1587,12 @@ class HubCore:
         agent_id = validate_token("agent_id", params.get("agent_id"))
         epoch = params.get("epoch")
         session_token = params.get("session_token")
-        ack_ids = params.get("ack_ids") or []
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
         now_ts = utc_now_ts()
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
-            ttl = float(agent["lease_ttl_s"])
-            new_state = agent["state"]
-            recovered = new_state in ("stalled", "dead", "disconnected")
-            if recovered:
-                new_state = "working"
-            conn.execute(
-                "UPDATE agents SET state = ?, last_seen_at = ?, lease_expires_at = ?, "
-                "wake_count = 0, stalled_since = NULL, notified_dead_at = NULL, updated_at = ? "
-                "WHERE agent_id = ?",
-                (new_state, now_ts, now_ts + ttl, now_ts, agent_id),
-            )
-            if recovered:
-                self.ledger.emit_event_locked(conn, agent_id, "agent_recovered", {"via": "heartbeat"}, now_ts)
+            recovered = self._recover_agent_liveness_locked(conn, agent, "heartbeat", now_ts)
             messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts, ack_ids=ack_ids)
             agent_row = dict(conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone())
 
@@ -1137,23 +1605,49 @@ class HubCore:
         agent_id = validate_token("agent_id", params.get("agent_id"))
         epoch = params.get("epoch")
         session_token = params.get("session_token")
-        ack_ids = params.get("ack_ids") or []
-        hold_s = float(params.get("hold_s") if params.get("hold_s") is not None else 20.0)
-        hold_s = max(0.0, min(hold_s, MAX_CHUNK_S))
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
+        hold_s = validate_finite_float(
+            "hold_s",
+            params.get("hold_s") if params.get("hold_s") is not None else 20.0,
+            minimum=0.0,
+            maximum=MAX_CHUNK_S,
+        )
         interrupt_only = bool(params.get("interrupt_only", False))
         expect_re = params.get("expect_re")
         if expect_re is not None:
             expect_re = validate_token("expect_re", expect_re)
+        exec_id = params.get("exec_id")
+        if exec_id is not None:
+            exec_id = validate_token("exec_id", exec_id)
 
         start_ts = utc_now_ts()
         spin_trigger: Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]], int]] = None
+        observed_gen = self.wake_hub.agent_gen(agent_id)
+        exec_ended = False
+        messages: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        recovered = False
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
+            if exec_id is not None:
+                ex = conn.execute(
+                    "SELECT status FROM exec_runs WHERE exec_id = ? AND agent_id = ?",
+                    (exec_id, agent_id),
+                ).fetchone()
+                if ex is None or ex["status"] != "running":
+                    return {
+                        "agent_id": agent_id,
+                        "epoch": int(epoch),
+                        "messages": [],
+                        "matched_expect": False,
+                        "exec_finished": True,
+                        "stopping": self.wake_hub.stop_event.is_set(),
+                    }
             ttl = float(agent["lease_ttl_s"])
             new_state = agent["state"]
             recovered = new_state in ("stalled", "dead", "disconnected")
-            if new_state in ("registered", "stalled", "dead", "disconnected"):
+            if new_state not in ("paused", "spinning"):
                 new_state = "waiting" if not interrupt_only else "working"
             lease_ext = max(ttl, hold_s + 15.0)
             conn.execute(
@@ -1172,20 +1666,27 @@ class HubCore:
         if recovered:
             self.wake_hub.wake_events()
 
-        cond = self.wake_hub.cond_for(agent_id)
         deadline = time.monotonic() + hold_s
         try:
-            while not messages and hold_s > 0.0 and not self.wake_hub.stop_event.is_set():
+            while not messages and not exec_ended and hold_s > 0.0 and not self.wake_hub.stop_event.is_set():
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     break
-                with cond:
-                    cond.wait(timeout=min(rem, 5.0))
+                self.wake_hub.wait_agent(agent_id, observed_gen, min(rem, 5.0))
                 if self.wake_hub.stop_event.is_set():
                     break
+                observed_gen = self.wake_hub.agent_gen(agent_id)
                 now_ts = utc_now_ts()
                 with self.ledger.tx() as conn:
                     agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
+                    if exec_id is not None:
+                        ex = conn.execute(
+                            "SELECT status FROM exec_runs WHERE exec_id = ? AND agent_id = ?",
+                            (exec_id, agent_id),
+                        ).fetchone()
+                        if ex is None or ex["status"] != "running":
+                            exec_ended = True
+                            continue
                     ttl = float(agent["lease_ttl_s"])
                     conn.execute(
                         "UPDATE agents SET last_seen_at = ?, lease_expires_at = ?, updated_at = ? WHERE agent_id = ?",
@@ -1203,14 +1704,13 @@ class HubCore:
                 if row is not None and int(row["epoch"]) == int(epoch):
                     agent = dict(row)
                     ttl = float(agent["lease_ttl_s"])
-                    poll_ts: List[float] = []
-                    # Only rapid non-blocking/zero-hold empty polls count toward poll-thrash spin detection.
-                    if not messages and hold_s < 1.0 and elapsed < 0.5 and not interrupt_only:
-                        try:
-                            poll_ts = [float(x) for x in json.loads(agent["poll_timestamps_json"])]
-                        except ValueError:
-                            poll_ts = []
-                        poll_ts = [t for t in poll_ts if end_ts - t <= 60.0]
+                    try:
+                        poll_ts = [float(x) for x in json.loads(agent["poll_timestamps_json"]) if end_ts - float(x) <= 60.0]
+                    except ValueError:
+                        poll_ts = []
+                    if messages:
+                        poll_ts = []
+                    elif hold_s < 1.0 and elapsed < 0.5 and not interrupt_only:
                         poll_ts.append(end_ts)
                         if len(poll_ts) >= int(self.settings["spin_poll_burst"]):
                             iv_msg, strikes = self._trigger_intervention_locked(
@@ -1255,12 +1755,21 @@ class HubCore:
 
         if messages:
             self.wake_hub.wake_events()
-        matched_expect = bool(expect_re and any(m.get("re_id") == expect_re or m.get("kind") == "release" for m in messages))
+        matched_expect = bool(
+            expect_re
+            and any(
+                m.get("re_id") == expect_re
+                or bool(m.get("interrupt"))
+                or m.get("kind") in ("release", "steer", "interrupt", "pause", "cancel", "intervention")
+                for m in messages
+            )
+        )
         return {
             "agent_id": agent_id,
             "epoch": int(epoch),
             "messages": messages,
             "matched_expect": matched_expect,
+            "exec_finished": exec_ended,
             "stopping": self.wake_hub.stop_event.is_set(),
         }
 
@@ -1275,9 +1784,10 @@ class HubCore:
         note = validate_one_line("note", params.get("note"))
         evidence = validate_one_line("evidence", params.get("evidence"))
         host = validate_one_line("host", params.get("host") or socket.gethostname(), 128)
-        ack_ids = params.get("ack_ids") or []
-        decisions_in = params.get("decisions") or []
-        blockers_in = params.get("blockers")
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
+        decisions_in = validate_str_list("decisions", params.get("decisions"), max_items=MAX_DECISIONS, item_limit=MAX_ITEM_LEN)
+        blockers_raw = params.get("blockers")
+        blockers_in = validate_str_list("blockers", blockers_raw, max_items=MAX_BLOCKERS, item_limit=MAX_ITEM_LEN) if blockers_raw is not None else None
         unblock = bool(params.get("unblock", False))
         now_ts = utc_now_ts()
         ts_iso = iso_utc(now_ts)
@@ -1291,6 +1801,8 @@ class HubCore:
                 self._apply_acks_locked(conn, agent_id, ack_ids, now_ts)
 
             if state == "done":
+                if agent["state"] == "paused":
+                    raise HubError("AGENT_PAUSED", f"done refused: {agent_id} is paused", status=409)
                 owed = conn.execute(
                     "SELECT id, kind, task FROM messages WHERE agent_id = ? AND direction = 'to_agent' "
                     "AND kind IN ('task', 'steer', 'interrupt', 'question', 'review', 'intervention') "
@@ -1315,13 +1827,12 @@ class HubCore:
 
             prior_decisions = json.loads(agent["decisions_json"]) if same_task else []
             for d in decisions_in:
-                prior_decisions.append({"t": ts_iso, "text": validate_one_line("decision", d, MAX_ITEM_LEN)})
+                prior_decisions.append({"t": ts_iso, "text": d})
             decisions = prior_decisions[-MAX_DECISIONS:]
 
             prior_blockers = [] if (unblock or not same_task) else json.loads(agent["blockers_json"])
             if blockers_in:
-                for b in blockers_in:
-                    bt = validate_one_line("blocker", b, MAX_ITEM_LEN)
+                for bt in blockers_in:
                     if bt not in prior_blockers:
                         prior_blockers.append(bt)
             if len(prior_blockers) > MAX_BLOCKERS:
@@ -1333,11 +1844,11 @@ class HubCore:
             hub_state = {
                 "start": "working",
                 "step": "working",
-                "blocked": "working",
+                "blocked": "blocked",
                 "done": "completed",
             }[state]
-            if agent["state"] == "paused" and state in ("start", "step"):
-                hub_state = "paused"
+            if agent["state"] in ("paused", "spinning") and state != "done":
+                hub_state = agent["state"]
 
             # Anti-spin: no-progress detection on consecutive identical start/step reports
             recent_steps: List[Dict[str, Any]] = []
@@ -1463,16 +1974,19 @@ class HubCore:
         re_id = params.get("re_id")
         if re_id is not None:
             re_id = validate_token("re_id", re_id)
-        refs = [validate_one_line("ref", r) for r in (params.get("refs") or [])]
-        ack_ids = list(params.get("ack_ids") or [])
+        refs = validate_str_list("refs", params.get("refs"), max_items=32, item_limit=MAX_TEXT_LEN)
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
         if re_id and re_id not in ack_ids:
             ack_ids.append(re_id)
         now_ts = utc_now_ts()
         ts_iso = iso_utc(now_ts)
 
         msg_row: Dict[str, Any]
+        dot_name: Optional[str] = None
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
+            dot_name = agent.get("dot")
+            project = validate_token("project", params.get("project") or agent.get("project") or "default")
             if re_id:
                 parent = conn.execute(
                     "SELECT id FROM messages WHERE id = ? AND agent_id = ? AND direction = 'to_agent'",
@@ -1488,7 +2002,7 @@ class HubCore:
 
             if ack_ids:
                 self._apply_acks_locked(conn, agent_id, ack_ids, now_ts)
-            if re_id:
+            if re_id and kind in ("answer", "result", "question", "block", "exec_interrupted"):
                 conn.execute(
                     "UPDATE messages SET delivery_state = 'answered', acked_at = COALESCE(acked_at, ?), "
                     "answered_at = ? WHERE id = ? AND agent_id = ? AND direction = 'to_agent'",
@@ -1496,21 +2010,26 @@ class HubCore:
                 )
                 self.ledger.emit_event_locked(conn, agent_id, "message_answered", {"id": re_id}, now_ts)
 
-            mid = new_msg_id()
-            project = params.get("project") or agent.get("project") or "default"
             p_hash = hash_payload([agent_id, project, task, kind, re_id, refs, text_body])
-            conn.execute(
-                "INSERT INTO messages(id, request_id, payload_hash, direction, agent_id, project, task, kind, "
-                "priority, interrupt, re_id, text, refs_json, delivery_state, created_at, created_at_iso) "
-                "VALUES (?, NULL, ?, 'to_local', ?, ?, ?, ?, 0, 0, ?, ?, ?, 'delivered', ?, ?)",
-                (mid, p_hash, agent_id, project, task, kind, re_id, text_body, json.dumps(refs), now_ts, ts_iso),
+            mid = self._insert_message_locked(
+                conn,
+                request_id=None,
+                payload_hash=p_hash,
+                direction="to_local",
+                agent_id=agent_id,
+                project=project,
+                task=task,
+                kind=kind,
+                priority=0,
+                interrupt=0,
+                re_id=re_id,
+                text_body=text_body,
+                refs_json=json.dumps(refs),
+                delivery_state="delivered",
+                created_at=now_ts,
+                created_at_iso=ts_iso,
             )
-            ttl = float(agent["lease_ttl_s"])
-            conn.execute(
-                "UPDATE agents SET last_seen_at = ?, lease_expires_at = ?, recent_steps_json = '[]', "
-                "updated_at = ? WHERE agent_id = ?",
-                (now_ts, now_ts + ttl, now_ts, agent_id),
-            )
+            self._recover_agent_liveness_locked(conn, agent, "reply", now_ts, recent_steps_json="[]")
             self.ledger.emit_event_locked(
                 conn,
                 agent_id,
@@ -1522,7 +2041,7 @@ class HubCore:
             messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts)
 
         if self.mirror.enabled:
-            m_err = self.mirror.mirror_mail("to_local", msg_row)
+            m_err = self.mirror.mirror_mail("to_local", msg_row, dot=dot_name)
             if m_err:
                 with self.ledger.tx() as conn:
                     self.ledger.emit_event_locked(conn, agent_id, "mirror_error", {"detail": m_err})
@@ -1535,21 +2054,17 @@ class HubCore:
         agent_id = validate_token("agent_id", params.get("agent_id"))
         epoch = params.get("epoch")
         session_token = params.get("session_token")
-        ack_ids = params.get("ack_ids") or []
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
         now_ts = utc_now_ts()
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
             acked = self._apply_acks_locked(conn, agent_id, ack_ids, now_ts)
-            ttl = float(agent["lease_ttl_s"])
-            conn.execute(
-                "UPDATE agents SET last_seen_at = ?, lease_expires_at = ?, updated_at = ? WHERE agent_id = ?",
-                (now_ts, now_ts + ttl, now_ts, agent_id),
-            )
+            recovered = self._recover_agent_liveness_locked(conn, agent, "ack", now_ts)
             messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts)
 
         self._notify_unacked_failures(agent_id, failed)
-        if acked:
+        if acked or recovered:
             self.wake_hub.wake_events()
         return {"ok": True, "acked": acked, "messages": messages}
 
@@ -1558,32 +2073,52 @@ class HubCore:
         epoch = params.get("epoch")
         session_token = params.get("session_token")
         cmd = validate_body("cmd", params.get("cmd"))
-        cwd = str(params.get("cwd") or ".")
-        ack_ids = params.get("ack_ids") or []
+        cwd = validate_one_line("cwd", str(params.get("cwd") or "."), limit=1024)
+        ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
         now_ts = utc_now_ts()
         exec_id = f"ex-{uuid.uuid4().hex[:12]}"
         cmd_norm = normalize_text_sig(cmd)
+        blocked_stop: Optional[Dict[str, Any]] = None
+        messages: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
-            conn.execute(
-                "INSERT INTO exec_runs(exec_id, agent_id, epoch, cmd, cmd_norm, cwd, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
-                (exec_id, agent_id, int(epoch), cmd, cmd_norm, cwd, now_ts),
-            )
-            ttl = float(agent["lease_ttl_s"])
-            conn.execute(
-                "UPDATE agents SET state = CASE WHEN state = 'paused' THEN 'paused' ELSE 'working' END, "
-                "last_seen_at = ?, lease_expires_at = ?, updated_at = ? WHERE agent_id = ?",
-                (now_ts, now_ts + ttl, now_ts, agent_id),
-            )
-            self.ledger.emit_event_locked(
-                conn, agent_id, "exec_started", {"exec_id": exec_id, "cmd": cmd_norm[:160]}, now_ts
-            )
-            messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts, ack_ids=ack_ids)
+            if agent["state"] == "paused":
+                raise HubError("AGENT_PAUSED", f"exec refused: {agent_id} is paused", status=409)
+            if ack_ids:
+                self._apply_acks_locked(conn, agent_id, ack_ids, now_ts)
+            pending_stop = conn.execute(
+                "SELECT id, kind FROM messages WHERE agent_id = ? AND direction = 'to_agent' "
+                "AND kind IN ('pause', 'cancel') AND delivery_state IN ('queued', 'offered') "
+                "ORDER BY created_at ASC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+            if pending_stop is not None:
+                blocked_stop = dict(pending_stop)
+                messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts)
+            else:
+                conn.execute(
+                    "INSERT INTO exec_runs(exec_id, agent_id, epoch, cmd, cmd_norm, cwd, status, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+                    (exec_id, agent_id, int(epoch), cmd, cmd_norm, cwd, now_ts),
+                )
+                override = agent["state"] if agent["state"] in ("paused", "spinning") else "working"
+                self._recover_agent_liveness_locked(conn, agent, "exec_start", now_ts, override_state=override)
+                self.ledger.emit_event_locked(
+                    conn, agent_id, "exec_started", {"exec_id": exec_id, "cmd": cmd_norm[:160]}, now_ts
+                )
+                messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts)
 
         self._notify_unacked_failures(agent_id, failed)
         self.wake_hub.wake_events()
+        if blocked_stop is not None:
+            raise HubError(
+                "INTERRUPT_PENDING",
+                f"exec refused: pending {blocked_stop['kind']} message {blocked_stop['id']}",
+                status=409,
+                extra={"messages": messages},
+            )
         return {"ok": True, "exec_id": exec_id, "messages": messages}
 
     def exec_heartbeat(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1595,13 +2130,11 @@ class HubCore:
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
-            ttl = float(agent["lease_ttl_s"])
-            conn.execute(
-                "UPDATE agents SET last_seen_at = ?, lease_expires_at = ?, updated_at = ? WHERE agent_id = ?",
-                (now_ts, now_ts + ttl, now_ts, agent_id),
-            )
+            recovered = self._recover_agent_liveness_locked(conn, agent, "exec_heartbeat", now_ts)
             messages, failed = self._collect_piggyback_locked(conn, agent_id, now_ts)
 
+        if recovered:
+            self.wake_hub.wake_events()
         self._notify_unacked_failures(agent_id, failed)
         interrupt_msgs = [m for m in messages if m.get("interrupt") or m.get("kind") in INTERRUPT_KINDS]
         return {"ok": True, "exec_id": exec_id, "messages": messages, "interrupt_requested": bool(interrupt_msgs)}
@@ -1616,10 +2149,19 @@ class HubCore:
             raise ValueError("status must be completed, failed, or interrupted")
         exit_code = params.get("exit_code")
         if exit_code is not None:
+            if isinstance(exit_code, bool):
+                raise ValueError("exit_code must be an integer")
             exit_code = int(exit_code)
-        stderr_hash = str(params.get("stderr_hash") or "")
+        raw_stderr_hash = str(params.get("stderr_hash") or "")
+        stderr_hash = validate_one_line("stderr_hash", raw_stderr_hash, 128) if raw_stderr_hash else ""
         output_tail = redact(str(params.get("output_tail") or "")[-2000:])
+        if output_tail.strip():
+            raw_sig = hashlib.sha256(normalize_text_sig(output_tail).encode("utf-8")).hexdigest()[:16]
+            if not stderr_hash or stderr_hash == raw_sig:
+                stderr_hash = hashlib.sha256(normalize_spin_output(output_tail).encode("utf-8")).hexdigest()[:16]
         interrupted_by = params.get("interrupted_by")
+        if interrupted_by is not None:
+            interrupted_by = validate_token("interrupted_by", interrupted_by)
         now_ts = utc_now_ts()
 
         spin_trigger: Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]], int]] = None
@@ -1636,6 +2178,8 @@ class HubCore:
                 "ended_at = ?, interrupted_by = ? WHERE exec_id = ?",
                 (status, exit_code, stderr_hash, output_tail, now_ts, interrupted_by, exec_id),
             )
+            if status == "interrupted" and interrupted_by:
+                self._apply_acks_locked(conn, agent_id, [interrupted_by], now_ts)
 
             try:
                 recent_execs = [
@@ -1669,11 +2213,13 @@ class HubCore:
                     recent_execs = [r for r in recent_execs if r.get("cmd_norm") != cmd_norm]
                     spin_trigger = (agent, iv_msg, strikes)
 
-            ttl = float(agent["lease_ttl_s"])
-            conn.execute(
-                "UPDATE agents SET recent_execs_json = ?, last_seen_at = ?, lease_expires_at = ?, updated_at = ? "
-                "WHERE agent_id = ?",
-                (json.dumps(recent_execs), now_ts, now_ts + ttl, now_ts, agent_id),
+            fresh_ag = dict(conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone())
+            self._recover_agent_liveness_locked(
+                conn,
+                fresh_ag,
+                "exec_finish",
+                now_ts,
+                recent_execs_json=json.dumps(recent_execs),
             )
             self.ledger.emit_event_locked(
                 conn,
@@ -1705,6 +2251,7 @@ class HubCore:
                 )
 
         self._notify_unacked_failures(agent_id, failed)
+        self.wake_hub.wake_agent(agent_id)
         self.wake_hub.wake_events()
         return {"ok": True, "exec_id": exec_id, "messages": messages}
 
@@ -1720,7 +2267,7 @@ class HubCore:
         re_id = params.get("re_id")
         if re_id is not None:
             re_id = validate_token("re_id", re_id)
-        refs = [validate_one_line("ref", r) for r in (params.get("refs") or [])]
+        refs = validate_str_list("refs", params.get("refs"), max_items=32, item_limit=MAX_TEXT_LEN)
         interrupt = bool(params.get("interrupt", False)) or kind in INTERRUPT_KINDS
         priority = self._priority_for_kind(kind, interrupt)
         request_id = params.get("request_id")
@@ -1729,16 +2276,28 @@ class HubCore:
         now_ts = utc_now_ts()
         ts_iso = iso_utc(now_ts)
 
-        msg_row: Dict[str, Any]
+        msg_row: Dict[str, Any] = {}
         deduped = False
         wake_needed = False
         wake_agent_row: Optional[Dict[str, Any]] = None
 
         with self.ledger.tx() as conn:
             agent_row = conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+            if agent_row is not None:
+                wake_agent_row = dict(agent_row)
             project = validate_token(
                 "project", params.get("project") or (agent_row["project"] if agent_row else "default")
             )
+            if re_id is not None:
+                ref_msg = conn.execute(
+                    "SELECT id, direction, delivery_state FROM messages WHERE id = ? AND agent_id = ?",
+                    (re_id, agent_id),
+                ).fetchone()
+                if ref_msg is None:
+                    raise HubError("INVALID_RE", f"re_id {re_id!r} not found for agent {agent_id!r}", status=404)
+                if ref_msg["direction"] == "to_local" and ref_msg["delivery_state"] == "delivered":
+                    conn.execute("UPDATE messages SET delivery_state = 'read' WHERE id = ?", (re_id,))
+
             payload_sig = hash_payload([agent_id, project, task, kind, re_id, refs, text_body, interrupt])
 
             if request_id is not None:
@@ -1752,36 +2311,28 @@ class HubCore:
                         )
                     msg_row = dict(prev)
                     deduped = True
-                else:
-                    msg_row = {}
-            else:
-                msg_row = {}
 
             if not deduped:
-                mid = new_msg_id()
-                conn.execute(
-                    "INSERT INTO messages(id, request_id, payload_hash, direction, agent_id, project, task, kind, "
-                    "priority, interrupt, re_id, text, refs_json, delivery_state, created_at, created_at_iso) "
-                    "VALUES (?, ?, ?, 'to_agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
-                    (
-                        mid,
-                        request_id,
-                        payload_sig,
-                        agent_id,
-                        project,
-                        task,
-                        kind,
-                        priority,
-                        1 if interrupt else 0,
-                        re_id,
-                        text_body,
-                        json.dumps(refs),
-                        now_ts,
-                        ts_iso,
-                    ),
+                mid = self._insert_message_locked(
+                    conn,
+                    request_id=request_id,
+                    payload_hash=payload_sig,
+                    direction="to_agent",
+                    agent_id=agent_id,
+                    project=project,
+                    task=task,
+                    kind=kind,
+                    priority=priority,
+                    interrupt=1 if interrupt else 0,
+                    re_id=re_id,
+                    text_body=text_body,
+                    refs_json=json.dumps(refs),
+                    delivery_state="queued",
+                    created_at=now_ts,
+                    created_at_iso=ts_iso,
                 )
-                if agent_row is not None:
-                    ag = dict(agent_row)
+                if wake_agent_row is not None:
+                    ag = wake_agent_row
                     if kind == "pause":
                         conn.execute(
                             "UPDATE agents SET state = 'paused', updated_at = ? WHERE agent_id = ?",
@@ -1803,6 +2354,37 @@ class HubCore:
                             "UPDATE agents SET state = 'working', updated_at = ? WHERE agent_id = ?",
                             (now_ts, agent_id),
                         )
+                    elif ag["state"] == "completed" and kind in (
+                        "task",
+                        "steer",
+                        "question",
+                        "review",
+                        "interrupt",
+                        "intervention",
+                    ):
+                        # Re-arm completed agent for Task 2+ so watchdog monitors it if offline.
+                        conn.execute(
+                            "UPDATE agents SET state = 'working', updated_at = ? WHERE agent_id = ?",
+                            (now_ts, agent_id),
+                        )
+                    if (
+                        self.wake_cmd is not None
+                        and kind not in ("pause", "release")
+                        and int(ag["active_poll_count"]) == 0
+                        and ag["state"] in ("completed", "stalled", "dead", "disconnected")
+                    ):
+                        wake_count = int(ag["wake_count"])
+                        last_wake = float(ag["last_wake_at"] or 0.0)
+                        due_wait = float(self.settings["wake_backoff_s"]) * (2 ** wake_count)
+                        if wake_count < int(self.settings["max_wakes"]) and (
+                            ag["last_wake_at"] is None or now_ts - last_wake >= due_wait
+                        ):
+                            conn.execute(
+                                "UPDATE agents SET wake_count = ?, last_wake_at = ?, updated_at = ? WHERE agent_id = ?",
+                                (wake_count + 1, now_ts, now_ts, agent_id),
+                            )
+                            wake_needed = True
+
                 self.ledger.emit_event_locked(
                     conn,
                     agent_id,
@@ -1811,16 +2393,14 @@ class HubCore:
                     now_ts,
                 )
                 msg_row = dict(conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone())
-                if agent_row is not None:
-                    wake_agent_row = dict(agent_row)
-                    wake_needed = (
-                        int(wake_agent_row["active_poll_count"]) == 0
-                        and wake_agent_row["state"] in ("stalled", "dead", "disconnected")
-                    )
 
         if not deduped:
             if self.mirror.enabled:
-                m_err = self.mirror.mirror_mail("to_agent", msg_row)
+                m_err = self.mirror.mirror_mail(
+                    "to_agent",
+                    msg_row,
+                    dot=wake_agent_row.get("dot") if wake_agent_row else None,
+                )
                 if m_err:
                     with self.ledger.tx() as conn:
                         self.ledger.emit_event_locked(conn, agent_id, "mirror_error", {"detail": m_err})
@@ -1856,8 +2436,14 @@ class HubCore:
         re_id = params.get("re_id")
         if re_id is not None:
             re_id = validate_token("re_id", re_id)
-        timeout_s = float(params.get("timeout_s") if params.get("timeout_s") is not None else 60.0)
-        since_ts = float(params.get("since_ts") or 0.0)
+        raw_tout = params.get("timeout_s")
+        timeout_s = validate_finite_float(
+            "timeout_s",
+            60.0 if raw_tout is None else raw_tout,
+            minimum=0.0,
+            maximum=3600.0,
+        )
+        since_ts = validate_finite_float("since_ts", params.get("since_ts") or 0.0, minimum=0.0)
 
         def _find_reply() -> Optional[Dict[str, Any]]:
             with self.ledger._lock:
@@ -1875,14 +2461,15 @@ class HubCore:
                     ).fetchone()
                 return self._format_msg_row(dict(row)) if row is not None else None
 
+        observed_gen = self.wake_hub.current_events_gen()
         found = _find_reply()
-        deadline = time.monotonic() + max(0.0, timeout_s)
+        deadline = time.monotonic() + timeout_s
         while found is None and not self.wake_hub.stop_event.is_set():
             rem = deadline - time.monotonic()
             if rem <= 0:
                 break
-            with self.wake_hub.events_cond:
-                self.wake_hub.events_cond.wait(timeout=min(rem, 1.0))
+            self.wake_hub.wait_events(observed_gen, min(rem, 5.0))
+            observed_gen = self.wake_hub.current_events_gen()
             found = _find_reply()
 
         return {"found": found is not None, "reply": found}
@@ -1962,13 +2549,17 @@ class HubCore:
         return {"ok": True, "id": msg_id}
 
     def local_events(self, agent_id: Optional[str] = None, after_seq: int = 0, limit: int = 100) -> Dict[str, Any]:
+        if isinstance(after_seq, bool) or isinstance(limit, bool):
+            raise ValueError("after_seq and limit must be integers")
+        seq_val = max(0, int(after_seq))
+        lim_val = max(1, min(int(limit), 500))
         with self.ledger._lock:
             clauses = ["seq > ?"]
-            args: List[Any] = [int(after_seq)]
+            args: List[Any] = [seq_val]
             if agent_id:
                 clauses.append("agent_id = ?")
                 args.append(validate_token("agent_id", agent_id))
-            args.append(max(1, min(int(limit), 500)))
+            args.append(lim_val)
             rows = self.ledger._conn.execute(
                 f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY seq ASC LIMIT ?",
                 args,
@@ -2023,28 +2614,54 @@ class HubCore:
         wakes_to_run: List[Tuple[Dict[str, Any], str]] = []
         notifies_to_run: List[Tuple[Dict[str, Any], str]] = []
         agents_total = 0
-        agents_alive = 0
+        final_states: List[str] = []
+        events_emitted = False
 
         with self.ledger.tx() as conn:
             rows = conn.execute("SELECT * FROM agents").fetchall()
             agents_total = len(rows)
+            pending_map = {
+                r["agent_id"]: int(r["cnt"])
+                for r in conn.execute(
+                    "SELECT agent_id, COUNT(*) AS cnt FROM messages WHERE direction = 'to_agent' "
+                    "AND kind IN ('task', 'steer', 'interrupt', 'question', 'review', 'intervention') "
+                    "AND delivery_state IN ('queued', 'offered', 'acked') GROUP BY agent_id"
+                ).fetchall()
+            }
+            resume_cancel_map = {
+                r["agent_id"]: int(r["cnt"])
+                for r in conn.execute(
+                    "SELECT agent_id, COUNT(*) AS cnt FROM messages WHERE direction = 'to_agent' "
+                    "AND kind IN ('resume', 'cancel') AND delivery_state IN ('queued', 'offered') "
+                    "GROUP BY agent_id"
+                ).fetchall()
+            }
             for raw in rows:
                 ag = dict(raw)
                 agent_id = ag["agent_id"]
                 state = ag["state"]
-                if state not in ("stalled", "dead", "disconnected"):
-                    agents_alive += 1
-                if state == "completed":
+                prev_state = state
+                pending = pending_map.get(agent_id, 0)
+                resume_cancel = resume_cancel_map.get(agent_id, 0)
+
+                if state == "paused" and resume_cancel == 0:
+                    final_states.append(state)
+                    continue
+                if state == "completed" and pending == 0:
+                    final_states.append(state)
                     continue
                 if int(ag["active_poll_count"]) > 0:
+                    final_states.append(state)
                     continue
 
                 lease_exp = float(ag["lease_expires_at"])
-                if now_ts <= lease_exp:
+                overdue = now_ts > lease_exp
+                if not overdue:
+                    final_states.append(state)
                     continue
 
-                # Lease expired while no poll is open.
-                if state in ("registered", "working", "waiting", "paused", "spinning"):
+                # Lease expired while no poll is open (or new Task queued for completed agent).
+                if overdue and state in ("registered", "working", "waiting", "blocked", "paused", "spinning", "completed"):
                     stalled_since = ag["stalled_since"] or now_ts
                     conn.execute(
                         "UPDATE agents SET state = 'stalled', stalled_since = ?, updated_at = ? WHERE agent_id = ?",
@@ -2057,11 +2674,12 @@ class HubCore:
                         {"prev_state": state, "overdue_s": round(now_ts - lease_exp, 2)},
                         now_ts,
                     )
+                    events_emitted = True
                     state = "stalled"
                     ag["state"] = "stalled"
                     ag["stalled_since"] = stalled_since
 
-                if now_ts > lease_exp + dead_grace_s and state in ("stalled", "disconnected"):
+                if overdue and now_ts > lease_exp + dead_grace_s and state in ("stalled", "disconnected"):
                     conn.execute(
                         "UPDATE agents SET state = 'dead', updated_at = ? WHERE agent_id = ?",
                         (now_ts, agent_id),
@@ -2073,15 +2691,17 @@ class HubCore:
                         {"dead_after_s": round(now_ts - lease_exp, 2)},
                         now_ts,
                     )
+                    events_emitted = True
                     state = "dead"
                     ag["state"] = "dead"
 
-                pending = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE agent_id = ? AND direction = 'to_agent' "
-                    "AND delivery_state IN ('queued', 'offered', 'acked')",
-                    (agent_id,),
-                ).fetchone()[0]
-                has_unfinished = pending > 0 or state in ("stalled", "dead")
+                final_states.append(state)
+                has_unfinished = pending > 0 or bool(ag.get("task")) or prev_state in (
+                    "working",
+                    "spinning",
+                    "stalled",
+                    "dead",
+                )
                 if not has_unfinished:
                     continue
 
@@ -2100,13 +2720,14 @@ class HubCore:
                     self.notify_cmd
                     and ag["notified_dead_at"] is None
                     and (state == "dead" or now_ts - stalled_at >= notify_after_s)
-                    and now_ts - stalled_at >= notify_after_s
                 ):
                     conn.execute(
                         "UPDATE agents SET notified_dead_at = ?, updated_at = ? WHERE agent_id = ?",
                         (now_ts, now_ts, agent_id),
                     )
                     notifies_to_run.append((ag, f"AGENT_{state.upper()}"))
+
+        agents_alive = sum(1 for st in final_states if st not in ("stalled", "dead", "disconnected"))
 
         for ag, why in wakes_to_run:
             self._spawn_cmd_hook(
@@ -2142,7 +2763,7 @@ class HubCore:
                 "notify_triggered",
                 ag["agent_id"],
             )
-        if wakes_to_run or notifies_to_run:
+        if wakes_to_run or notifies_to_run or events_emitted:
             self.wake_hub.wake_events()
 
         hb_path = os.path.join(self.state_dir, "heartbeat.json")
@@ -2230,7 +2851,7 @@ def reverse_mcp_tools() -> List[Dict[str, Any]]:
                     "expect_re": {"type": "string"},
                 },
             },
-            "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
         },
         {
             "name": "subdots_step",
@@ -2306,7 +2927,7 @@ def reverse_mcp_tools() -> List[Dict[str, Any]]:
                     "ack_ids": {"type": "array", "items": {"type": "string"}},
                 },
             },
-            "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
         },
     ]
 
@@ -2344,8 +2965,13 @@ def handle_reverse_mcp_rpc(core: HubCore, req: Any) -> Optional[Dict[str, Any]]:
                 res = core.agent_register(args)
             elif name == "subdots_wait":
                 bounded = dict(args)
-                hold = float(bounded.get("hold_s") if bounded.get("hold_s") is not None else 20.0)
-                bounded["hold_s"] = max(0.0, min(hold, 25.0))
+                raw_hold = bounded.get("hold_s")
+                bounded["hold_s"] = validate_finite_float(
+                    "hold_s",
+                    20.0 if raw_hold is None else raw_hold,
+                    minimum=0.0,
+                    maximum=25.0,
+                )
                 res = core.agent_poll(bounded)
             elif name == "subdots_step":
                 res = core.agent_step(args)
@@ -2364,7 +2990,7 @@ def handle_reverse_mcp_rpc(core: HubCore, req: Any) -> Optional[Dict[str, Any]]:
                 content.append({"type": "text", "text": piggyback})
             content.append({"type": "text", "text": json.dumps(res, ensure_ascii=False)})
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": content, "isError": False}}
-        except (HubError, ValueError) as exc:
+        except (HubError, ValueError, TypeError) as exc:
             err_msg = exc.message if isinstance(exc, HubError) else str(exc)
             return {
                 "jsonrpc": "2.0",
@@ -2379,6 +3005,35 @@ def handle_reverse_mcp_rpc(core: HubCore, req: Any) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _extract_host_only(raw_host: str) -> str:
+    h = raw_host.strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        if end == -1:
+            return ""
+        rest = h[end + 1 :]
+        if rest and (not rest.startswith(":") or not rest[1:].isdigit()):
+            return ""
+        return h[: end + 1]
+    if h.count(":") == 1:
+        name, port_s = h.split(":", 1)
+        if not port_s.isascii() or not port_s.isdigit():
+            return ""
+        port_num = int(port_s)
+        if port_num < 1 or port_num > 65535:
+            return ""
+        return name
+    if ":" in h:
+        return ""
+    return h
+
+
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,8}$")
+_CL_RE = re.compile(r"^[0-9]+$")
+
+
 class SubdotsHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -2387,22 +3042,37 @@ class SubdotsHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.core = core
         self.token = token
         self.stop_cb = stop_cb
+        self._conn_sem = threading.BoundedSemaphore(64)
         super().__init__(server_address, SubdotsHTTPHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
 
 
 class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 15.0
 
     def log_message(self, format: str, *args: Any) -> None:
         return  # Keep stdout/stderr clean; events live in SQLite.
 
     def _send_json(self, status: int, obj: Any, close: bool = False) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        force_close = close or (status >= 400)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if close:
+        if force_close:
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
@@ -2413,37 +3083,73 @@ class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _public_host_bare(self) -> Optional[str]:
+        pub = self.server.core.public_host
+        if not pub:
+            return None
+        extracted = _extract_host_only(pub)
+        return extracted or pub.strip().lower()
+
     def _allowed_host(self) -> bool:
-        host = (self.headers.get("Host") or "").strip().lower()
-        if not host:
+        host_vals = self.headers.get_all("Host") or []
+        if len(host_vals) != 1:
             return False
-        hostname = host.split(":")[0]
-        if host.startswith("["):
-            hostname = host.split("]")[0] + "]"
+        host = host_vals[0].strip().lower()
+        hostname = _extract_host_only(host)
+        if not hostname:
+            return False
         allowed = {"127.0.0.1", "localhost", "[::1]"}
-        if self.server.core.public_host:
-            allowed.add(self.server.core.public_host.lower())
+        pub = self._public_host_bare()
+        if pub:
+            allowed.add(pub)
         return hostname in allowed
 
     def _allowed_origin(self) -> bool:
-        origin = (self.headers.get("Origin") or "").strip()
+        origin_vals = self.headers.get_all("Origin") or []
+        if len(origin_vals) > 1:
+            return False
+        origin = origin_vals[0].strip() if origin_vals else ""
         if not origin:
             return True
-        parsed = urllib.parse.urlsplit(origin)
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            return False
         host = (parsed.hostname or "").lower()
-        return host in ("127.0.0.1", "localhost", "::1")
+        allowed = {"127.0.0.1", "localhost", "::1"}
+        pub = self._public_host_bare()
+        if pub:
+            allowed.add(pub.strip("[]"))
+        return host in allowed
+
+    def _effective_mcp_resource_url(self) -> str:
+        pub = self._public_host_bare()
+        raw_host = (self.headers.get("Host") or "").strip()
+        if pub and _extract_host_only(raw_host) == pub:
+            proto_hdrs = self.headers.get_all("X-Forwarded-Proto") or ["https"]
+            proto = proto_hdrs[-1].split(",")[-1].strip().lower()
+            scheme = proto if proto in ("http", "https") else "https"
+            return f"{scheme}://{raw_host}/{self.server.token}/mcp"
+        return self.server.core.mcp_url
 
     def _check_security_and_route(self) -> Optional[str]:
         if not self._allowed_host():
-            self._send_json(403, {"error": "forbidden host", "code": "FORBIDDEN_HOST"})
+            self._send_json(403, {"error": "forbidden host", "code": "FORBIDDEN_HOST"}, close=True)
             return None
         if not self._allowed_origin():
-            self._send_json(403, {"error": "forbidden origin", "code": "FORBIDDEN_ORIGIN"})
+            self._send_json(403, {"error": "forbidden origin", "code": "FORBIDDEN_ORIGIN"}, close=True)
             return None
 
         path = urllib.parse.urlsplit(self.path).path
         prm_expected = f"/.well-known/oauth-protected-resource/{self.server.token}/mcp"
-        if path == prm_expected:
+        if hmac.compare_digest(path.encode("utf-8"), prm_expected.encode("utf-8")):
             return "__PRM__"
 
         parts = [p for p in path.split("/") if p]
@@ -2452,47 +3158,141 @@ class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
         if auth.lower().startswith("bearer "):
             bearer = auth[7:].strip()
 
-        if parts and hmac.compare_digest(parts[0], self.server.token):
+        tok_b = self.server.token.encode("utf-8")
+        if parts and hmac.compare_digest(parts[0].encode("utf-8"), tok_b):
             return "/" + "/".join(parts[1:])
-        if bearer and hmac.compare_digest(bearer, self.server.token):
+        if bearer and hmac.compare_digest(bearer.encode("utf-8"), tok_b):
             return path
-        self._send_json(401, {"error": "unauthorized", "code": "UNAUTHORIZED"})
+        self._send_json(401, {"error": "unauthorized", "code": "UNAUTHORIZED"}, close=True)
         return None
 
-    def _read_json_body(self) -> Optional[Any]:
-        raw_len = self.headers.get("Content-Length")
-        if raw_len is not None:
-            try:
-                clen = int(raw_len)
-            except ValueError:
-                self._send_json(400, {"error": "invalid content-length", "code": "INVALID_INPUT"})
-                return None
-            if clen < 0 or clen > MAX_HTTP_BODY_BYTES:
-                self._send_json(413, {"error": "payload too large", "code": "PAYLOAD_TOO_LARGE"}, close=True)
-                return None
-            raw = self.rfile.read(clen) if clen else b""
-        else:
-            raw = self.rfile.read(MAX_HTTP_BODY_BYTES + 1)
-            if len(raw) > MAX_HTTP_BODY_BYTES:
-                self._send_json(413, {"error": "payload too large", "code": "PAYLOAD_TOO_LARGE"}, close=True)
-                return None
-        if not raw:
-            return {}
+    def _read_chunked_body(self) -> Optional[bytes]:
+        buf = bytearray()
+        deadline = time.monotonic() + 30.0
+        chunk_count = 0
         try:
-            return json.loads(raw.decode("utf-8"))
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    self._send_json(408, {"error": "chunked body timeout", "code": "REQUEST_TIMEOUT"}, close=True)
+                    return None
+                self.connection.settimeout(min(15.0, rem))
+                chunk_count += 1
+                if chunk_count > 1024:
+                    self._send_json(400, {"error": "too many chunks", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                size_line = self.rfile.readline(128)
+                if not size_line or not size_line.endswith(b"\r\n") or len(size_line) > 120:
+                    self._send_json(400, {"error": "invalid chunk size line", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                size_part = size_line[:-2].split(b";", 1)[0].strip()
+                if not _CHUNK_SIZE_RE.fullmatch(size_part):
+                    self._send_json(400, {"error": "invalid chunk length", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                chunk_len = int(size_part, 16)
+                if len(buf) + chunk_len > MAX_HTTP_BODY_BYTES:
+                    self._send_json(413, {"error": "payload too large", "code": "PAYLOAD_TOO_LARGE"}, close=True)
+                    return None
+                if chunk_len == 0:
+                    for _ in range(64):
+                        rem = deadline - time.monotonic()
+                        if rem <= 0:
+                            self._send_json(408, {"error": "chunked trailer timeout", "code": "REQUEST_TIMEOUT"}, close=True)
+                            return None
+                        self.connection.settimeout(min(15.0, rem))
+                        trailer = self.rfile.readline(4098)
+                        if not trailer or len(trailer) > 4096 or not trailer.endswith(b"\r\n"):
+                            self._send_json(400, {"error": "invalid chunk trailer", "code": "INVALID_INPUT"}, close=True)
+                            return None
+                        if trailer == b"\r\n":
+                            return bytes(buf)
+                    self._send_json(400, {"error": "too many chunk trailers", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    self._send_json(408, {"error": "chunked body timeout", "code": "REQUEST_TIMEOUT"}, close=True)
+                    return None
+                self.connection.settimeout(min(15.0, rem))
+                chunk = self.rfile.read(chunk_len)
+                if len(chunk) != chunk_len:
+                    self._send_json(400, {"error": "truncated chunk", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                crlf = self.rfile.read(2)
+                if crlf != b"\r\n":
+                    self._send_json(400, {"error": "missing chunk CRLF", "code": "INVALID_INPUT"}, close=True)
+                    return None
+                buf.extend(chunk)
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(15.0)
+
+    def _read_json_body(self) -> Tuple[bool, Any]:
+        te_vals = self.headers.get_all("Transfer-Encoding") or []
+        cl_vals = self.headers.get_all("Content-Length") or []
+        ct_vals = self.headers.get_all("Content-Type") or []
+        if len(cl_vals) > 1 or len(ct_vals) > 1:
+            self._send_json(400, {"error": "duplicate Content-Length or Content-Type", "code": "INVALID_INPUT"}, close=True)
+            return False, None
+        if te_vals and cl_vals:
+            self._send_json(400, {"error": "conflicting Content-Length and Transfer-Encoding", "code": "INVALID_INPUT"}, close=True)
+            return False, None
+
+        raw = b""
+        if te_vals:
+            encodings = [p.strip().lower() for h in te_vals for p in h.split(",") if p.strip()]
+            if encodings != ["chunked"]:
+                self._send_json(501, {"error": "unsupported Transfer-Encoding", "code": "UNSUPPORTED_TE"}, close=True)
+                return False, None
+            chunked = self._read_chunked_body()
+            if chunked is None:
+                return False, None
+            raw = chunked
+        elif cl_vals:
+            raw_len = cl_vals[0].strip()
+            if not _CL_RE.fullmatch(raw_len):
+                self._send_json(400, {"error": "invalid content-length", "code": "INVALID_INPUT"}, close=True)
+                return False, None
+            clen = int(raw_len)
+            if clen > MAX_HTTP_BODY_BYTES:
+                self._send_json(413, {"error": "payload too large", "code": "PAYLOAD_TOO_LARGE"}, close=True)
+                return False, None
+            raw = self.rfile.read(clen) if clen else b""
+            if len(raw) != clen:
+                self._send_json(400, {"error": "truncated body", "code": "INVALID_INPUT"}, close=True)
+                return False, None
+
+        if raw:
+            ctype = (ct_vals[0] if ct_vals else "").split(";", 1)[0].strip().lower()
+            if ctype and ctype != "application/json" and not ctype.endswith("+json"):
+                self._send_json(415, {"error": "Content-Type must be application/json", "code": "UNSUPPORTED_MEDIA_TYPE"}, close=True)
+                return False, None
+            if not ctype and (self.headers.get("Origin") or "").strip():
+                self._send_json(415, {"error": "Content-Type application/json required", "code": "UNSUPPORTED_MEDIA_TYPE"}, close=True)
+                return False, None
+
+        if not raw:
+            return True, {}
+        try:
+            return True, json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            self._send_json(400, {"error": "invalid json", "code": "INVALID_JSON"})
-            return None
+            self._send_json(400, {"error": "invalid json", "code": "INVALID_JSON"}, close=True)
+            return False, None
+
+    def _reject_body_headers(self) -> bool:
+        if (self.headers.get_all("Content-Length") or []) or (self.headers.get_all("Transfer-Encoding") or []):
+            self._send_json(400, {"error": "body framing not allowed on this method", "code": "INVALID_INPUT"}, close=True)
+            return True
+        return False
 
     def do_GET(self) -> None:
         route = self._check_security_and_route()
-        if route is None:
+        if route is None or self._reject_body_headers():
             return
         if route == "__PRM__":
             self._send_json(
                 200,
                 {
-                    "resource": self.server.core.mcp_url,
+                    "resource": self._effective_mcp_resource_url(),
                     "resource_name": "Dotomation sub-dots Reverse Bridge",
                     "authorization_servers": [],
                 },
@@ -2508,7 +3308,7 @@ class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         route = self._check_security_and_route()
-        if route is None:
+        if route is None or self._reject_body_headers():
             return
         if route == "/mcp":
             self._send_json(200, {"ok": True})
@@ -2519,12 +3319,37 @@ class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
         route = self._check_security_and_route()
         if route is None:
             return
-        body = self._read_json_body()
-        if body is None:
+        ok, body = self._read_json_body()
+        if not ok:
             return
 
         if route == "/mcp":
             if isinstance(body, list):
+                if not body:
+                    self._send_json(
+                        400,
+                        {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Empty batch"}},
+                    )
+                    return
+                if len(body) > 20:
+                    self._send_json(400, {"error": "JSON-RPC batch exceeds 20 items", "code": "INVALID_INPUT"})
+                    return
+                for item in body:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("method") == "tools/call"
+                        and isinstance(item.get("params"), dict)
+                        and item["params"].get("name") == "subdots_wait"
+                    ):
+                        self._send_json(
+                            400,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": item.get("id"),
+                                "error": {"code": -32600, "message": "subdots_wait cannot be used in a batch"},
+                            },
+                        )
+                        return
                 replies = [r for r in (handle_reverse_mcp_rpc(self.server.core, item) for item in body) if r is not None]
                 if not replies:
                     self._send_empty(202)
@@ -2564,8 +3389,10 @@ class SubdotsHTTPHandler(http.server.BaseHTTPRequestHandler):
             out = {"error": exc.message, "code": exc.code}
             out.update(exc.extra)
             self._send_json(exc.status, out)
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
             self._send_json(400, {"error": str(exc), "code": "INVALID_INPUT"})
+        except Exception:
+            self._send_json(500, {"error": "internal server error", "code": "INTERNAL_ERROR"})
 
 
 # ---------------------------------------------------------------------------
@@ -2579,10 +3406,31 @@ class ControlSocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSe
     def __init__(self, socket_path: str, core: HubCore, stop_cb: Any) -> None:
         self.core = core
         self.stop_cb = stop_cb
-        with contextlib.suppress(FileNotFoundError):
+        self._conn_sem = threading.BoundedSemaphore(64)
+        try:
+            st = os.lstat(socket_path)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode):
+                raise OSError(f"{socket_path} exists and is not a Unix domain socket")
+            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                raise OSError(f"{socket_path} owner mismatch")
             os.unlink(socket_path)
         super().__init__(socket_path, ControlSocketHandler)
         os.chmod(socket_path, 0o600)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._conn_sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
 
 
 class ControlSocketHandler(socketserver.StreamRequestHandler):
@@ -2626,7 +3474,14 @@ class ControlSocketHandler(socketserver.StreamRequestHandler):
                 continue
 
             if method == "events.follow":
-                self._stream_events(req_id, params)
+                try:
+                    self._stream_events(req_id, params)
+                except HubError as exc:
+                    with contextlib.suppress(OSError):
+                        self._write_line({"id": req_id, "error": {"code": exc.code, "message": exc.message, **exc.extra}})
+                except (ValueError, TypeError) as exc:
+                    with contextlib.suppress(OSError):
+                        self._write_line({"id": req_id, "error": {"code": "INVALID_INPUT", "message": str(exc)}})
                 return
 
             try:
@@ -2636,16 +3491,31 @@ class ControlSocketHandler(socketserver.StreamRequestHandler):
                     return
             except HubError as exc:
                 self._write_line({"id": req_id, "error": {"code": exc.code, "message": exc.message, **exc.extra}})
-            except ValueError as exc:
+            except (ValueError, TypeError) as exc:
                 self._write_line({"id": req_id, "error": {"code": "INVALID_INPUT", "message": str(exc)}})
 
     def _stream_events(self, req_id: Any, params: Dict[str, Any]) -> None:
-        after_seq = int(params.get("after_seq") or 0)
+        raw_after = params.get("after_seq")
+        if raw_after is None:
+            after_seq = 0
+        elif isinstance(raw_after, bool) or not isinstance(raw_after, int):
+            raise ValueError("after_seq must be an integer")
+        else:
+            after_seq = max(0, raw_after)
         agent_id = params.get("agent_id")
-        timeout_s = float(params.get("timeout_s") if params.get("timeout_s") is not None else 30.0)
-        deadline = time.monotonic() + max(0.0, timeout_s)
+        if agent_id is not None:
+            agent_id = validate_token("agent_id", agent_id)
+        raw_tout = params.get("timeout_s")
+        timeout_s = validate_finite_float(
+            "timeout_s",
+            30.0 if raw_tout is None else raw_tout,
+            minimum=0.0,
+            maximum=3600.0,
+        )
+        deadline = time.monotonic() + timeout_s
         self._write_line({"id": req_id, "result": {"streaming": True}})
         while not self.server.core.wake_hub.stop_event.is_set():
+            observed_gen = self.server.core.wake_hub.current_events_gen()
             batch = self.server.core.local_events(agent_id=agent_id, after_seq=after_seq, limit=100)["events"]
             for ev in batch:
                 after_seq = max(after_seq, int(ev["seq"]))
@@ -2653,13 +3523,14 @@ class ControlSocketHandler(socketserver.StreamRequestHandler):
                     self._write_line({"event": ev})
                 except OSError:
                     return
+            if len(batch) >= 100:
+                continue
             rem = deadline - time.monotonic()
             if rem <= 0:
                 with contextlib.suppress(OSError):
                     self._write_line({"done": True, "last_seq": after_seq})
                 return
-            with self.server.core.wake_hub.events_cond:
-                self.server.core.wake_hub.events_cond.wait(timeout=min(rem, 0.5))
+            self.server.core.wake_hub.wait_events(observed_gen, min(rem, 1.0))
 
     def _dispatch(self, method: Any, params: Dict[str, Any]) -> Any:
         core: HubCore = self.server.core
@@ -2795,19 +3666,21 @@ def run_hub_foreground(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
     ensure_private_dir(state_dir)
 
+    if a.port < 0 or a.port > 65535:
+        raise ValueError("port must be in [0, 65535]")
     settings = {
-        "lease_ttl_s": a.lease_ttl,
-        "dead_grace_s": a.dead_grace,
-        "watchdog_interval_s": a.watchdog_interval,
-        "reoffer_s": a.reoffer_s,
-        "max_offers": a.max_offers,
-        "wake_backoff_s": a.wake_backoff,
-        "max_wakes": a.max_wakes,
-        "notify_after_s": a.notify_after,
-        "spin_window_s": a.spin_window,
-        "spin_cmd_repeats": a.spin_cmd_repeats,
-        "spin_step_repeats": a.spin_step_repeats,
-        "spin_poll_burst": a.spin_poll_burst,
+        "lease_ttl_s": validate_finite_float("lease-ttl", float(a.lease_ttl), minimum=0.1, maximum=3600.0),
+        "dead_grace_s": validate_finite_float("dead-grace", float(a.dead_grace), minimum=0.0, maximum=86400.0),
+        "watchdog_interval_s": validate_finite_float("watchdog-interval", float(a.watchdog_interval), minimum=0.05, maximum=3600.0),
+        "reoffer_s": validate_finite_float("reoffer-s", float(a.reoffer_s), minimum=0.1, maximum=86400.0),
+        "max_offers": max(1, int(a.max_offers)),
+        "wake_backoff_s": validate_finite_float("wake-backoff", float(a.wake_backoff), minimum=0.0, maximum=86400.0),
+        "max_wakes": max(0, int(a.max_wakes)),
+        "notify_after_s": validate_finite_float("notify-after", float(a.notify_after), minimum=0.0, maximum=86400.0),
+        "spin_window_s": validate_finite_float("spin-window", float(a.spin_window), minimum=1.0, maximum=86400.0),
+        "spin_cmd_repeats": max(1, int(a.spin_cmd_repeats)),
+        "spin_step_repeats": max(1, int(a.spin_step_repeats)),
+        "spin_poll_burst": max(1, int(a.spin_poll_burst)),
     }
     ops_base = a.ops_base or (os.environ.get("DOTS_OPS_BASE") if a.mirror_ops else None)
     wake_cmd = parse_cmd_argv(a.wake_cmd, "--wake-cmd")
@@ -2826,73 +3699,81 @@ def run_hub_foreground(a: argparse.Namespace) -> int:
     sock_path, sock_tmp_dir = socket_path_for(state_dir)
     rt_path = runtime_path_for(state_dir)
     shutdown_event = threading.Event()
+    http_srv: Optional[SubdotsHTTPServer] = None
+    ctrl_srv: Optional[ControlSocketServer] = None
+    wd_th: Optional[threading.Thread] = None
+    previous: Dict[Any, Any] = {}
 
     def trigger_stop() -> None:
         core.wake_hub.stop_all()
         shutdown_event.set()
 
-    http_srv = SubdotsHTTPServer(("127.0.0.1", int(a.port)), core, token, trigger_stop)
-    bound_port = http_srv.server_address[1]
-    base_url = f"http://127.0.0.1:{bound_port}/{token}"
-    core.http_url = base_url
-    core.mcp_url = f"{base_url}/mcp"
-
-    ctrl_srv = ControlSocketServer(sock_path, core, trigger_stop)
-
-    runtime_doc = {
-        "v": 1,
-        "version": VERSION,
-        "pid": os.getpid(),
-        "started_at": core.started_at,
-        "state_dir": state_dir,
-        "socket_path": sock_path,
-        "http_host": "127.0.0.1",
-        "http_port": bound_port,
-        "token": token,
-        "http_url": core.http_url,
-        "mcp_url": core.mcp_url,
-        "public_host": a.public_host,
-        "ops_base": core.mirror.ops_base,
-    }
-    write_private_atomic(rt_path, json.dumps(runtime_doc, indent=1) + "\n", mode=0o600)
-
-    def _on_signal(signum: int, frame: Any) -> None:
-        trigger_stop()
-
-    previous = {s: signal.getsignal(s) for s in SIGNALS}
-    for s in SIGNALS:
-        signal.signal(s, _on_signal)
-
-    http_th = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
-    ctrl_th = threading.Thread(target=ctrl_srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
-
-    def _watchdog_runner() -> None:
-        interval = max(0.05, float(core.settings["watchdog_interval_s"]))
-        while not shutdown_event.wait(interval):
-            try:
-                core.watchdog_tick()
-            except Exception as exc:
-                with contextlib.suppress(Exception):
-                    with core.ledger.tx() as conn:
-                        core.ledger.emit_event_locked(conn, "-", "watchdog_error", {"detail": redact(str(exc))})
-
-    wd_th = threading.Thread(target=_watchdog_runner, daemon=True)
-    http_th.start()
-    ctrl_th.start()
-    wd_th.start()
-
     try:
+        core._hub_token = token
+        http_srv = SubdotsHTTPServer(("127.0.0.1", int(a.port)), core, token, trigger_stop)
+        bound_port = http_srv.server_address[1]
+        base_url = f"http://127.0.0.1:{bound_port}/{token}"
+        core.http_url = base_url
+        core.mcp_url = f"{base_url}/mcp"
+
+        ctrl_srv = ControlSocketServer(sock_path, core, trigger_stop)
+
+        runtime_doc = {
+            "v": 1,
+            "version": VERSION,
+            "pid": os.getpid(),
+            "started_at": core.started_at,
+            "state_dir": state_dir,
+            "socket_path": sock_path,
+            "http_host": "127.0.0.1",
+            "http_port": bound_port,
+            "token": token,
+            "http_url": core.http_url,
+            "mcp_url": core.mcp_url,
+            "public_host": a.public_host,
+            "ops_base": core.mirror.ops_base,
+        }
+        write_private_atomic(rt_path, json.dumps(runtime_doc, indent=1) + "\n", mode=0o600)
+
+        def _on_signal(signum: int, frame: Any) -> None:
+            trigger_stop()
+
+        previous = {s: signal.getsignal(s) for s in SIGNALS}
+        for s in SIGNALS:
+            signal.signal(s, _on_signal)
+
+        http_th = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
+        ctrl_th = threading.Thread(target=ctrl_srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
+
+        def _watchdog_runner() -> None:
+            interval = max(0.05, float(core.settings["watchdog_interval_s"]))
+            while not shutdown_event.wait(interval):
+                try:
+                    core.watchdog_tick()
+                except Exception as exc:
+                    with contextlib.suppress(Exception):
+                        with core.ledger.tx() as conn:
+                            core.ledger.emit_event_locked(conn, "-", "watchdog_error", {"detail": redact(str(exc))})
+
+        wd_th = threading.Thread(target=_watchdog_runner, daemon=True)
+        http_th.start()
+        ctrl_th.start()
+        wd_th.start()
+
         while not shutdown_event.is_set():
             shutdown_event.wait(0.5)
     finally:
         core.wake_hub.stop_all()
-        with contextlib.suppress(Exception):
-            ctrl_srv.shutdown()
-            ctrl_srv.server_close()
-        with contextlib.suppress(Exception):
-            http_srv.shutdown()
-            http_srv.server_close()
-        wd_th.join(timeout=2.0)
+        if ctrl_srv is not None:
+            with contextlib.suppress(Exception):
+                ctrl_srv.shutdown()
+                ctrl_srv.server_close()
+        if http_srv is not None:
+            with contextlib.suppress(Exception):
+                http_srv.shutdown()
+                http_srv.server_close()
+        if wd_th is not None:
+            wd_th.join(timeout=2.0)
         core.close()
         with contextlib.suppress(OSError):
             if os.path.exists(rt_path):
@@ -2915,6 +3796,9 @@ def cmd_hub_start(a: argparse.Namespace) -> int:
 
     with contextlib.suppress(Exception):
         existing = control_rpc(state_dir, "hub.status", timeout=2.0)
+        if not getattr(a, "show_token", False):
+            existing["http_url"] = re.sub(r"/[0-9a-f]{48}$", "/<token>", existing["http_url"])
+            existing["mcp_url"] = re.sub(r"/[0-9a-f]{48}/mcp$", "/<token>/mcp", existing["mcp_url"])
         if a.json:
             print(json.dumps({"already_running": True, **existing}, ensure_ascii=False))
         else:
@@ -2953,7 +3837,23 @@ def cmd_hub_start(a: argparse.Namespace) -> int:
         cmd += [flag, str(val)]
 
     log_path = os.path.join(state_dir, "hub.log")
-    log_fh = open(log_path, "ab")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | nofollow | os.O_NONBLOCK, 0o600)
+    opened = False
+    try:
+        if not stat.S_ISREG(os.fstat(log_fd).st_mode):
+            raise OSError(f"{log_path} is not a regular file")
+        if hasattr(os, "fchmod"):
+            os.fchmod(log_fd, 0o600)
+        else:
+            os.chmod(log_path, 0o600)
+        log_fh = os.fdopen(log_fd, "ab")
+        opened = True
+    except BaseException:
+        if not opened:
+            with contextlib.suppress(OSError):
+                os.close(log_fd)
+        raise
     try:
         proc = subprocess.Popen(
             cmd,
@@ -2971,6 +3871,9 @@ def cmd_hub_start(a: argparse.Namespace) -> int:
             die(f"hub exited prematurely with code {proc.returncode}; check {log_path}", code=3)
         try:
             st = control_rpc(state_dir, "hub.status", timeout=1.5)
+            if not getattr(a, "show_token", False):
+                st["http_url"] = re.sub(r"/[0-9a-f]{48}$", "/<token>", st["http_url"])
+                st["mcp_url"] = re.sub(r"/[0-9a-f]{48}/mcp$", "/<token>/mcp", st["mcp_url"])
             if a.json:
                 print(json.dumps(st, ensure_ascii=False))
             else:
@@ -3004,6 +3907,28 @@ def cmd_hub_status(a: argparse.Namespace) -> int:
     return 0
 
 
+def _pid_matches_subdots_hub(pid: int, state_dir: str) -> bool:
+    if pid <= 0 or pid == os.getpid() or not pid_alive(pid):
+        return False
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        cmd_line = proc.stdout.strip()
+        if proc.returncode != 0 or not cmd_line:
+            return False
+        parts = cmd_line.split()
+        has_script = any(os.path.basename(p) == "subdots.py" for p in parts)
+        if not (has_script and "hub" in parts and "start" in parts and "--foreground" in parts):
+            return False
+        return state_dir in parts or os.path.realpath(state_dir) in cmd_line
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def cmd_hub_stop(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
     try:
@@ -3012,17 +3937,27 @@ def cmd_hub_stop(a: argparse.Namespace) -> int:
         print(f"HUB not running ({exc})")
         return 0
     pid = int(rt.get("pid") or 0)
+    started_at = rt.get("started_at")
     with contextlib.suppress(Exception):
         control_rpc(state_dir, "hub.stop", timeout=3.0)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and pid_alive(pid):
         time.sleep(0.05)
     if pid_alive(pid):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and pid_alive(pid):
-            time.sleep(0.05)
+        cur_rt: Optional[Dict[str, Any]] = None
+        with contextlib.suppress(Exception):
+            cur_rt = read_runtime(state_dir)
+        if (
+            cur_rt is not None
+            and cur_rt.get("pid") == pid
+            and cur_rt.get("started_at") == started_at
+            and _pid_matches_subdots_hub(pid, state_dir)
+        ):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and pid_alive(pid):
+                time.sleep(0.05)
     if a.json:
         print(json.dumps({"ok": True, "pid": pid}))
     else:
@@ -3042,6 +3977,41 @@ def local_mcp_tools() -> List[Dict[str, Any]]:
             "description": "List connected Dots sub-agents, their epoch, live state, lease health, spin strikes, and pending steering counts.",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+        },
+        {
+            "name": "subdots_agent_status",
+            "description": "Show detailed live status, recent messages, and recent command runs for a specific Dots sub-agent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent_id"],
+                "properties": {"agent_id": {"type": "string"}},
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+        },
+        {
+            "name": "subdots_inbox",
+            "description": "Read direct messages (replies, questions, results, blockers) sent from Dots sub-agents to the local session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "include_read": {"type": "boolean"},
+                },
+            },
+            "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+        },
+        {
+            "name": "subdots_mark_read",
+            "description": "Mark a sub-agent reply message as read in the local session inbox.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent_id", "id"],
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "id": {"type": "string"},
+                },
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
         },
         {
             "name": "subdots_send",
@@ -3125,6 +4095,109 @@ def local_mcp_tools() -> List[Dict[str, Any]]:
 
 def cmd_mcp_stdio(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
+    out_lock = threading.Lock()
+    sem = threading.BoundedSemaphore(16)
+    in_flight: List[threading.Thread] = []
+    flight_lock = threading.Lock()
+
+    def _emit(obj: Dict[str, Any]) -> None:
+        raw = json.dumps(obj, ensure_ascii=False) + "\n"
+        with out_lock:
+            sys.stdout.write(raw)
+            sys.stdout.flush()
+
+    def _handle_req(req: Dict[str, Any]) -> None:
+        try:
+            req_id = req.get("id")
+            method = req.get("method")
+            params = req.get("params") if isinstance(req.get("params"), dict) else {}
+            if req_id is None:
+                return
+            if method == "initialize":
+                proto = params.get("protocolVersion")
+                chosen = proto if isinstance(proto, str) and proto in ("2024-11-05", "2025-03-26") else MCP_PROTOCOL_VERSION
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": chosen,
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": "dotomation-subdots-local-mcp", "version": VERSION},
+                    },
+                }
+            elif method == "ping":
+                resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            elif method == "tools/list":
+                resp = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": local_mcp_tools()}}
+            elif method == "tools/call":
+                name = params.get("name")
+                args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+                try:
+                    if name == "subdots_list_agents":
+                        out = control_rpc(state_dir, "agent.list")
+                    elif name == "subdots_agent_status":
+                        out = control_rpc(state_dir, "agent.status", {"agent_id": args.get("agent_id", "")})
+                    elif name == "subdots_inbox":
+                        out = control_rpc(
+                            state_dir,
+                            "message.inbox",
+                            {"agent_id": args.get("agent_id"), "include_read": bool(args.get("include_read", False))},
+                        )
+                    elif name == "subdots_mark_read":
+                        out = control_rpc(
+                            state_dir,
+                            "message.mark_read",
+                            {"agent_id": args.get("agent_id", ""), "id": args.get("id", "")},
+                        )
+                    elif name == "subdots_send":
+                        out = control_rpc(state_dir, "message.send", args)
+                    elif name == "subdots_steer":
+                        p = dict(args)
+                        p["kind"] = "interrupt" if p.get("interrupt") else "steer"
+                        p.setdefault("task", "steer")
+                        out = control_rpc(state_dir, "message.send", p)
+                    elif name == "subdots_await_reply":
+                        raw_tout = args.get("timeout_s")
+                        tout = validate_finite_float(
+                            "timeout_s",
+                            60.0 if raw_tout is None else raw_tout,
+                            minimum=0.0,
+                            maximum=3600.0,
+                        )
+                        out = control_rpc(state_dir, "message.await", args, timeout=tout + 10.0)
+                    elif name == "subdots_events":
+                        out = control_rpc(state_dir, "events.list", args)
+                    elif name == "subdots_control":
+                        action = args.get("action")
+                        if action not in ("pause", "resume", "cancel", "release", "wake"):
+                            raise ValueError(f"invalid control action {action!r}")
+                        out = control_rpc(
+                            state_dir,
+                            f"control.{action}",
+                            {"agent_id": args.get("agent_id"), "text": args.get("text") or action},
+                        )
+                    else:
+                        out = None
+                    if out is None:
+                        resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+                    else:
+                        resp = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}], "isError": False},
+                        }
+                except Exception as exc:
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": [{"type": "text", "text": f"ERROR: {exc}"}], "isError": True},
+                    }
+            else:
+                resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+            _emit(resp)
+        finally:
+            sem.release()
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -3132,75 +4205,22 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
         try:
             req = json.loads(line)
         except ValueError:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}) + "\n")
-            sys.stdout.flush()
+            _emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
             continue
         if not isinstance(req, dict):
+            _emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
             continue
-        req_id = req.get("id")
-        method = req.get("method")
-        params = req.get("params") if isinstance(req.get("params"), dict) else {}
-        if req_id is None:
-            continue
-        if method == "initialize":
-            proto = params.get("protocolVersion")
-            chosen = proto if isinstance(proto, str) and proto in ("2024-11-05", "2025-03-26") else MCP_PROTOCOL_VERSION
-            resp = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": chosen,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "dotomation-subdots-local-mcp", "version": VERSION},
-                },
-            }
-        elif method == "ping":
-            resp = {"jsonrpc": "2.0", "id": req_id, "result": {}}
-        elif method == "tools/list":
-            resp = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": local_mcp_tools()}}
-        elif method == "tools/call":
-            name = params.get("name")
-            args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            try:
-                if name == "subdots_list_agents":
-                    out = control_rpc(state_dir, "agent.list")
-                elif name == "subdots_send":
-                    out = control_rpc(state_dir, "message.send", args)
-                elif name == "subdots_steer":
-                    p = dict(args)
-                    p["kind"] = "interrupt" if p.get("interrupt") else "steer"
-                    p.setdefault("task", "steer")
-                    out = control_rpc(state_dir, "message.send", p)
-                elif name == "subdots_await_reply":
-                    tout = float(args.get("timeout_s") if args.get("timeout_s") is not None else 60.0)
-                    out = control_rpc(state_dir, "message.await", args, timeout=tout + 10.0)
-                elif name == "subdots_events":
-                    out = control_rpc(state_dir, "events.list", args)
-                elif name == "subdots_control":
-                    action = args.get("action")
-                    if action not in ("pause", "resume", "cancel", "release", "wake"):
-                        raise ValueError(f"invalid control action {action!r}")
-                    out = control_rpc(state_dir, f"control.{action}", {"agent_id": args.get("agent_id"), "text": args.get("text") or action})
-                else:
-                    out = None
-                if out is None:
-                    resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
-                else:
-                    resp = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}], "isError": False},
-                    }
-            except Exception as exc:
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {"content": [{"type": "text", "text": f"ERROR: {exc}"}], "isError": True},
-                }
-        else:
-            resp = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        sem.acquire()
+        th = threading.Thread(target=_handle_req, args=(req,), daemon=True)
+        with flight_lock:
+            in_flight = [t for t in in_flight if t.is_alive()]
+            in_flight.append(th)
+        th.start()
+
+    with flight_lock:
+        pending = list(in_flight)
+    for th in pending:
+        th.join()
     return 0
 
 
@@ -3218,6 +4238,7 @@ def resolve_hub_url(state_dir: str, explicit_url: Optional[str]) -> str:
 
 
 def session_cache_path(state_dir: str, agent_id: str, explicit_path: Optional[str]) -> str:
+    agent_id = validate_token("agent_id", agent_id)
     if explicit_path:
         return os.path.abspath(os.path.expanduser(explicit_path))
     sess_dir = os.path.join(state_dir, "sessions")
@@ -3228,7 +4249,10 @@ def session_cache_path(state_dir: str, agent_id: str, explicit_path: Optional[st
 def load_agent_session(
     state_dir: str, agent_id: str, explicit_path: Optional[str], epoch: Optional[int], session_token: Optional[str]
 ) -> Tuple[int, str]:
+    agent_id = validate_token("agent_id", agent_id)
     if epoch is not None and session_token is not None:
+        if isinstance(epoch, bool):
+            raise ValueError("epoch must be an integer")
         return int(epoch), session_token
     path = session_cache_path(state_dir, agent_id, explicit_path)
     raw = read_regular_text(path, 16384)
@@ -3240,31 +4264,97 @@ def load_agent_session(
 
 def save_agent_session(state_dir: str, agent_id: str, explicit_path: Optional[str], epoch: int, session_token: str) -> None:
     path = session_cache_path(state_dir, agent_id, explicit_path)
-    write_private_atomic(path, json.dumps({"agent_id": agent_id, "epoch": epoch, "session_token": session_token}) + "\n")
+    write_private_atomic(
+        path,
+        json.dumps({"agent_id": agent_id, "epoch": epoch, "session_token": session_token}) + "\n",
+        enforce_parent_dir=(explicit_path is None),
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise urllib.error.HTTPError(req.full_url, code, "redirects disallowed", headers, fp)
+
+
+def _is_loopback_host(hostname: Optional[str]) -> bool:
+    if not hostname:
+        return False
+    h = hostname.strip().strip("[]").lower()
+    if h in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _parse_and_validate_hub_url(hub_url: str, route: str) -> urllib.parse.SplitResult:
+    if not isinstance(hub_url, str) or any(c in hub_url for c in ("\x00", "\r", "\n", "\t")):
+        raise ValueError("hub_url contains invalid control characters")
+    url = hub_url.rstrip("/") + route
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid hub_url {hub_url!r}") from exc
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError(f"invalid hub_url {hub_url!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("hub_url must not contain userinfo")
+    if parsed.query or parsed.fragment:
+        raise ValueError("hub_url must not contain query or fragment")
+    if parsed.scheme == "https":
+        return parsed
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
+        return parsed
+    raise ValueError(f"non-loopback hub_url must use https: {hub_url!r}")
+
+
+def _build_url_opener(parsed: urllib.parse.SplitResult) -> urllib.request.OpenerDirector:
+    handlers: List[Any] = [_NoRedirectHandler()]
+    if _is_loopback_host(parsed.hostname):
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
 
 
 def http_post(hub_url: str, route: str, payload: Dict[str, Any], timeout: float = 35.0) -> Dict[str, Any]:
-    url = hub_url + route
+    parsed = _parse_and_validate_hub_url(hub_url, route)
+    url = urllib.parse.urlunsplit(parsed)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    opener = _build_url_opener(parsed)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        with opener.open(req, timeout=timeout) as resp:
+            raw_bytes = resp.read(MAX_HTTP_BODY_BYTES + 1)
+            if len(raw_bytes) > MAX_HTTP_BODY_BYTES:
+                raise HubError("RESPONSE_TOO_LARGE", "hub response exceeded size limit", status=502)
+            return json.loads(raw_bytes.decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
+        raw = exc.read(MAX_HTTP_BODY_BYTES).decode("utf-8", errors="replace")
         try:
             doc = json.loads(raw)
         except ValueError:
             doc = {"error": raw, "code": f"HTTP_{exc.code}"}
         raise HubError(doc.get("code", f"HTTP_{exc.code}"), doc.get("error", raw), status=exc.code, extra=doc) from exc
-    except urllib.error.URLError as exc:
-        raise HubError("HUB_UNAVAILABLE", f"cannot reach hub at {route}: {exc.reason}", status=503) from exc
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        socket.timeout,
+        OSError,
+    ) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise HubError("HUB_UNAVAILABLE", f"cannot reach hub at {route}: {reason}", status=503) from exc
 
 
 def print_agent_piggyback(messages: Sequence[Dict[str, Any]]) -> None:
     banner = format_piggyback_blocks(messages)
     if banner:
         print(banner, flush=True)
+
+
+class _WaitSignalAbort(BaseException):
+    """Raised cleanly from signal handler to interrupt blocking socket recv under PEP 475."""
 
 
 def run_agent_wait_loop(
@@ -3277,18 +4367,21 @@ def run_agent_wait_loop(
     ack_ids: Sequence[str],
     expect_re: Optional[str] = None,
     as_json: bool = False,
+    initial_messages: Sequence[Dict[str, Any]] = (),
+    reply_id: Optional[str] = None,
 ) -> int:
     stop_flag = False
 
     def _sig(signum: int, frame: Any) -> None:
         nonlocal stop_flag
         stop_flag = True
+        raise _WaitSignalAbort()
 
     previous = {s: signal.getsignal(s) for s in SIGNALS}
     for s in SIGNALS:
         signal.signal(s, _sig)
 
-    collected: List[Dict[str, Any]] = []
+    collected: List[Dict[str, Any]] = list(initial_messages)
     pending_acks = list(ack_ids)
     deadline = time.monotonic() + timeout_s
     try:
@@ -3296,7 +4389,10 @@ def run_agent_wait_loop(
             rem = deadline - time.monotonic()
             if rem <= 0:
                 if as_json:
-                    print(json.dumps({"timeout": True, "messages": collected}, ensure_ascii=False), flush=True)
+                    out: Dict[str, Any] = {"timeout": True, "messages": collected}
+                    if reply_id is not None:
+                        out["reply_id"] = reply_id
+                    print(json.dumps(out, ensure_ascii=False), flush=True)
                 else:
                     print(f"WAIT timeout agent={agent_id} after={round(timeout_s, 1)}s", flush=True)
                 return 3
@@ -3332,7 +4428,10 @@ def run_agent_wait_loop(
                 collected.extend(msgs)
                 if expect_re is None:
                     if as_json:
-                        print(json.dumps({"messages": collected}, ensure_ascii=False), flush=True)
+                        out = {"messages": collected}
+                        if reply_id is not None:
+                            out["reply_id"] = reply_id
+                        print(json.dumps(out, ensure_ascii=False), flush=True)
                     else:
                         print_agent_piggyback(msgs)
                     return 0
@@ -3340,13 +4439,18 @@ def run_agent_wait_loop(
                     print_agent_piggyback(msgs)
                 if res.get("matched_expect"):
                     if as_json:
-                        print(json.dumps({"matched_expect": True, "messages": collected}, ensure_ascii=False), flush=True)
+                        out = {"matched_expect": True, "messages": collected}
+                        if reply_id is not None:
+                            out["reply_id"] = reply_id
+                        print(json.dumps(out, ensure_ascii=False), flush=True)
                     return 0
             if res.get("stopping"):
                 return 4
         if stop_flag:
             return 4
         return 3
+    except _WaitSignalAbort:
+        return 4
     finally:
         for s, h in previous.items():
             signal.signal(s, h)
@@ -3385,14 +4489,18 @@ def cmd_agent_register(a: argparse.Namespace) -> int:
 def cmd_agent_wait(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
     hub_url = resolve_hub_url(state_dir, a.hub_url)
+    timeout_s = validate_finite_float("timeout", float(a.timeout), minimum=0.0, maximum=86400.0)
+    chunk_s = validate_finite_float("chunk", float(a.chunk), minimum=0.0, maximum=MAX_CHUNK_S)
+    if timeout_s > 0.0 and chunk_s < 0.1:
+        raise ValueError("chunk must be >= 0.1 when timeout > 0")
     epoch, tok = load_agent_session(state_dir, a.agent, a.session_file, a.epoch, a.session_token)
     return run_agent_wait_loop(
         hub_url,
         a.agent,
         epoch,
         tok,
-        timeout_s=float(a.timeout),
-        chunk_s=float(a.chunk),
+        timeout_s=timeout_s,
+        chunk_s=chunk_s,
         ack_ids=a.ack,
         as_json=a.json,
     )
@@ -3435,6 +4543,10 @@ def cmd_agent_step(a: argparse.Namespace) -> int:
 def cmd_agent_reply(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
     hub_url = resolve_hub_url(state_dir, a.hub_url)
+    timeout_s = validate_finite_float("timeout", float(a.timeout), minimum=0.0, maximum=86400.0)
+    chunk_s = validate_finite_float("chunk", float(a.chunk), minimum=0.0, maximum=MAX_CHUNK_S)
+    if a.kind in REPLY_WAITS and not a.no_wait and timeout_s > 0.0 and chunk_s < 0.1:
+        raise ValueError("chunk must be >= 0.1 when timeout > 0")
     epoch, tok = load_agent_session(state_dir, a.agent, a.session_file, a.epoch, a.session_token)
     text_body = a.text if a.text is not None else sys.stdin.read()
     res = http_post(
@@ -3454,27 +4566,35 @@ def cmd_agent_reply(a: argparse.Namespace) -> int:
     )
     reply_id = res["reply"]["id"]
     waits = a.kind in REPLY_WAITS and not a.no_wait
-    if not waits:
+    piggy_msgs = res.get("messages") or []
+    actionable = ("release", "steer", "interrupt", "pause", "cancel", "intervention")
+    already_answered = any(
+        m.get("re_id") == reply_id or bool(m.get("interrupt")) or m.get("kind") in actionable
+        for m in piggy_msgs
+    )
+    if not waits or already_answered:
         if a.json:
             print(json.dumps(res, ensure_ascii=False))
         else:
-            print_agent_piggyback(res.get("messages") or [])
+            print_agent_piggyback(piggy_msgs)
             print(reply_id)
         return 0
     if not a.json:
         print(reply_id, flush=True)
-        print_agent_piggyback(res.get("messages") or [])
+        print_agent_piggyback(piggy_msgs)
         print(f"REPLY waiting for answer to {reply_id}", flush=True)
     return run_agent_wait_loop(
         hub_url,
         a.agent,
         epoch,
         tok,
-        timeout_s=float(a.timeout),
-        chunk_s=float(a.chunk),
+        timeout_s=timeout_s,
+        chunk_s=chunk_s,
         ack_ids=[],
         expect_re=reply_id,
         as_json=a.json,
+        initial_messages=piggy_msgs,
+        reply_id=reply_id,
     )
 
 
@@ -3512,12 +4632,75 @@ def cmd_agent_heartbeat(a: argparse.Namespace) -> int:
     return 0
 
 
+def _terminate_process_group(pid: int, proc: Any, grace_s: float) -> None:
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.02)
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(pid, signal.SIGKILL)
+
+
+def _abortable_http_post(
+    hub_url: str,
+    route: str,
+    payload: Dict[str, Any],
+    timeout: float,
+    conn_holder: Dict[str, Any],
+    conn_lock: threading.Lock,
+) -> Dict[str, Any]:
+    parsed = _parse_and_validate_hub_url(hub_url, route)
+    host = (parsed.hostname or "").strip("[]")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(host, port, timeout=timeout)
+    try:
+        conn.connect()
+    except (http.client.HTTPException, TimeoutError, socket.timeout, OSError) as exc:
+        with contextlib.suppress(Exception):
+            conn.close()
+        raise HubError("HUB_UNAVAILABLE", f"cannot reach hub at {route}: {exc}", status=503) from exc
+    with conn_lock:
+        if conn_holder.get("closed"):
+            conn.close()
+            raise HubError("HUB_UNAVAILABLE", "watcher stopped", status=503)
+        conn_holder["conn"] = conn
+    try:
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json", "Connection": "close"})
+        resp = conn.getresponse()
+        raw_bytes = resp.read(MAX_HTTP_BODY_BYTES + 1)
+        if len(raw_bytes) > MAX_HTTP_BODY_BYTES:
+            raise HubError("RESPONSE_TOO_LARGE", "hub response exceeded size limit", status=502)
+        raw = raw_bytes.decode("utf-8", errors="replace")
+        if resp.status < 200 or resp.status >= 300:
+            try:
+                doc = json.loads(raw)
+            except ValueError:
+                doc = {"error": raw, "code": f"HTTP_{resp.status}"}
+            raise HubError(doc.get("code", f"HTTP_{resp.status}"), doc.get("error", raw), status=resp.status, extra=doc)
+        return json.loads(raw)
+    except (http.client.HTTPException, TimeoutError, socket.timeout, OSError) as exc:
+        raise HubError("HUB_UNAVAILABLE", f"cannot reach hub at {route}: {exc}", status=503) from exc
+    finally:
+        with conn_lock:
+            if conn_holder.get("conn") is conn:
+                conn_holder["conn"] = None
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 def cmd_agent_exec(a: argparse.Namespace) -> int:
     cmd_args = list(a.command)
     if cmd_args and cmd_args[0] == "--":
         cmd_args = cmd_args[1:]
     if not cmd_args:
         die("agent exec requires a command after --")
+    heartbeat_s = validate_finite_float("heartbeat-s", float(a.heartbeat_s), minimum=0.1, maximum=60.0)
+    grace_s = validate_finite_float("grace-s", float(a.grace_s), minimum=0.1, maximum=30.0)
     cmd_str = " ".join(cmd_args)
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
     hub_url = resolve_hub_url(state_dir, a.hub_url)
@@ -3536,27 +4719,79 @@ def cmd_agent_exec(a: argparse.Namespace) -> int:
         },
     )
     exec_id = start_res["exec_id"]
-    print_agent_piggyback(start_res.get("messages") or [])
+    start_msgs = start_res.get("messages") or []
+    print_agent_piggyback(start_msgs)
 
-    proc = subprocess.Popen(
-        cmd_args,
-        cwd=a.cwd or None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    pre_interrupt = next(
+        (m for m in start_msgs if bool(m.get("interrupt")) or m.get("kind") in INTERRUPT_KINDS),
+        None,
     )
+    if pre_interrupt is not None:
+        http_post(
+            hub_url,
+            "/agent/exec/finish",
+            {
+                "agent_id": a.agent,
+                "epoch": epoch,
+                "session_token": tok,
+                "exec_id": exec_id,
+                "status": "interrupted",
+                "exit_code": None,
+                "stderr_hash": "",
+                "output_tail": "",
+                "interrupted_by": pre_interrupt["id"],
+            },
+        )
+        print(f"\n[INTERRUPTED_BY_STEERING] exec_id={exec_id} by={pre_interrupt['id']}", flush=True)
+        return 130
 
-    out_chunks: List[bytes] = []
+    try:
+        proc = subprocess.Popen(
+            cmd_args,
+            cwd=a.cwd or None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        with contextlib.suppress(HubError):
+            http_post(
+                hub_url,
+                "/agent/exec/finish",
+                {
+                    "agent_id": a.agent,
+                    "epoch": epoch,
+                    "session_token": tok,
+                    "exec_id": exec_id,
+                    "status": "failed",
+                    "exit_code": 127,
+                    "stderr_hash": "",
+                    "output_tail": str(exc)[-2000:],
+                    "interrupted_by": None,
+                },
+            )
+        raise
+
+    ring = bytearray()
+    ring_cap = 16384
     out_lock = threading.Lock()
 
     def _drain_output() -> None:
         assert proc.stdout is not None
+        fd = proc.stdout.fileno()
         while True:
-            chunk = proc.stdout.read(4096)
+            try:
+                chunk = os.read(fd, 4096)
+            except InterruptedError:
+                continue
+            except OSError:
+                break
             if not chunk:
                 break
             with out_lock:
-                out_chunks.append(chunk)
+                ring.extend(chunk)
+                if len(ring) > ring_cap:
+                    del ring[:-ring_cap]
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
 
@@ -3564,57 +4799,115 @@ def cmd_agent_exec(a: argparse.Namespace) -> int:
     drain_th.start()
 
     done_event = threading.Event()
-    interrupt_info: Dict[str, Any] = {"messages": [], "triggered": False}
+    sig_abort = threading.Event()
+    state_lock = threading.Lock()
+    conn_lock = threading.Lock()
+    conn_holder: Dict[str, Any] = {"conn": None, "closed": False}
+    interrupt_info: Dict[str, Any] = {
+        "messages": [],
+        "late_messages": [],
+        "triggered": False,
+        "stale_exc": None,
+    }
+
+    def _abort_watch_conn() -> None:
+        with conn_lock:
+            conn_holder["closed"] = True
+            conn = conn_holder.get("conn")
+        if conn is not None:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(Exception):
+                conn.close()
 
     def _watch_interrupt() -> None:
         while not done_event.is_set():
+            hold = min(heartbeat_s, 20.0)
             try:
-                res = http_post(
+                res = _abortable_http_post(
                     hub_url,
                     "/agent/poll",
                     {
                         "agent_id": a.agent,
                         "epoch": epoch,
                         "session_token": tok,
-                        "hold_s": min(float(a.heartbeat_s), 20.0),
+                        "exec_id": exec_id,
+                        "hold_s": hold,
                         "interrupt_only": True,
                     },
-                    timeout=min(float(a.heartbeat_s), 20.0) + 10.0,
+                    timeout=hold + 10.0,
+                    conn_holder=conn_holder,
+                    conn_lock=conn_lock,
                 )
-            except HubError:
+            except HubError as exc:
+                if done_event.is_set():
+                    return
+                if exc.code == "STALE_EPOCH":
+                    with state_lock:
+                        interrupt_info["stale_exc"] = exc
+                    _terminate_process_group(proc.pid, proc, grace_s)
+                    return
                 if done_event.wait(0.2):
                     return
                 continue
             msgs = res.get("messages") or []
             if msgs:
-                interrupt_info["messages"] = msgs
-                interrupt_info["triggered"] = True
-                # Kill entire process group cleanly: SIGTERM -> grace -> SIGKILL.
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    os.killpg(proc.pid, signal.SIGTERM)
-                deadline = time.monotonic() + float(a.grace_s)
-                while time.monotonic() < deadline and proc.poll() is None:
-                    time.sleep(0.05)
-                if proc.poll() is None:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        os.killpg(proc.pid, signal.SIGKILL)
+                with state_lock:
+                    if done_event.is_set() or proc.poll() is not None:
+                        interrupt_info["late_messages"].extend(msgs)
+                        done_event.set()
+                        return
+                    interrupt_info["messages"] = msgs
+                    interrupt_info["triggered"] = True
+                _terminate_process_group(proc.pid, proc, grace_s)
                 return
+            if done_event.is_set() or res.get("exec_finished"):
+                return
+
+    def _on_exec_sig(signum: int, frame: Any) -> None:
+        sig_abort.set()
+        done_event.set()
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGTERM)
+
+    previous_sigs = {s: signal.getsignal(s) for s in SIGNALS}
+    for s in SIGNALS:
+        signal.signal(s, _on_exec_sig)
 
     watch_th = threading.Thread(target=_watch_interrupt, daemon=True)
     watch_th.start()
 
     try:
         rc = proc.wait()
-    finally:
+    except BaseException:
+        for s, h in previous_sigs.items():
+            signal.signal(s, h)
         done_event.set()
-        drain_th.join(timeout=2.0)
-        watch_th.join(timeout=1.5)
+        _abort_watch_conn()
+        _terminate_process_group(proc.pid, proc, grace_s)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1.0)
+        raise
+    for s, h in previous_sigs.items():
+        signal.signal(s, h)
+
+    if sig_abort.is_set() and proc.poll() is None:
+        _terminate_process_group(proc.pid, proc, grace_s)
+    drain_th.join(timeout=2.0)
+
+    if interrupt_info.get("stale_exc") is not None:
+        done_event.set()
+        _abort_watch_conn()
+        watch_th.join(timeout=1.0)
+        raise interrupt_info["stale_exc"]
 
     with out_lock:
-        raw_out = b"".join(out_chunks)
+        raw_out = bytes(ring)
     text_out = raw_out.decode("utf-8", errors="replace")
     tail = text_out[-2000:]
-    norm_tail = normalize_text_sig(tail)
+    norm_tail = normalize_spin_output(tail)
     stderr_hash = hashlib.sha256(norm_tail.encode("utf-8")).hexdigest()[:16] if rc != 0 else ""
 
     interrupted = bool(interrupt_info["triggered"])
@@ -3623,27 +4916,61 @@ def cmd_agent_exec(a: argparse.Namespace) -> int:
         interrupt_info["messages"][0]["id"] if interrupted and interrupt_info["messages"] else None
     )
 
-    fin_res = http_post(
-        hub_url,
-        "/agent/exec/finish",
-        {
-            "agent_id": a.agent,
-            "epoch": epoch,
-            "session_token": tok,
-            "exec_id": exec_id,
-            "status": status,
-            "exit_code": rc,
-            "stderr_hash": stderr_hash,
-            "output_tail": tail,
-            "interrupted_by": interrupted_by,
-        },
-    )
+    fin_res: Dict[str, Any] = {}
+    if interrupted or sig_abort.is_set():
+        done_event.set()
+        _abort_watch_conn()
+        watch_th.join(timeout=1.0)
+        fin_res = http_post(
+            hub_url,
+            "/agent/exec/finish",
+            {
+                "agent_id": a.agent,
+                "epoch": epoch,
+                "session_token": tok,
+                "exec_id": exec_id,
+                "status": status,
+                "exit_code": rc,
+                "stderr_hash": stderr_hash,
+                "output_tail": tail,
+                "interrupted_by": interrupted_by,
+            },
+        )
+    else:
+        # Normal child exit: mark exec finished first so the Hub wakes any open interrupt poll cleanly without stealing interrupts.
+        try:
+            fin_res = http_post(
+                hub_url,
+                "/agent/exec/finish",
+                {
+                    "agent_id": a.agent,
+                    "epoch": epoch,
+                    "session_token": tok,
+                    "exec_id": exec_id,
+                    "status": status,
+                    "exit_code": rc,
+                    "stderr_hash": stderr_hash,
+                    "output_tail": tail,
+                    "interrupted_by": interrupted_by,
+                },
+            )
+        finally:
+            done_event.set()
+            _abort_watch_conn()
+            watch_th.join(timeout=1.0)
+
+    with state_lock:
+        late_msgs = list(interrupt_info["late_messages"])
     if interrupted:
         print(f"\n[INTERRUPTED_BY_STEERING] exec_id={exec_id} by={interrupted_by}", flush=True)
         print_agent_piggyback(interrupt_info["messages"])
+        print_agent_piggyback(late_msgs)
         print_agent_piggyback(fin_res.get("messages") or [])
         return 130
+    print_agent_piggyback(late_msgs)
     print_agent_piggyback(fin_res.get("messages") or [])
+    if sig_abort.is_set():
+        return 130
     return rc
 
 
@@ -3692,6 +5019,9 @@ def cmd_local_status(a: argparse.Namespace) -> int:
 
 def cmd_local_send(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
+    tout: Optional[float] = None
+    if getattr(a, "wait_reply", False):
+        tout = validate_finite_float("timeout", float(a.timeout), minimum=0.0, maximum=3600.0)
     text_body = a.text if a.text is not None else sys.stdin.read()
     res = control_rpc(
         state_dir,
@@ -3709,8 +5039,7 @@ def cmd_local_send(a: argparse.Namespace) -> int:
         },
     )
     msg = res["message"]
-    if getattr(a, "wait_reply", False):
-        tout = float(a.timeout)
+    if tout is not None:
         awaited = control_rpc(
             state_dir,
             "message.await",
@@ -3784,17 +5113,20 @@ def cmd_local_read(a: argparse.Namespace) -> int:
 
 def cmd_local_events(a: argparse.Namespace) -> int:
     state_dir = os.path.abspath(os.path.expanduser(a.state_dir))
+    after_seq = max(0, int(a.after))
     if a.follow:
+        timeout_s = validate_finite_float("timeout", float(a.timeout), minimum=0.0, maximum=3600.0)
         def _emit(ev: Dict[str, Any]) -> None:
             if a.json:
                 print(json.dumps(ev, ensure_ascii=False), flush=True)
             else:
                 print(f"{ev['seq']} {ev['ts_iso']} {ev['agent_id']} {ev['event_type']} {json.dumps(ev['payload'], ensure_ascii=False)}", flush=True)
 
-        control_follow_events(state_dir, a.agent, int(a.after), float(a.timeout), _emit)
+        control_follow_events(state_dir, a.agent, after_seq, timeout_s, _emit)
         return 0
 
-    res = control_rpc(state_dir, "events.list", {"agent_id": a.agent, "after_seq": a.after, "limit": a.limit})
+    limit = max(1, min(int(a.limit), 500))
+    res = control_rpc(state_dir, "events.list", {"agent_id": a.agent, "after_seq": after_seq, "limit": limit})
     if a.json:
         print(json.dumps(res, ensure_ascii=False))
     else:
@@ -3814,7 +5146,7 @@ def cmd_local_control(action: str) -> Any:
             print(json.dumps(res, ensure_ascii=False))
         else:
             print(f"{action.upper()} {a.agent} ok={res.get('ok')}")
-        return 0
+        return 0 if res.get("ok", True) else 1
 
     return _run
 
@@ -3864,6 +5196,7 @@ def build_parser() -> argparse.ArgumentParser:
     hs.add_argument("--spin-cmd-repeats", type=int, default=DEFAULT_SETTINGS["spin_cmd_repeats"])
     hs.add_argument("--spin-step-repeats", type=int, default=DEFAULT_SETTINGS["spin_step_repeats"])
     hs.add_argument("--spin-poll-burst", type=int, default=DEFAULT_SETTINGS["spin_poll_burst"])
+    hs.add_argument("--show-token", action="store_true", help="print unredacted hub/mcp URLs")
 
     hst = hub_sub.add_parser("status", help="check hub status")
     add_state_flags(hst)
@@ -3952,7 +5285,7 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--role", default="구현")
     ar.add_argument("--host")
     ar.add_argument("--model", default="requested gpt-6.2-astra xhigh; runtime does not display effective")
-    ar.add_argument("--lease-ttl", type=float, default=DEFAULT_SETTINGS["lease_ttl_s"])
+    ar.add_argument("--lease-ttl", type=float, default=None)
 
     aw = ag_sub.add_parser("wait", help="wait for steering via chunked long-poll")
     add_agent_conn_flags(aw)

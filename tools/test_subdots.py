@@ -640,17 +640,29 @@ class TestAntiSpinAndMcpAndMirror(HubTestBase):
         self.assertEqual(
             cli_run([
                 "agent", "step", "w1", "step",
-                "--task", "T-MIR", "--note", "working", "--evidence", "local:file",
+                "--task", "T-MIR", "--note", "working", "--evidence", "local:file token=ghp_MirSecret1234567",
                 "--goal", "mirror", "--doing", "writing", "--next", "reply",
+                "--decision", "use WAL",
                 "--ack", mid, "--state-dir", self.state_dir,
             ], self.state_dir).returncode,
             0,
         )
-        # dots.py board reads mirrored live/memory/mail cleanly
+        # dots.py board reads mirrored live/memory/mail cleanly without NO-LIVE / STALLED
         env = dict(os.environ, DOTS_OPS_BASE=self.ops_base, DOTS_AUTO_UPDATE="0", PYTHONDONTWRITEBYTECODE="1")
         board = subprocess.run([sys.executable, os.path.join(TOOLS_DIR, "dots.py"), "board"], env=env, capture_output=True, text=True, timeout=15)
         self.assertEqual(board.returncode, 0, board.stderr)
         self.assertIn("DOT-A w1", board.stdout)
+        self.assertIn("T-MIR", board.stdout)
+        self.assertNotIn("NO-LIVE", board.stdout)
+        self.assertNotIn("STALLED", board.stdout)
+
+        mem_doc = json.loads(pathlib.Path(os.path.join(self.ops_base, "memory", "DOT-A", "w1.json")).read_text(encoding="utf-8"))
+        self.assertEqual(mem_doc["decisions"][0]["text"], "use WAL")
+        live_txt = pathlib.Path(os.path.join(self.ops_base, "live", "DOT-A", "w1.jsonl")).read_text(encoding="utf-8")
+        live_obj = json.loads(live_txt.strip().splitlines()[-1])
+        self.assertIsInstance(live_obj["evidence"], str)
+        self.assertNotIn("ghp_MirSecret1234567", live_obj["evidence"])
+        self.assertIn("[REDACTED]", live_obj["evidence"])
 
         # dots_monitor.py snapshot --no-github reads mirrored live ledger cleanly
         cfg_path = os.path.join(self._tmp.name, "mon.json")
@@ -669,6 +681,468 @@ class TestAntiSpinAndMcpAndMirror(HubTestBase):
         os.mkfifo(fifo_path)
         fifo_send = cli_run(["send", "fifo-agent", "task", "T-F", "--project", "proj", "--text", "safe", "--state-dir", self.state_dir], self.state_dir, timeout=5.0)
         self.assertEqual(fifo_send.returncode, 0, fifo_send.stderr)
+
+
+class TestAuditRegressionsAndHardening(HubTestBase):
+    def test_fast_exec_and_post_exit_interrupt_not_stolen(self):
+        self.start_hub()
+        self.register_agent("w1")
+        t0 = time.monotonic()
+        ex = cli_run(
+            ["agent", "exec", "w1", "--state-dir", self.state_dir, "--", sys.executable, "-c", "print('fast')"],
+            self.state_dir,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(ex.returncode, 0, ex.stderr)
+        self.assertLess(elapsed, 1.0)
+
+        # Immediately send an interrupt after exec exited: must NOT be stolen into 'offered' by an orphan watcher.
+        sr = cli_run(["steer", "w1", "--interrupt", "--text", "stop now", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(sr.returncode, 0, sr.stderr)
+        w = cli_run(["agent", "wait", "w1", "--timeout", "1.0", "--chunk", "0.5", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(w.returncode, 0, w.stderr)
+        msgs = json.loads(w.stdout)["messages"]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["kind"], "interrupt")
+
+    def test_prequeued_interrupt_and_pause_block_exec_and_reply_wakes_on_steer(self):
+        self.start_hub()
+        reg = self.register_agent("w1")
+        rt = sd.read_runtime(self.state_dir)
+        marker = os.path.join(self._tmp.name, "should_not_run.txt")
+
+        # Pre-queued interrupt prevents child spawn in agent exec
+        cli_run(["steer", "w1", "--interrupt", "--text", "abort before start", "--state-dir", self.state_dir], self.state_dir)
+        ex = cli_run(
+            [
+                "agent", "exec", "w1", "--state-dir", self.state_dir, "--",
+                sys.executable, "-c", f"import pathlib; pathlib.Path({marker!r}).write_text('ran')",
+            ],
+            self.state_dir,
+        )
+        self.assertEqual(ex.returncode, 130)
+        self.assertFalse(os.path.exists(marker))
+
+        # Reply waiting on question wakes immediately when human sends steer (even without --re)
+        reply_proc = subprocess.Popen(
+            [
+                sys.executable, os.path.join(TOOLS_DIR, "subdots.py"),
+                "agent", "reply", "w1", "question", "T-ASK", "--text", "need guidance", "--ref", "file:x",
+                "--chunk", "10.0", "--timeout", "10.0", "--state-dir", self.state_dir, "--json",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: reply_proc.kill() if reply_proc.poll() is None else None)
+        self.assertTrue(
+            wait_until(lambda: json.loads(cli_run(["status", "w1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["active_poll_count"] > 0)
+        )
+        t0 = time.monotonic()
+        cli_run(["steer", "w1", "--text", "pivot immediately", "--state-dir", self.state_dir], self.state_dir)
+        out, err = reply_proc.communicate(timeout=5.0)
+        self.assertEqual(reply_proc.returncode, 0, err)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertIn("pivot immediately", out)
+
+        # Pause blocks exec_start and watchdog dead transition (when lease expires)
+        cli_run(["pause", "w1", "--state-dir", self.state_dir], self.state_dir)
+        code, body = http_raw(
+            f"{rt['http_url']}/agent/exec/start",
+            method="POST",
+            body={"agent_id": "w1", "epoch": reg["epoch"], "session_token": reg["session_token"], "cmd": "echo hi"},
+        )
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["code"], "AGENT_PAUSED")
+
+    def test_paused_watchdog_exempt_completed_rearms_for_task2(self):
+        self.start_hub([
+            "--lease-ttl", "0.2",
+            "--dead-grace", "0.2",
+            "--watchdog-interval", "0.08",
+        ])
+        reg1 = self.register_agent("p1", lease_ttl=0.2)
+        cli_run(["pause", "p1", "--state-dir", self.state_dir], self.state_dir)
+
+        reg2 = self.register_agent("c1", lease_ttl=0.2)
+        t1 = json.loads(cli_run(["send", "c1", "task", "T1", "--text", "first", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cli_run(["agent", "reply", "c1", "result", "T1", "--re", t1, "--text", "done1", "--no-wait", "--state-dir", self.state_dir], self.state_dir)
+        cli_run([
+            "agent", "step", "c1", "done", "--task", "T1", "--note", "finished", "--evidence", "ok",
+            "--goal", "g", "--doing", "d", "--next", "none", "--state-dir", self.state_dir,
+        ], self.state_dir)
+        # Queue Task 2 while c1 is completed; watchdog must catch it and mark dead once lease lapses
+        cli_run(["send", "c1", "task", "T2", "--text", "second", "--state-dir", self.state_dir], self.state_dir)
+        self.assertTrue(
+            wait_until(lambda: json.loads(cli_run(["status", "c1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"] == "dead", timeout=5.0)
+        )
+        # Paused p1 must STILL be paused (never escalated to dead)
+        p1_state = json.loads(cli_run(["status", "p1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"]
+        self.assertEqual(p1_state, "paused")
+
+    def test_spin_hardening_ack_note_and_cancel_scope(self):
+        self.start_hub(["--spin-cmd-repeats", "3", "--spin-poll-burst", "3"])
+        reg = self.register_agent("w1")
+        rt = sd.read_runtime(self.state_dir)
+
+        # Volatile timestamps & durations must still trip SPIN_COMMAND_LOOP
+        spin_script = "import datetime, time, sys; print(datetime.datetime.utcnow().isoformat() + f'Z fail in {time.monotonic():.3f}s'); sys.exit(3)"
+        for _ in range(3):
+            ex = cli_run(
+                ["agent", "exec", "w1", "--state-dir", self.state_dir, "--", sys.executable, "-c", spin_script],
+                self.state_dir,
+            )
+            self.assertEqual(ex.returncode, 3)
+            time.sleep(0.02)
+        self.assertIn("SPIN_COMMAND_LOOP", ex.stdout)
+        # spinning state must persist across agent step until human steers
+        st = cli_run([
+            "agent", "step", "w1", "step", "--task", "T", "--note", "still trying", "--evidence", "log",
+            "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir, "--json",
+        ], self.state_dir)
+        self.assertEqual(json.loads(st.stdout)["agent"]["state"], "spinning")
+        cli_run(["steer", "w1", "--text", "try option B", "--state-dir", self.state_dir], self.state_dir)
+        self.assertEqual(json.loads(cli_run(["status", "w1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"], "working")
+
+        # Poll thrash history preserved across interrupt_only poll
+        reg2 = self.register_agent("w2")
+        for _ in range(2):
+            http_raw(f"{rt['http_url']}/agent/poll", method="POST", body={"agent_id": "w2", "epoch": reg2["epoch"], "session_token": reg2["session_token"], "hold_s": 0.0})
+        http_raw(f"{rt['http_url']}/agent/poll", method="POST", body={"agent_id": "w2", "epoch": reg2["epoch"], "session_token": reg2["session_token"], "hold_s": 0.0, "interrupt_only": True})
+        code, body = http_raw(f"{rt['http_url']}/agent/poll", method="POST", body={"agent_id": "w2", "epoch": reg2["epoch"], "session_token": reg2["session_token"], "hold_s": 0.0})
+        self.assertEqual(code, 200)
+        self.assertIn("SPIN_POLL_THRASH", body)
+
+        # ack/note with --re must NOT allow tick done; cancel only cancels older messages
+        reg3 = self.register_agent("w3")
+        t1 = json.loads(cli_run(["send", "w3", "task", "T1", "--text", "m1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cli_run(["agent", "reply", "w3", "note", "T1", "--re", t1, "--text", "working on it", "--state-dir", self.state_dir], self.state_dir)
+        done_fail = cli_run([
+            "agent", "step", "w3", "done", "--task", "T1", "--note", "d", "--evidence", "e",
+            "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir,
+        ], self.state_dir)
+        self.assertEqual(done_fail.returncode, 2)
+
+        old_m = json.loads(cli_run(["send", "w3", "task", "T-OLD", "--text", "old", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cancel_m = json.loads(cli_run(["cancel", "w3", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        new_m = json.loads(cli_run(["send", "w3", "task", "T-NEW", "--text", "new", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cli_run(["agent", "ack", "w3", cancel_m, "--state-dir", self.state_dir], self.state_dir)
+        rec = json.loads(cli_run(["status", "w3", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        by_id = {m["id"]: m["delivery_state"] for m in rec["recent_messages"]}
+        self.assertEqual(by_id[old_m], "cancelled")
+        self.assertIn(by_id[new_m], ("queued", "offered"))
+
+    def test_http_chunked_public_host_and_security_and_mcp_stdio_concurrency(self):
+        import http.client
+
+        self.start_hub(["--public-host", "bridge.example.test:8443", "--ops-base", self.ops_base])
+        rt = sd.read_runtime(self.state_dir)
+
+        # hub start redacts token unless --show-token
+        hs = cli_run(["hub", "status", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertIn("/<token>", json.loads(hs.stdout)["http_url"])
+        hs_raw = cli_run(["hub", "status", "--state-dir", self.state_dir, "--show-token", "--json"], self.state_dir)
+        self.assertIn(rt["token"], json.loads(hs_raw.stdout)["http_url"])
+
+        # --public-host allowed in Host, Origin, and reflected in PRM resource
+        base = f"http://127.0.0.1:{rt['http_port']}"
+        code, body = http_raw(
+            f"{base}/.well-known/oauth-protected-resource/{rt['token']}/mcp",
+            headers={"Host": "bridge.example.test:8443", "Origin": "https://bridge.example.test"},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["resource"], f"https://bridge.example.test:8443/{rt['token']}/mcp")
+
+        # HTTP Transfer-Encoding: chunked works cleanly; non-JSON Content-Type returns 415
+        conn = http.client.HTTPConnection("127.0.0.1", rt["http_port"], timeout=5.0)
+        try:
+            payload = json.dumps({"agent_id": "ch1", "dot": "DOT-A", "project": "proj"}).encode("utf-8")
+            chunked_wire = f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
+            conn.putrequest("POST", f"/{rt['token']}/agent/register")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Transfer-Encoding", "chunked")
+            conn.endheaders(chunked_wire)
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            reg = json.loads(resp.read().decode("utf-8"))
+        finally:
+            conn.close()
+
+        code415, _ = http_raw(
+            f"{rt['http_url']}/agent/heartbeat",
+            method="POST",
+            body=b"a=1",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(code415, 415)
+
+        # Path traversal in agent_reply project rejected
+        code_trav, _ = http_raw(
+            f"{rt['http_url']}/agent/reply",
+            method="POST",
+            body={
+                "agent_id": "ch1", "epoch": reg["epoch"], "session_token": reg["session_token"],
+                "kind": "note", "task": "t", "text": "x", "project": "../../escape",
+            },
+        )
+        self.assertEqual(code_trav, 400)
+
+        # Symlink in .dots-ops/ mail folder cannot write outside ops_base, and secrets are redacted
+        escape_dir = os.path.join(self._tmp.name, "outside")
+        os.makedirs(escape_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.ops_base, "proj", "mail"), exist_ok=True)
+        os.symlink(escape_dir, os.path.join(self.ops_base, "proj", "mail", "sym-agent"))
+        cli_run(["send", "sym-agent", "task", "T-SYM", "--project", "proj", "--text", "Authorization: Bearer supersecrettoken123", "--state-dir", self.state_dir], self.state_dir)
+        self.assertFalse(os.path.exists(os.path.join(escape_dir, "in.jsonl")))
+
+        # Valid mirrored mail redacts secrets, render_argv strips leading '-' & secrets, and locked flock does not freeze Hub
+        cli_run(["send", "ch1", "task", "T-SEC", "--project", "proj", "--text", "token=ghp_SecretValue1234567890", "--state-dir", self.state_dir], self.state_dir)
+        mail_in = os.path.join(self.ops_base, "proj", "mail", "ch1", "in.jsonl")
+        mail_txt = pathlib.Path(mail_in).read_text(encoding="utf-8")
+        self.assertNotIn("ghp_SecretValue1234567890", mail_txt)
+        self.assertIn("[REDACTED]", mail_txt)
+
+        rendered = sd.render_argv(["echo", "{task}"], {"task": "--flag token=ghp_SecretValue1234567890"})
+        self.assertIsNotNone(rendered)
+        self.assertFalse(rendered[1].startswith("-"))
+        self.assertNotIn("ghp_SecretValue1234567890", rendered[1])
+
+        import fcntl
+        lock_fh = open(mail_in, "ab")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            t0 = time.monotonic()
+            locked_send = cli_run(["send", "ch1", "note", "T-LOCK", "--project", "proj", "--text", "nonblocking", "--state-dir", self.state_dir], self.state_dir, timeout=3.0)
+            self.assertEqual(locked_send.returncode, 0, locked_send.stderr)
+            self.assertLess(time.monotonic() - t0, 1.5)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            lock_fh.close()
+
+        # NaN numeric value returns 400 INVALID_INPUT
+        code_nan, body_nan = http_raw(
+            f"{rt['http_url']}/agent/poll",
+            method="POST",
+            body=b'{"agent_id":"ch1","epoch":1,"session_token":"x","hold_s":NaN}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(code_nan, 400)
+        self.assertEqual(json.loads(body_nan)["code"], "INVALID_INPUT")
+
+        # Reverse MCP tools/list hints & batch caps (no >20 items, no subdots_wait in batch)
+        code_tl, body_tl = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
+        )
+        self.assertEqual(code_tl, 200)
+        rev_tools = {t["name"]: t["annotations"] for t in json.loads(body_tl)["result"]["tools"]}
+        self.assertFalse(rev_tools["subdots_wait"]["readOnlyHint"])
+        self.assertFalse(rev_tools["subdots_wait"]["idempotentHint"])
+        self.assertFalse(rev_tools["subdots_heartbeat"]["readOnlyHint"])
+        self.assertFalse(rev_tools["subdots_heartbeat"]["idempotentHint"])
+
+        code_b21, _ = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body=[{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(21)],
+        )
+        self.assertEqual(code_b21, 400)
+        code_bw, _ = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body=[{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "subdots_wait", "arguments": {}}}],
+        )
+        self.assertEqual(code_bw, 400)
+
+        # ask CLI + events --follow E2E
+        ask_proc = subprocess.Popen(
+            [sys.executable, os.path.join(TOOLS_DIR, "subdots.py"), "ask", "ch1", "--task", "T-ASK-E2E", "--text", "ok?", "--timeout", "5.0", "--state-dir", self.state_dir, "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: ask_proc.kill() if ask_proc.poll() is None else None)
+        ask_mid = wait_until(
+            lambda: next(
+                (m["id"] for m in json.loads(cli_run(["status", "ch1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["recent_messages"]
+                 if m["task"] == "T-ASK-E2E" and m["direction"] == "to_agent"),
+                None,
+            )
+        )
+        self.assertIsNotNone(ask_mid)
+        rep = cli_run(
+            [
+                "agent", "reply", "ch1", "answer", "T-ASK-E2E", "--re", ask_mid, "--text", "yes ok",
+                "--epoch", str(reg["epoch"]), "--session-token", reg["session_token"],
+                "--state-dir", self.state_dir,
+            ],
+            self.state_dir,
+        )
+        self.assertEqual(rep.returncode, 0, rep.stderr)
+        ask_out, ask_err = ask_proc.communicate(timeout=5.0)
+        self.assertEqual(ask_proc.returncode, 0, ask_err)
+        self.assertEqual(json.loads(ask_out)["reply"]["text"], "yes ok")
+
+        ev_follow = cli_run(["events", "ch1", "--follow", "--timeout", "0.2", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(ev_follow.returncode, 0, ev_follow.stderr)
+        self.assertIn("agent_reply", ev_follow.stdout)
+
+        # Concurrent mcp-stdio: subdots_list_agents responds while subdots_await_reply is blocking
+        mcp_proc = subprocess.Popen(
+            [sys.executable, os.path.join(TOOLS_DIR, "subdots.py"), "mcp-stdio", "--state-dir", self.state_dir],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: mcp_proc.kill() if mcp_proc.poll() is None else None)
+        assert mcp_proc.stdin is not None and mcp_proc.stdout is not None
+        mcp_proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}) + "\n")
+        mcp_proc.stdin.flush()
+        tl = json.loads(mcp_proc.stdout.readline())
+        t_names = {t["name"] for t in tl["result"]["tools"]}
+        self.assertTrue({"subdots_agent_status", "subdots_inbox", "subdots_mark_read"}.issubset(t_names))
+
+        mcp_proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "subdots_await_reply", "arguments": {"agent_id": "ch1", "re_id": "m-20990101T000000Z-ffff", "timeout_s": 5.0}},
+        }) + "\n")
+        mcp_proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "subdots_list_agents", "arguments": {}},
+        }) + "\n")
+        mcp_proc.stdin.flush()
+        fast_resp = json.loads(mcp_proc.stdout.readline())
+        self.assertEqual(fast_resp["id"], 3)
+        mcp_proc.stdin.close()
+        mcp_proc.stdout.close()
+        mcp_proc.stderr.close()
+        mcp_proc.terminate()
+        mcp_proc.wait(timeout=3.0)
+
+        # --session-file inside /tmp works and wake exits 1 when unconfigured
+        sess_tmp = os.path.join(tempfile.gettempdir(), f"subdots-sess-{os.getpid()}.json")
+        try:
+            r_tmp = cli_run(["agent", "register", "tmp-w", "--session-file", sess_tmp, "--state-dir", self.state_dir], self.state_dir)
+            self.assertEqual(r_tmp.returncode, 0, r_tmp.stderr)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(sess_tmp)
+        self.assertEqual(cli_run(["wake", "ch1", "--state-dir", self.state_dir], self.state_dir).returncode, 1)
+
+    def test_audit_part2_security_redos_smuggling_watchdog_and_exec_hardening(self):
+        import http.client
+
+        # 1) O(N) redaction (no quadratic ReDoS), quoted secret redaction, and Hub token path redaction
+        t0 = time.monotonic()
+        r_tok = sd.redact("token" * 40000)
+        r_pem = sd.redact("-----BEGIN PRIVATE KEY-----" * 2000)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertGreater(len(r_tok), 0)
+        self.assertIn("[REDACTED_PRIVATE_KEY]", r_pem)
+
+        red_q = sd.redact('{"api_key": "topsecret123"} PASSWORD="mypass" http://127.0.0.1:9999/' + ("a" * 48) + "/mcp")
+        self.assertNotIn("topsecret123", red_q)
+        self.assertNotIn("mypass", red_q)
+        self.assertNotIn("a" * 48, red_q)
+
+        # render_argv strips shell metacharacters from {task}
+        rav = sd.render_argv(["cmd", "{task}"], {"task": "--bad $(id); rm -rf"})
+        self.assertIsNotNone(rav)
+        self.assertFalse(rav[1].startswith("-"))
+        self.assertNotIn("$(", rav[1])
+        self.assertNotIn(";", rav[1])
+
+        # Non-loopback cleartext http rejected
+        with self.assertRaises(ValueError):
+            sd.http_post("http://remote.example.com/tok", "/agent/heartbeat", {})
+
+        # 2) Completed agent after answer/release stays completed; paused stays paused after prior acked resume
+        self.start_hub(["--lease-ttl", "0.2", "--dead-grace", "0.2", "--watchdog-interval", "0.08"])
+        rt = sd.read_runtime(self.state_dir)
+
+        # Agent registered without --lease-ttl inherits Hub's custom 0.2s TTL
+        reg_inh = self.register_agent("inh-w")
+        self.assertAlmostEqual(reg_inh["lease_ttl_s"], 0.2, places=2)
+
+        reg_done = self.register_agent("done-w", lease_ttl=0.2)
+        t_id = json.loads(cli_run(["send", "done-w", "task", "T1", "--text", "do 1", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cli_run(["agent", "reply", "done-w", "result", "T1", "--re", t_id, "--text", "r1", "--no-wait", "--state-dir", self.state_dir], self.state_dir)
+        cli_run(["agent", "step", "done-w", "done", "--task", "T1", "--note", "ok", "--evidence", "ok", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir], self.state_dir)
+        # Operator sends terminal answer & release (neither gets answered by agent_reply --re)
+        cli_run(["send", "done-w", "answer", "T1", "--text", "LGTM", "--state-dir", self.state_dir], self.state_dir)
+        cli_run(["release", "done-w", "--state-dir", self.state_dir], self.state_dir)
+
+        # Paused agent after an earlier acked resume stays paused even past lease expiry
+        self.register_agent("pr-w", lease_ttl=0.2)
+        res_m = json.loads(cli_run(["resume", "pr-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        cli_run(["agent", "ack", "pr-w", res_m, "--state-dir", self.state_dir], self.state_dir)
+        cli_run(["pause", "pr-w", "--state-dir", self.state_dir], self.state_dir)
+
+        time.sleep(0.6)
+        st_done = json.loads(cli_run(["status", "done-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"]
+        st_pr = json.loads(cli_run(["status", "pr-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"]
+        self.assertEqual(st_done, "completed")
+        self.assertEqual(st_pr, "paused")
+
+        # 3) Recovering dead agent via exec_start resets state to working
+        self.register_agent("rec-w", lease_ttl=0.15)
+        cli_run(["send", "rec-w", "task", "T-REC", "--text", "go", "--state-dir", self.state_dir], self.state_dir)
+        self.assertTrue(wait_until(lambda: json.loads(cli_run(["status", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"] == "dead", timeout=3.0))
+        ex_rec = cli_run(["agent", "exec", "rec-w", "--state-dir", self.state_dir, "--", sys.executable, "-c", "print('ok')"], self.state_dir)
+        self.assertEqual(ex_rec.returncode, 0, ex_rec.stderr)
+        self.assertEqual(json.loads(cli_run(["status", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"], "working")
+
+        # 4) exec_start --ack <cancel_id> unblocks exec cleanly
+        c_mid = json.loads(cli_run(["cancel", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
+        ex_unblock = cli_run(["agent", "exec", "rec-w", "--ack", c_mid, "--state-dir", self.state_dir, "--", sys.executable, "-c", "print('unblocked')"], self.state_dir)
+        self.assertEqual(ex_unblock.returncode, 0, ex_unblock.stderr)
+
+        # Pre-queued interrupt=True with kind="task" aborts exec before child runs
+        marker2 = os.path.join(self._tmp.name, "no_task_intr.txt")
+        cli_run(["send", "rec-w", "task", "T-INTR", "--interrupt", "--text", "abort!", "--state-dir", self.state_dir], self.state_dir)
+        ex_abort = cli_run(["agent", "exec", "rec-w", "--state-dir", self.state_dir, "--", sys.executable, "-c", f"import pathlib; pathlib.Path({marker2!r}).write_text('bad')"], self.state_dir)
+        self.assertEqual(ex_abort.returncode, 130)
+        self.assertFalse(os.path.exists(marker2))
+
+        # 5) HTTP smuggling, null body, empty MCP batch, non-ASCII auth token
+        def raw_http_wire(wire_bytes):
+            import socket
+            with socket.create_connection(("127.0.0.1", rt["http_port"]), timeout=5.0) as s:
+                s.sendall(wire_bytes)
+                s.settimeout(2.0)
+                return s.recv(4096)
+
+        # Duplicate Content-Length -> 400
+        resp_dup = raw_http_wire(f"POST /{rt['token']}/agent/heartbeat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}".encode())
+        self.assertIn(b"400 ", resp_dup)
+        # Empty TE + TE chunked + CL -> 400
+        resp_smug = raw_http_wire(f"POST /{rt['token']}/agent/heartbeat HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: \r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}".encode())
+        self.assertIn(b"400 ", resp_smug)
+        # GET with Content-Length -> 400
+        resp_getcl = raw_http_wire(f"GET /{rt['token']}/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n".encode())
+        self.assertIn(b"400 ", resp_getcl)
+        # JSON null body -> 400
+        resp_null = raw_http_wire(f"POST /{rt['token']}/agent/heartbeat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nContent-Type: application/json\r\n\r\nnull".encode())
+        self.assertIn(b"400 ", resp_null)
+        # Empty MCP batch [] -> 400
+        resp_empty_batch = raw_http_wire(f"POST /{rt['token']}/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n[]".encode())
+        self.assertIn(b"400 ", resp_empty_batch)
+        # Non-ASCII Bearer token -> 401 cleanly (no crash)
+        resp_nonascii = raw_http_wire(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \xff\xfe\r\n\r\n")
+        self.assertIn(b"401 ", resp_nonascii)
+
+        # 6) agent wait terminates immediately (< 1.0s) on SIGTERM with exit 4
+        self.register_agent("sig-w")
+        wproc = subprocess.Popen(
+            [sys.executable, os.path.join(TOOLS_DIR, "subdots.py"), "agent", "wait", "sig-w", "--timeout", "30", "--chunk", "20", "--state-dir", self.state_dir],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertTrue(wait_until(lambda: json.loads(cli_run(["status", "sig-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["active_poll_count"] > 0))
+            t0_sig = time.monotonic()
+            wproc.terminate()
+            _, werr = wproc.communicate(timeout=2.0)
+            self.assertEqual(wproc.returncode, 4, werr)
+            self.assertLess(time.monotonic() - t0_sig, 1.0)
+        finally:
+            if wproc.poll() is None:
+                wproc.kill()
+                wproc.communicate()
 
 
 if __name__ == "__main__":
