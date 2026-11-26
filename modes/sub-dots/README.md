@@ -56,13 +56,15 @@ python3 tools/dots.py init --mode sub-dots --dot DOT-A --project myproj=myproj-m
 ### 2. 오너 측 Reverse Bridge Hub 시작
 ```bash
 # ~/.subdots (0700)에 SQLite WAL과 소켓/HTTP 서버 구동
-python3 tools/subdots.py hub start --ops-base ~/.dots-ops
+python3 tools/subdots.py hub start --ops-base ~/.dots-ops [--wake-cmd ARGV-JSON] [--notify-cmd ARGV-JSON] [--require-provision]
 
 # 상태 확인
 python3 tools/subdots.py hub status
 ```
-- **로컬 MCP 연결 (Antigravity/Claude/OMP 등):** `python3 tools/subdots.py mcp-stdio`
-- **Dots VM에서 접속해야 할 때:** `ssh -R <원격포트>:127.0.0.1:<허브포트>` 또는 터널을 열고 `--public-host <호스트>`와 `SUBDOTS_HUB_URL=http://127.0.0.1:<원격포트>/<token>`을 전달하세요.
+- **로컬 MCP 연결 (Antigravity/Claude/OMP 등):** `python3 tools/subdots.py mcp-stdio` — 9개 로컬 제어 도구(`subdots_list_agents`, `subdots_agent_status`, `subdots_inbox`, `subdots_mark_read`, `subdots_send`, `subdots_steer`, `subdots_await_reply`, `subdots_events`, `subdots_control`) 제공.
+- **역방향 HTTP MCP:** 서브에이전트 측에서는 6개 도구(`subdots_register`, `subdots_wait`, `subdots_step`, `subdots_reply`, `subdots_ack`, `subdots_heartbeat`) 사용 가능.
+- **멀티 에이전트 격리(권장):** `python3 tools/subdots.py provision <agentId> --dot <DOT> --project <proj> --show-token` 으로 에이전트 전용 스코프 URL(`/a/<agent_token>`)을 발급할 수 있습니다.
+- **Dots VM에서 접속해야 할 때:** `ssh -R <원격포트>:127.0.0.1:<허브포트>` 또는 터널을 열고 `--public-host <호스트>`와 `SUBDOTS_HUB_URL`을 전달하세요.
 
 ### 3. Dots 서브에이전트 연결 및 작업
 서브에이전트에게는 [AGENT-BRIEF.md](AGENT-BRIEF.md)를 붙입니다.

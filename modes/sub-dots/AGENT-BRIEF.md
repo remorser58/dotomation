@@ -9,13 +9,15 @@ Dot / Project: <DOT> / <project>
 Hub URL (or state dir on local): <SUBDOTS_HUB_URL or ~/.subdots>
 
 Rules:
-1. Do NOT route task instructions, questions, or results through the Dots root chat. Communicate directly with the local main session through `tools/subdots.py` (or the Reverse MCP endpoint `<hub_url>/mcp`).
-2. First command: register with the hub to receive your fencing epoch and session token:
+1. Do NOT route task instructions, questions, or results through the Dots root chat. Communicate directly with the local main session through `tools/subdots.py` (using `SUBDOTS_HUB_URL` / `--hub-url` or Reverse MCP `<hub_url>/mcp`).
+2. First command: if not pre-provisioned with explicit `--epoch`/`--session-token`, register with the hub to obtain fencing credentials:
    python3 tools/subdots.py agent register <agentId> --dot <DOT> --project <project>
-3. When waiting for work or after submitting a `result`/`question`/`block`, keep the loop alive without ending your turn:
-   - Waiting: `python3 tools/subdots.py agent wait <agentId> --timeout 3300`
-   - Returning work: `python3 tools/subdots.py agent reply <agentId> result <task> --re <msg_id> --ref <rev/* or local:path>` (blocks until the local session answers or releases you).
-4. Run commands through the supervised runner so local steering (`steer --interrupt`) can redirect you mid-command:
+   (Note: `agent register` already prints queued tasks via `[STEERING_INPUT]` piggyback. If a task arrives on register, run `agent step <agentId> start ... --ack <msg_id>` and begin working immediately without calling `agent wait` first.)
+3. When waiting for work (no queued task received on register) or after `step done` while awaiting owner `answer`/`release`, keep the loop alive without ending your turn:
+   - Waiting: `python3 tools/subdots.py agent wait <agentId> --timeout 3300` (exit 0=mail, 3=timeout, 4=signal, 5=stale epoch)
+   - Returning work: send `agent reply <agentId> result <task> --re <msg_id> --ref <rev/* or local:path> --no-wait` BEFORE `agent step <agentId> done` (to clear the Done-Gate), then run `agent step done`, then `agent wait` (or pass without `--no-wait` after `done` if all owed mail is already answered).
+   - Lease / Ack helpers: `agent ack <agentId> <id...>` and `agent heartbeat <agentId>`.
+4. Run commands through the supervised runner so local steering (`steer --interrupt`) can redirect you mid-command (exit 130=interrupted, 5=stale epoch):
    python3 tools/subdots.py agent exec <agentId> -- <command...>
 5. Report progress at start, every material step (<=15m), blocked, and done:
    python3 tools/subdots.py agent step <agentId> <start|step|blocked|done> --task <task> --note <note> --evidence <evidence> --goal <goal> --doing <doing> --next <next> [--ack <msg_id>...]

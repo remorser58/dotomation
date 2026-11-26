@@ -63,7 +63,7 @@ An agent's conversation cannot be read or written from outside the dot, so a new
 
 | Side | Command |
 |---|---|
-| Main session | `dots.py send <project> <agentId> <kind> <task> [--re ID] [--ref R]...` — text on stdin; `--re` names a message in `in.jsonl` or an agent reply in `out.jsonl`; prints the message id, then the agent's listening status |
+| Main session | `dots.py send <project> <agentId> <kind> <task> [--re ID] [--ref R]... [--wake-cmd ARGV]` — text on stdin; `--re` names a message in `in.jsonl` or an agent reply in `out.jsonl`; prints the message id, then the agent's listening status |
 | Main session | `dots.py inbox [project] [agentId]` — agent replies not yet marked read; `dots.py read <project> <agentId> <id>` marks them read |
 | Agent | `dots.py wait <DOT> <agentId> [--timeout SECONDS]` — default 3300 seconds (55 minutes) |
 | Agent | `dots.py reply <project> <agentId> <kind> <task> [--re ID] [--ref R]... [--dot DOT] [--timeout S] [--no-wait]` — text on stdin. A `result`, `question` or `block` stays open and prints the answer; `--no-wait` returns as soon as the line is written |
@@ -93,7 +93,7 @@ there and at least one `--ref` says what the result is about. `--re` stays requi
 
 1. **The agent is in `wait`.** The line is printed the moment it lands — typically within a second — and `wait` exits 0. This is the only near-real-time path, and it is what steering means here: the agent is holding one tool call open, so an instruction reaches it mid-task instead of at the end of a step.
 2. **The agent is working.** It sees the line at the top of its next `tick`, printed before the live line under a `MAIL_FIRST ... handle these before your next step` header. A working agent ticks at each material step and at least every 15 minutes, so that is the worst case while it is working.
-3. **The agent is idle.** Nothing reads the file until it runs a command again. `send` prints `LISTENING` with the waiting process, or `NOT_LISTENING last_tick=<age>`. When it is not listening and `dots.json` holds a wake command, `send` runs that command once, prints its exit code, and does not retry. Otherwise it prints the manual doorbell below.
+3. **The agent is idle.** Nothing reads the file until it runs a command again. `send` prints `LISTENING` with the waiting process, or `NOT_LISTENING last_tick=<age>`. When it is not listening, `send` runs the owner-supplied `--wake-cmd` / `DOTS_WAKE_CMD` once (ignoring root-writable `dots.json` hooks by default unless `DOTS_TRUST_CONFIG_CMDS=1`), prints its exit code, and does not retry. Otherwise it prints the manual doorbell below.
 
 The main session does not have to guess which agents are stuck: `dots.py board` flags
 `MAIL_WAITING` on an agent whose inbox holds a message that still owes an answer while no `wait`

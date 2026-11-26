@@ -115,12 +115,24 @@ import urllib.parse
 import urllib.request
 import warnings
 from dataclasses import dataclass
-from typing import Iterator, Optional, Union
+from typing import Iterator, Optional, Tuple, Union
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 VERSION_LINE = re.compile(rb'^VERSION = "([0-9]+(?:\.[0-9]+)+)"\r?$', re.MULTILINE)
 UPDATE_API = "https://api.github.com/repos/remorser58/dotomation/releases/latest"
 UPDATE_LIMIT = 2 * 1024 * 1024
+MAX_JSONL_BYTES = 16 * 1024 * 1024
+MAX_JSON_BYTES = 1024 * 1024
+MAX_MARKER_BYTES = 4096
+LOCK_TIMEOUT_S = 5.0
+RESERVED_OPS_DIRS = ("live", "memory", "listen", "watch")
+_TERM_CTRL_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b]"
+)
+
+
+def _clean_term(value):
+    return _TERM_CTRL_RE.sub("", str(value))
 
 
 def default_base():
@@ -216,11 +228,10 @@ READ_WARNED = set()
 BYTE_WARNED = {}
 
 def regular(path):
-    """False for a path that is not a regular file. This is the cheap first check; it cannot be the only
-    one, because the path can be replaced between this stat and the open, so every read goes through
-    open_raw, which opens non-blocking and asks the descriptor what it really holds."""
+    """False for a path that is not a regular file (including symlinks)."""
     try:
-        return stat.S_ISREG(os.stat(path).st_mode)
+        st = os.lstat(path)
+        return not stat.S_ISLNK(st.st_mode) and stat.S_ISREG(st.st_mode)
     except OSError:
         return True
 
@@ -250,12 +261,11 @@ def skipped_lines(path, count):
           f"every other line was read", file=sys.stderr)
 
 def open_raw(path):
-    """An open descriptor for reading, or None. O_NONBLOCK is what makes this safe: a FIFO open returns
-    at once instead of waiting for a writer, and the fstat on the descriptor decides what was really
-    opened — the path may be replaced between regular() and this call, and only the descriptor knows
-    what it holds. Anything that is not a regular file is reported and closed, never read."""
+    """An open descriptor for reading, or None. O_NONBLOCK + O_NOFOLLOW + fstat(S_ISREG) prevent
+    blocking on a FIFO or following a symlink planted by a hostile writer."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | nofollow)
     except FileNotFoundError:
         READ_WARNED.discard(path)
         return None
@@ -292,8 +302,7 @@ def jsonl(path):
     not UTF-8 must cost that one line: each line is decoded on its own, so damage cannot swallow the
     good lines after it, and the skipped count is printed once per change (skipped_lines). Decoding
     the stream instead would drop everything from the bad byte to the next buffer boundary, which is a
-    silent loss of mail a later `watch` never rings. The whole file is read here and this function
-    returns every parsed line anyway, so the copy costs no more than the list it builds."""
+    silent loss of mail a later `watch` never rings."""
     if not regular(path):
         unreadable(path, "not a regular file")
         return []
@@ -304,7 +313,11 @@ def jsonl(path):
     skipped = 0
     try:
         with os.fdopen(fd, "rb") as raw:
-            for bline in raw.read().splitlines():
+            blob = raw.read(MAX_JSONL_BYTES + 1)
+            if len(blob) > MAX_JSONL_BYTES:
+                unreadable(path, f"file exceeds {MAX_JSONL_BYTES} bytes")
+                return out
+            for bline in blob.splitlines():
                 try:
                     ln = bline.decode("utf-8")
                 except UnicodeDecodeError:
@@ -312,7 +325,7 @@ def jsonl(path):
                     continue
                 try:
                     obj = json.loads(ln)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if isinstance(obj, dict):
                     out.append(obj)
@@ -325,13 +338,15 @@ def jsonl(path):
 
 def one_line(value, limit=None):
     """A non-empty single-line string within limit: the schema's line and item shape."""
-    return (isinstance(value, str) and bool(value.strip()) and "\n" not in value and "\r" not in value
+    return (isinstance(value, str) and bool(value.strip()) and "\x00" not in value
+            and "\n" not in value and "\r" not in value
             and (limit is None or len(value) <= limit))
 
 def is_v1(x):
-    """The live-record-v1 schema: ten non-empty single-line strings, a token agent, an RFC 3339 t."""
+    """The live-record-v1 schema: ten non-empty single-line strings, token agent/project, RFC 3339 t."""
     return (set(x) == set(FIELDS) and all(one_line(x[f]) for f in FIELDS) and x["state"] in STATES
-            and bool(TOKEN.match(x["agent"])) and bool(RFC3339.match(x["t"])) and parse_t(x["t"]) is not None)
+            and bool(TOKEN.fullmatch(x["agent"])) and bool(TOKEN.fullmatch(x["project"]))
+            and bool(RFC3339.match(x["t"])) and parse_t(x["t"]) is not None)
 
 def v1_lines(path):
     """Live lines that are live-record-v1 shaped; legacy lines are left out, never repaired."""
@@ -352,16 +367,20 @@ def load_json(path):
     if not regular(path):
         unreadable(path, "not a regular file")
         return None
-    fh = open_read(path)
-    if fh is None:
+    fd = open_raw(path)
+    if fd is None:
         return None
     try:
-        with fh:
-            obj = json.load(fh)
+        with os.fdopen(fd, "rb") as raw:
+            blob = raw.read(MAX_JSON_BYTES + 1)
+            if len(blob) > MAX_JSON_BYTES:
+                unreadable(path, f"file exceeds {MAX_JSON_BYTES} bytes")
+                return None
+            obj = json.loads(blob.decode("utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         unreadable(path, exc)
         return None
-    except ValueError:   # not JSON: no config, which is the same as none written
+    except (ValueError, RecursionError):   # not JSON: no config, which is the same as none written
         READ_WARNED.discard(path)
         return None
     READ_WARNED.discard(path)
@@ -371,17 +390,21 @@ def marker(path):
     if not regular(path):
         unreadable(path, "not a regular file")
         return None
-    fh = open_read(path)
-    if fh is None:
+    fd = open_raw(path)
+    if fd is None:
         return None
     try:
-        with fh:
-            text = fh.read().strip() or None
+        with os.fdopen(fd, "rb") as raw:
+            blob = raw.read(MAX_MARKER_BYTES + 1)
+            if len(blob) > MAX_MARKER_BYTES:
+                unreadable(path, f"file exceeds {MAX_MARKER_BYTES} bytes")
+                return None
+            text_val = blob.decode("utf-8").strip() or None
     except (OSError, UnicodeDecodeError) as exc:
         unreadable(path, exc)
         return None
     READ_WARNED.discard(path)
-    return text
+    return text_val
 
 def after(msgs, last):
     """Lines after the marker id. A duplicate id already on disk resolves to its last occurrence,
@@ -451,37 +474,113 @@ def waiting_on(box):
     answered = answered_ids(jsonl(os.path.join(box, "out.jsonl")))
     return [m for m in jsonl(os.path.join(box, "in.jsonl")) if owes_answer(m, answered)]
 
-def write_atomic(path, data):
-    """Replace `path` with `data` through a temp file beside it. The temp name is opened non-blocking
-    on purpose: a FIFO planted at that name would otherwise hold the open until a reader appears, and
-    a failed open is reported as the OSError the callers already handle. A failed write or rename
-    removes the temp file, so a refused path leaves nothing behind."""
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK, 0o666)
+def _open_parent_dir_nofollow(parent):
+    d = parent or "."
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    dfd = os.open(d, os.O_RDONLY | o_dir | nofollow | os.O_NONBLOCK)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        if not stat.S_ISDIR(os.fstat(dfd).st_mode):
+            raise OSError(f"{d} is not a directory")
+        return dfd
     except BaseException:
         with contextlib.suppress(OSError):
-            os.unlink(tmp)
+            os.close(dfd)
         raise
 
+def _flock_nb(fd_or_fh, label, timeout_s=LOCK_TIMEOUT_S):
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd_or_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                die(f"cannot lock {label}: lock busy")
+            time.sleep(0.01)
+
+def write_atomic(path, data):
+    """Replace `path` with `data` through an unpredictable exclusive temp file via dir_fd."""
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    filename = os.path.basename(abs_path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dfd = _open_parent_dir_nofollow(parent)
+    tmp_name = f".{filename}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    try:
+        try:
+            st = os.lstat(filename, dir_fd=dfd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{abs_path} is not a regular file")
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | os.O_NONBLOCK,
+            0o666,
+            dir_fd=dfd,
+        )
+        opened = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                opened = True
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                st = os.lstat(filename, dir_fd=dfd)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{abs_path} is not a regular file")
+            except FileNotFoundError:
+                pass
+            os.replace(tmp_name, filename, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            if not opened:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dfd)
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dfd)
+
 def append_fd(path):
-    """A descriptor to append one line through, or exit 2. O_NONBLOCK on top of O_APPEND is what makes
-    this safe: a FIFO renamed onto the path after the stat above returns at once instead of holding the
-    open until a reader appears, and the fstat on the descriptor says what was really opened. A path
-    that is not a real file is refused before a byte is written, so a line can never be lost into one."""
+    """A descriptor to append one line through, or exit 2. Checks O_NOFOLLOW, S_ISREG, and st_nlink == 1."""
     if not regular(path):
         die(f"cannot append to {path}: it is not a regular file")
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    filename = os.path.basename(abs_path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o666)
+        dfd = _open_parent_dir_nofollow(parent)
     except OSError as exc:
         die(f"cannot append to {path}: {exc.strerror or exc}")
     try:
-        real = stat.S_ISREG(os.fstat(fd).st_mode)
+        try:
+            st = os.lstat(filename, dir_fd=dfd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                die(f"cannot append to {path}: it is not a regular file")
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(
+                filename,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | nofollow | os.O_NONBLOCK,
+                0o666,
+                dir_fd=dfd,
+            )
+        except OSError as exc:
+            die(f"cannot append to {path}: {exc.strerror or exc}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dfd)
+    try:
+        fst = os.fstat(fd)
+        real = stat.S_ISREG(fst.st_mode) and fst.st_nlink == 1 and (
+            not hasattr(os, "geteuid") or fst.st_uid == os.geteuid()
+        )
     except OSError:
         real = False
     if not real:
@@ -493,7 +592,7 @@ def append_line(path, obj):
     fd = append_fd(path)
     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
     with os.fdopen(fd, "ab") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        _flock_nb(fh, path)
         fh.write(data)
         fh.flush()
         os.fsync(fh.fileno())
@@ -503,7 +602,7 @@ def append_unique(path, msg):
     The check runs under the same lock as the write, so two senders cannot pick the same id."""
     fd = append_fd(path)
     with os.fdopen(fd, "ab") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        _flock_nb(fh, path)
         seen = {m.get("id") for m in jsonl(path) if isinstance(m.get("id"), str)}
         while msg["id"] in seen:
             msg["id"] = new_id()
@@ -512,18 +611,23 @@ def append_unique(path, msg):
         os.fsync(fh.fileno())
 
 def show_mail(project, m, tag):
-    re_ = f" re={m['re']}" if m.get("re") else ""
-    refs = [x for x in m["refs"] if isinstance(x, str)] if isinstance(m.get("refs"), list) else []
+    re_ = f" re={_clean_term(m['re'])}" if m.get("re") else ""
+    refs = [_clean_term(x) for x in m["refs"] if isinstance(x, str)] if isinstance(m.get("refs"), list) else []
     refs = f" refs={','.join(refs)}" if refs else ""
-    print(f"{tag} {project} {m.get('id')} {m.get('t')} {m.get('from')} kind={m.get('kind')} task={m.get('task')}{re_}{refs}")
-    print(f"    {m.get('text', '')}")
+    print(f"{tag} {_clean_term(project)} {_clean_term(m.get('id'))} {_clean_term(m.get('t'))} "
+          f"{_clean_term(m.get('from'))} kind={_clean_term(m.get('kind'))} task={_clean_term(m.get('task'))}{re_}{refs}")
+    print(f"    {_clean_term(m.get('text', ''))}")
 
 @contextlib.contextmanager
 def dot_lock(live_dir):
     """Serialize ticks per dot by locking the dot's live folder itself, so no lock file is ever created."""
-    fd = os.open(live_dir, os.O_RDONLY)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(live_dir, os.O_RDONLY | o_dir | nofollow | os.O_NONBLOCK)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            die(f"{live_dir} is not a folder")
+        _flock_nb(fd, live_dir)
         yield
     finally:
         os.close(fd)
@@ -807,7 +911,7 @@ def last_t_min():
     return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 def clip(s, n=110):
-    s = str(s or "-")
+    s = _clean_term(s or "-")
     return s if len(s) <= n else s[:n - 1] + "…"
 
 def board(a):
@@ -831,12 +935,13 @@ def board(a):
                           for k in ("free", "total", "unassigned", "parked"))
         print(f"{dot} slots {values}")
     for e in errors:
-        print(f"{e['dot']}: {e['error']}")
+        print(f"{_clean_term(e['dot'])}: {_clean_term(e['error'])}")
     for r in rows:
         age = "-" if r["age_min"] is None else f"{r['age_min']}m"
         flags = f"  [{' '.join(r['flags'])}]" if r["flags"] else ""
-        print(f"{r['dot']} {r['agent']}  {r['state'] or '-'} {age} host={r['host'] or '-'} "
-              f"roster={r['roster'] or '-'} (the root's claim)  {clip(r['task'], 60)}{flags}")
+        print(f"{_clean_term(r['dot'])} {_clean_term(r['agent'])}  {_clean_term(r['state'] or '-')} {age} "
+              f"host={_clean_term(r['host'] or '-')} roster={_clean_term(r['roster'] or '-')} (the root's claim)  "
+              f"{clip(r['task'], 60)}{flags}")
         if r.get("claim_stale"):
             print(f"    claim: {clip(r['claim_stale'], 140)}")
         if r["doing"] or r["next"]:
@@ -857,8 +962,8 @@ def memo(a):
     mem = load_json(os.path.join(BASE, "memory", dot, f"{agent}.json"))
     print(json.dumps(mem, ensure_ascii=False, indent=1) if mem else f"(no memory for {dot}/{agent})")
     for ln in v1_lines(os.path.join(BASE, "live", dot, f"{agent}.jsonl"))[-3:]:
-        print(f"live {ln['t']} {ln['state']} host={ln['host']} task={ln['task']}")
-        print(f"    {ln['note']}  [{ln['evidence']}]")
+        print(f"live {_clean_term(ln['t'])} {_clean_term(ln['state'])} host={_clean_term(ln['host'])} task={_clean_term(ln['task'])}")
+        print(f"    {_clean_term(ln['note'])}  [{_clean_term(ln['evidence'])}]")
 
 # ---------------------------------------------------------------- config, init
 
@@ -1020,18 +1125,51 @@ def send(a):
     seen = last_tick(agent)
     print(f"NOT_LISTENING last_tick={age_label(None if seen is None else age_min(seen[0].isoformat()))}", flush=True)
     dot = dot_for(agent, cfg)
-    argv, missing = wake_argv(cfg, project, agent, msg["id"], dot)
+    wake_spec, wake_src = _trusted_cmd(getattr(a, "wake_cmd", None), "DOTS_WAKE_CMD", cfg, "wake", "--wake-cmd")
+    argv, missing = argv_for(wake_spec, {"project": project, "agent": agent, "id": msg["id"], "dot": dot or ""})
     if argv:
         code = run_wake(argv)
         print(f"WAKE exit={code}", flush=True)
+    elif wake_src == "ignored":
+        print("WAKE ignored (untrusted dots.json; pass --wake-cmd or DOTS_WAKE_CMD)", flush=True)
+        doorbell(project, agent, msg["id"], dot)
     elif missing:
         print(f"WAKE not_run missing={missing}", flush=True)
         doorbell(project, agent, msg["id"], dot)
     else:
         doorbell(project, agent, msg["id"], dot)
 
+def _trusted_cmd(cli_spec, env_var, cfg, key, flag_name):
+    """Resolve wake/notify argv strictly from owner-trusted sources (CLI flag or env var;
+    dots.json is root-writable and ignored unless DOTS_TRUST_CONFIG_CMDS=1)."""
+    if cli_spec is not None:
+        return cli_argv(cli_spec, flag_name), "argv"
+    env_spec = os.environ.get(env_var)
+    if env_spec:
+        return cli_argv(env_spec, env_var), "env"
+    if argv_list(cfg.get(key)):
+        if os.environ.get("DOTS_TRUST_CONFIG_CMDS") == "1":
+            return cfg.get(key), "dots.json"
+        return None, "ignored"
+    return None, "none"
+
 def argv_list(argv):
     return argv if isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv) else None
+
+def _safe_argv_placeholder(name, val):
+    text_v = _clean_term(
+        str(val).replace("\x00", "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    )
+    text_v = re.sub(r" +", " ", text_v).strip()
+    if name in ("task", "why"):
+        if len(text_v) > 200:
+            text_v = text_v[:197] + "..."
+        if text_v in ("", "-"):
+            return "-"
+        while text_v.startswith("-"):
+            text_v = text_v.lstrip("-").strip()
+        return text_v or "-"
+    return text_v
 
 def argv_for(argv, values):
     """Substitute {project} {agent} {id} {dot} {age} {task} {state} {why}; a placeholder with no value
@@ -1043,7 +1181,11 @@ def argv_for(argv, values):
         v = values.get(name)
         if v is None or (name == "dot" and not v):
             return None, name
-    return [PLACEHOLDER.sub(lambda m: str(values[m.group(1)]), x) for x in argv], None
+        sv = _safe_argv_placeholder(name, v)
+        if name in ("project", "agent", "dot", "id"):
+            if not sv or sv.startswith("-") or any(c.isspace() for c in sv):
+                return None, name
+    return [PLACEHOLDER.sub(lambda m: _safe_argv_placeholder(m.group(1), values[m.group(1)]), x) for x in argv], None
 
 def wake_argv(cfg, project, agent, msg_id, dot):
     return argv_for(cfg.get("wake"), {"project": project, "agent": agent, "id": msg_id, "dot": dot or ""})
@@ -1264,21 +1406,13 @@ def watch_cfg(cfg):
     return out, src
 
 def watch_settings(a, cfg):
-    """Effective watchdog settings; the command line wins over dots.json, which sits in the folder the
-    dot root writes. The idle command and the recovery reader run new code on the owner's side, so
-    they come from the command line only, never from dots.json. Returns (wake argv, notify argv,
-    delays, state path, sources, board scan) where every source is `argv`, `dots.json`, `default` or
-    `none`."""
+    """Effective watchdog settings; owner CLI flags and env vars win, and dots.json commands are ignored
+    by default because that file sits in the folder the dot root writes."""
     wake = notify = None
     src = {}
     for key in ("wake", "notify"):
-        spec = getattr(a, f"{key}_cmd", None)
-        if spec is not None:
-            argv = cli_argv(spec, f"--{key}-cmd")
-            src[key] = "argv"
-        else:
-            argv = cfg.get(key) if argv_list(cfg.get(key)) else None
-            src[key] = "dots.json" if argv else "none"
+        argv, key_src = _trusted_cmd(getattr(a, f"{key}_cmd", None), f"DOTS_{key.upper()}_CMD", cfg, key, f"--{key}-cmd")
+        src[key] = key_src
         if key == "wake":
             wake = argv
         else:
@@ -1391,9 +1525,10 @@ def owed_mail():
     out = []
     for box in sorted(base_glob("*", "mail", "*")):
         agent = os.path.basename(box)
-        if not (os.path.isdir(box) and TOKEN.match(agent)):
+        project = project_of(box)
+        if not (os.path.isdir(box) and TOKEN.fullmatch(agent) and TOKEN.fullmatch(project)) or project in RESERVED_OPS_DIRS:
             continue
-        out += [(project_of(box), agent, box, m) for m in waiting_on(box)]
+        out += [(project, agent, box, m) for m in waiting_on(box)]
     return out
 
 def unread_in(box, mid):
@@ -1618,8 +1753,10 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallb
     cfg = config()
     board = scan.idle or scan.recovery
     print("WATCH_CONFIG " + " ".join(
-        [f"wake={src['wake']}:{json.dumps(wake, ensure_ascii=False)}" if wake else "wake=none",
-         f"notify={src['notify']}:{json.dumps(notify, ensure_ascii=False)}" if notify else "notify=none",
+        [f"wake={src['wake']}:{json.dumps(wake, ensure_ascii=False)}" if wake
+         else ("wake=none(untrusted_dots_json)" if src["wake"] == "ignored" else "wake=none"),
+         f"notify={src['notify']}:{json.dumps(notify, ensure_ascii=False)}" if notify
+         else ("notify=none(untrusted_dots_json)" if src["notify"] == "ignored" else "notify=none"),
          f"idle={src['idle']}:{json.dumps(scan.idle, ensure_ascii=False)}" if scan.idle else "idle=none",
          f"after_min={src['after_min']}:{delays['after_min']}",
          f"notify_after_min={src['notify_after_min']}:{delays['notify_after_min']}",
@@ -1828,7 +1965,7 @@ def cli_argv(spec, flag):
     """One argv list from a --*-cmd JSON argument. `init` and `watch` share the same rule."""
     try:
         argv = json.loads(spec)
-    except ValueError:
+    except (ValueError, RecursionError):
         die(f"{flag} takes a JSON list of strings; run dots.py init -h for an example")
     if not (isinstance(argv, list) and 0 < len(argv) <= 32
             and all(isinstance(x, str) and x.strip() for x in argv)):
@@ -1893,7 +2030,7 @@ def init(a):
             if not spec:
                 break
             host_specs.append(spec)
-        if chosen_mode != "dots-only":
+        if chosen_mode not in ("dots-only", "sub-dots"):
             wake_spec = ask("wake command as a JSON argv list with {dot} {agent} {id} {project} (blank for none): ",
                             wake_spec)
             notify_spec = ask("notify command as a JSON argv list, same placeholders plus {age} (blank for none): ",
@@ -1975,11 +2112,12 @@ def init(a):
     path = os.path.join(base, "dots.json")
     data = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
     current = None
-    fh = open_read(path)   # O_NONBLOCK: a FIFO or a folder at dots.json returns here, not in open
-    if fh is not None:
+    fd = open_raw(path)   # O_NONBLOCK + O_NOFOLLOW: a FIFO, symlink or folder returns here, not in open
+    if fd is not None:
         try:
-            with fh:
-                current = fh.read()
+            with os.fdopen(fd, "rb") as raw:
+                blob = raw.read(MAX_JSON_BYTES + 1)
+                current = blob.decode("utf-8") if len(blob) <= MAX_JSON_BYTES else None
         except (OSError, UnicodeDecodeError):
             current = None
     if current != data:
@@ -2088,7 +2226,8 @@ def brief(base, dots, projects, cfg, script):
         q_subdots = shlex.quote(subdots_script)
         print("Mode 2: sub-dots (Reverse web-gpt-agent steering + harness). Start Hub on local, then paste brief:")
         print()
-        print(f"Local Hub start: python3 {q_subdots} hub start --ops-base {q_base}")
+        print(f"Local Hub start: python3 {q_subdots} hub start --ops-base {q_base} [--wake-cmd ARGV-JSON] [--notify-cmd ARGV-JSON]")
+        print(f"Multi-agent isolation (optional): python3 {q_subdots} provision <agentId> --dot <DOT> --project <project>")
         print(f"Local stdio MCP: python3 {q_subdots} mcp-stdio")
         print(f"Local steering:  python3 {q_subdots} send <agentId> task <TASK> --text ... | steer <agentId> --interrupt --text ...")
         print()
@@ -2188,7 +2327,10 @@ class UpdateSource(urllib.request.HTTPRedirectHandler):
         return data
 
     def latest(self) -> Optional[UpdateRelease]:
-        release = json.loads(self.fetch(self.api))
+        try:
+            release = json.loads(self.fetch(self.api))
+        except (ValueError, RecursionError) as exc:
+            raise UpdateError("invalid-release") from exc
         if not isinstance(release, dict):
             raise UpdateError("invalid-release")
         tag = release.get("tag_name")
@@ -2257,8 +2399,9 @@ def update_write(path: pathlib.Path, data: bytes, mode: int) -> None:
 
 
 def update_read(path: pathlib.Path) -> bytes:
-    """Read only a bounded regular file, without blocking on a FIFO in the shared base."""
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as fh:
+    """Read only a bounded regular file, without blocking on a FIFO or following symlinks."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | nofollow), "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
             raise UpdateError("not-a-file")
         data = fh.read(UPDATE_LIMIT + 1)
@@ -2271,7 +2414,7 @@ def update_json_field(path: pathlib.Path, key: str) -> Union[bool, int, float, N
     """Read an optional update flag or timestamp without printing config warnings."""
     try:
         doc = json.loads(update_read(path))
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, ValueError, RecursionError, UpdateError, OSError):
         return None
     value = doc.get(key) if isinstance(doc, dict) else None
     return value if isinstance(value, (bool, int, float)) else None
@@ -2429,6 +2572,8 @@ def main(argv):
     s.add_argument("task")
     s.add_argument("--re", help="id this answers, from in.jsonl or out.jsonl")
     s.add_argument("--ref", action="append", default=[], help="exact reference; repeatable")
+    s.add_argument("--wake-cmd", dest="wake_cmd",
+                   help='argv list as JSON if agent is not listening (wins over dots.json)')
     i = sub.add_parser("inbox", help="main session: agent replies not yet marked read")
     i.add_argument("project", nargs="?")
     i.add_argument("agent", nargs="?")
