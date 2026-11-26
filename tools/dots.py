@@ -1798,6 +1798,14 @@ DEFAULT_HOSTS = (
     ("vm", "Dots VM: research, read-only analysis, derived work that does not change the canonical copy"),
     ("local", "This computer: canonical writes, the shared folder, long runs, logins, devices, native build"),
 )
+MODES = ("dots-only", "sub-dots")
+MODE_ALIASES = {"1": "dots-only", "2": "sub-dots", "dots-only": "dots-only", "sub-dots": "sub-dots"}
+
+def normalize_mode(value):
+    key = (value or "").strip().lower()
+    if key not in MODE_ALIASES:
+        die(f"--mode must be 1|dots-only or 2|sub-dots, got {value!r}")
+    return MODE_ALIASES[key]
 
 def ask(prompt, default=""):
     try:
@@ -1864,25 +1872,43 @@ def init(a):
     host_specs = list(a.host)
     wake_spec = a.wake_cmd or ""
     notify_spec = a.notify_cmd or ""
+    chosen_mode = normalize_mode(a.mode) if a.mode is not None else None
     if tty:
+        if chosen_mode is None:
+            cur_mode = cfg.get("mode") if cfg.get("mode") in MODES else "sub-dots"
+            default_num = "1" if cur_mode == "dots-only" else "2"
+            ans = ask(f"mode [1=dots-only (Dots quota only), 2=sub-dots (reverse local steering)] [{default_num}]: ",
+                      default_num)
+            chosen_mode = normalize_mode(ans)
         have = ", ".join(configured_dots(cfg)) or "none"
         dot_ids += [x.strip() for x in ask(f"dot ids, comma-separated (have {have}): ").split(",") if x.strip()]
-        while True:
-            spec = ask("project id=main session id (blank to finish): ")
-            if not spec:
-                break
-            project_specs.append(spec)
+        if chosen_mode != "dots-only":
+            while True:
+                spec = ask("project id=main session id (blank to finish): ")
+                if not spec:
+                    break
+                project_specs.append(spec)
         while True:
             spec = ask("extra host label=purpose beyond vm and local (blank to finish): ")
             if not spec:
                 break
             host_specs.append(spec)
-        wake_spec = ask("wake command as a JSON argv list with {dot} {agent} {id} {project} (blank for none): ",
-                        wake_spec)
-        notify_spec = ask("notify command as a JSON argv list, same placeholders plus {age} (blank for none): ",
-                          notify_spec)
+        if chosen_mode != "dots-only":
+            wake_spec = ask("wake command as a JSON argv list with {dot} {agent} {id} {project} (blank for none): ",
+                            wake_spec)
+            notify_spec = ask("notify command as a JSON argv list, same placeholders plus {age} (blank for none): ",
+                              notify_spec)
 
     report, dots = [], cfg["dots"]
+    if chosen_mode is not None:
+        prev_mode = cfg.get("mode")
+        if prev_mode == chosen_mode:
+            report.append(f"INIT mode {chosen_mode} (kept)")
+        elif prev_mode in MODES:
+            report.append(f"INIT mode {chosen_mode} (replaced)")
+        else:
+            report.append(f"INIT mode {chosen_mode} (set)")
+        cfg["mode"] = chosen_mode
     known = {d.get("id") for d in dots if isinstance(d, dict)}
     for d in dot_ids:
         d = token("dot", d)
@@ -1999,7 +2025,61 @@ def announce_rules(a):
 def brief(base, dots, projects, cfg, script):
     names = [d["id"] for d in dots if isinstance(d, dict) and isinstance(d.get("id"), str)]
     main_by = {p["id"]: p.get("main") for p in projects if isinstance(p, dict) and isinstance(p.get("id"), str)}
+    mode = cfg.get("mode") if cfg.get("mode") in MODES else None
+    subdots_script = os.path.join(os.path.dirname(script), "subdots.py")
     print()
+    if mode == "dots-only":
+        print("Paste this into each dot root's chat (Mode 1: dots-only; fill the pin with the kit commit SHA):")
+        print()
+        print("Dotomation Mode 1: dots-only @ <kit commit SHA>")
+        print(f"Dots: {', '.join(names)}")
+        print(f"Optional shared ops folder on local: {base}")
+        print("Load modes/dots-only/RULES.md from that SHA. Binding rules:")
+        print("# Critical Rules")
+        print("- 작업 공간이 dots의 VM 컴퓨터인지, 연결된 로컬의 맥인지 먼저 확인해라.")
+        print("- 연결된 로컬 맥에서 작업 시 Web GPT Agents MCP를 절대 사용하지 말고 네이티브 CLI 도구를 사용해라.")
+        print("# Coding Philosophy")
+        print("- Start the requested work directly. Do not add plans, RFCs, approval gates, wrappers, validation layers, self-checking harnesses, or other procedural scaffolding unless the task or a concrete risk requires them.")
+        print("- Use existing tools and instructions directly. Do not spend tokens building workflows that merely supervise, duplicate, or constrain the work.")
+        print("- Make the smallest complete change that achieves the requested outcome. Do not silently broaden the scope or add general-purpose infrastructure, compatibility layers, or flexibility that the task does not need.")
+        print("- Avoid hardcoded values whenever the behavior can be derived from inputs, existing data, metadata, configuration, APIs, types, or another source of truth. Do not introduce a literal or named constant merely for convenience; use a hardcoded value only when it is required by an external contract and no existing source can provide it.")
+        print("- Do not create speculative configuration or abstraction solely to avoid a literal; first reuse an existing source of truth or derive the value from data already available.")
+        print("- Add a test only when it protects non-trivial behavior or a regression that could otherwise go unnoticed. Prefer extending an existing relevant test; do not add tests that merely restate implementation details or duplicate direct verification.")
+        print("# Safety")
+        print("- Verify behavior through the real user or operator flow when one exists. Use authoritative readback for important state and mutation results.")
+        print("- Preserve authorization, privacy, money, external API boundaries, data integrity, concurrency, idempotency, and irreversible-operation safeguards. Broaden verification when these risks are involved.")
+        print("- Preserve unrelated user and agent work. Check live repository state before branching or changing worktrees.")
+        print("- Require explicit user approval before destructive actions and before pushing, merging, releasing, or deploying.")
+        print("- Report only checks actually run and real remaining risks. Do not turn investigation tools into mandatory proof-of-absence ceremonies.")
+        print("# Core Operating Instructions")
+        print("- Scope and Autonomy: complete the user's full requested outcome, act independently within established permissions, ask only on missing essentials / material scope change / genuine blocker.")
+        print("- Execution and Engineering: ground decisions in evidence, isolate root causes, favor the simplest complete solution, avoid speculative abstractions.")
+        print("- Persistence and Verification: continue through all authorized steps; reassess up to 3 meaningfully different approaches when blocked; verify through proportionate checks.")
+        print("- Continuity and Communication: reuse history/constraints, report verified work, assumptions, and remaining limits in the user's language.")
+        print("- Guiding Principle: maximize completed, verified work within intent/scope; stop only when achieved or genuinely blocked.")
+        print("Quota boundary: Dots quota only (zero local session quota). Do not run subdots.py or direct-mail polling.")
+        return
+
+    if mode == "sub-dots":
+        print("Mode 2: sub-dots (Reverse web-gpt-agent steering + harness). Start Hub on local, then paste brief:")
+        print()
+        print(f"Local Hub start: python3 {subdots_script} hub start --ops-base {base}")
+        print(f"Local stdio MCP: python3 {subdots_script} mcp-stdio")
+        print(f"Local steering:  python3 {subdots_script} send <agentId> task <TASK> --text ... | steer <agentId> --interrupt --text ...")
+        print()
+        print("Paste this to the Dots sub-agent / root (fill <kit commit SHA>):")
+        print("Dotomation Mode 2: sub-dots @ <kit commit SHA>")
+        print(f"Dots: {', '.join(names)}")
+        print("Projects: " + (", ".join(f"{k} (main {v})" for k, v in sorted(main_by.items())) or "none"))
+        print(f"Reverse bridge helper: python3 {subdots_script}")
+        print(f"  1) register: python3 {subdots_script} agent register <agentId> --dot <DOT> --project <project>")
+        print(f"  2) wait:     python3 {subdots_script} agent wait <agentId> --timeout 3300")
+        print(f"  3) exec:     python3 {subdots_script} agent exec <agentId> -- <command...>")
+        print(f"  4) step:     python3 {subdots_script} agent step <agentId> <start|step|blocked|done> --task T --note N --evidence E --goal G --doing D --next X [--ack ID]")
+        print(f"  5) reply:    python3 {subdots_script} agent reply <agentId> <result|question|block|ack|answer|note> <task> --re ID --ref R --text ...")
+        print("Full brief & protocol: modes/sub-dots/AGENT-BRIEF.md, modes/sub-dots/PROTOCOL.md")
+        return
+
     print("Paste this into each dot root's chat (fill the pin with the kit commit SHA):")
     print()
     print(f"Dotomation shared folder on local: {base}")
@@ -2350,6 +2430,7 @@ def main(argv):
     w.add_argument("--timeout", type=int, default=3300,
                    help="seconds to block; exit 3 after this (default 3300)")
     n = sub.add_parser("init", help="once per machine: config, folder tree, brief for each dot root")
+    n.add_argument("--mode", help="1|dots-only (Dots quota only) or 2|sub-dots (reverse bridge to local session)")
     n.add_argument("--base", help="shared folder; default $DOTS_OPS_BASE or ~/.dots-ops")
     n.add_argument("--dot", action="append", default=[], help="dot id; repeatable")
     n.add_argument("--project", action="append", default=[], help="ID=MAIN session id; repeatable")

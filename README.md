@@ -1,8 +1,35 @@
 # Dotomation (닷동화)
 
+Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하나를 선택해 세팅한다. `python3 tools/dots.py init`을 실행하거나 아래 모드 문서를 보고 **1번(`dots-only`)** 과 **2번(`sub-dots`)** 중 하나를 고른다.
+
+| 선택 | 모드 | 누구의 쿼터를 쓰나 | 핵심 목적 | 문서 / 도구 |
+|---|---|---|---|---|
+| **1번** | **`dots-only`** | **Dots 자체 쿼터만** (로컬 쿼터 0) | 로컬 세션 개입 없이 Dots가 VM/연결 맥 판별·네이티브 CLI·최소 변경 원칙으로 끝까지 완주 | [modes/dots-only/README.md](modes/dots-only/README.md) · [RULES.md](modes/dots-only/RULES.md) · [BRIEF.md](modes/dots-only/BRIEF.md) |
+| **2번** | **`sub-dots`** | 로컬 메인 세션 + Dots 서브에이전트 | `web-gpt-agent`의 정반대 방향(로컬 세션 → 로컬 허브 → Dots 서브에이전트)으로 **Dots 본체를 경유하지 않고** 직접 실시간 스티어링·중단·죽음/헛돌기 감시 | [modes/sub-dots/README.md](modes/sub-dots/README.md) · [`tools/subdots.py`](tools/subdots.py) · [PROTOCOL.md](modes/sub-dots/PROTOCOL.md) |
+
+---
+
+## 모드 선택하기 (`dots.py init`)
+
+- **1번 `dots-only` 세팅:**
+  ```bash
+  python3 tools/dots.py init --mode dots-only --dot <DOT_ID> --yes
+  ```
+  로컬 쿼터를 전혀 쓰지 않고, 작업 전 VM/연결된 로컬 맥 확인 및 연결된 로컬 맥에서의 Web GPT Agents MCP 금지(네이티브 CLI 강제), 최소 변경·무스캐폴딩 규칙이 통합된 브리핑을 출력합니다.
+- **2번 `sub-dots` 세팅:**
+  ```bash
+  python3 tools/dots.py init --mode sub-dots --dot <DOT_ID> --project <PROJ>=<PROJ>-main --yes
+  python3 tools/subdots.py hub start --ops-base ~/.dots-ops
+  ```
+  로컬 메인 세션(CLI 또는 `subdots.py mcp-stdio`)에서 Reverse Bridge Hub(`tools/subdots.py`)를 통해 Dots 서브에이전트(`subdots.py agent ...` 또는 Reverse Streamable-HTTP MCP)와 직접 양방향으로 주고받습니다. 대화형 `python3 tools/dots.py init`을 실행하면 1번과 2번 중 먼저 선택하게 됩니다.
+
+---
+
+아래는 기존 직접 우편(`dots.py`) 및 공통 워크플로 설명입니다.
+
 로컬 세션이 Dot 본체를 거치지 않고 Dots 서브에이전트에게 일을 보내고, 작업 도중 방향을 바꾸고, 결과를 돌려받게 하는 키트다. 실시간 대화가 아니라 공유 폴더 우편함으로 주고받는 비실시간 스티어링이다. 여기에 서브에이전트가 그 우편을 놓치지 않고 이어서 일하게 붙잡아 두는 서브에이전트 하네스(규칙·대기·기록·메모리·감시)를 함께 둔다.
 
-실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 예외는 소유자가 요청한 두 파일뿐이다: 읽기 전용 점검 도구 `tools/dots_monitor.py`는 설치·서비스·계정·자격 증명 없이 읽기만 하고([모니터링](workflows/monitoring.md)), 기록·메모리·우편을 다루고 서브에이전트를 대기시키는 `tools/dots.py`는 표준 라이브러리만 쓰며 사람이나 에이전트가 띄운 프로세스가 스스로 끝난다([직통 우편](workflows/direct-mail.md#steering-send-wait-reply), [AGENTS.md](AGENTS.md#the-second-exception-toolsdotspy)).
+실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 예외는 소유자가 요청한 도구들뿐이다: 읽기 전용 점검 도구 `tools/dots_monitor.py`([모니터링](workflows/monitoring.md)), 공유 폴더 우편·대기 도구 `tools/dots.py`([직통 우편](workflows/direct-mail.md#steering-send-wait-reply)), 그리고 2번 모드(`sub-dots`) 역방향 브릿지·감시 하네스 `tools/subdots.py`([`sub-dots`](modes/sub-dots/README.md), [AGENTS.md](AGENTS.md))는 모두 표준 라이브러리만 사용한다.
 
 ## 핵심 1: 본체 중계 없는 비실시간 스티어링
 

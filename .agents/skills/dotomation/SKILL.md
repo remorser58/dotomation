@@ -5,6 +5,12 @@ description: "Route approved Dots goal, ULW/WISH, plan, execute, loop, research 
 
 # Dotomation (닷동화) · handoff-v1
 
+## Mode selection (1: `dots-only` vs 2: `sub-dots`)
+
+Before routing work, identify which mode the user selected (`dots.json` `"mode"` or explicit instruction):
+- **Mode 1 (`dots-only`):** Runs 100% on Dots quota (zero local session quota). Load and obey [`modes/dots-only/RULES.md`](../../../modes/dots-only/RULES.md) — confirm VM vs connected local Mac first, never use Web GPT Agents MCP on a connected local Mac (use native CLI), and execute directly without unnecessary scaffolding.
+- **Mode 2 (`sub-dots`):** Reverse `web-gpt-agent` direct steering from the local session to Dots sub-agents without routing through the Dots root, using [`tools/subdots.py`](../../../tools/subdots.py) and [`modes/sub-dots/README.md`](../../../modes/sub-dots/README.md) (with optional `.dots-ops/` mirror).
+
 ## Choose the requested behavior
 
 Start at [dispatch](../../../workflows/dispatch.md#confirm-the-run-and-target): its runtime and workspace rules apply to the root, every worker and verifier, and plain work without a named mode. From there open the requested [workflow](../../../workflows/goals.md) or [specialist recipe](../../../workflows/specialists.md). Host placement and the approved routes are in [hosts](../../../workflows/hosts.md); progress is recorded in [live status](../../../workflows/live-status.md); a project main session outside Dots talks to its assigned sub-agents through [direct mail](../../../workflows/direct-mail.md); VM checkpoints and reset recovery are in the [VM watchdog](../../../workflows/vm-watchdog.md). A route adds a procedure, not a tool or permission. Do not turn a question about the kit into an invocation.

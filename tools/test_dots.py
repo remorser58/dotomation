@@ -2126,6 +2126,72 @@ class InitTests(Base):
         # the maintainer's own directory name is not a candidate anywhere in the tool
         self.assertNotIn("CodeProjects", read(SCRIPT))
 
+    def test_init_mode_dots_only_sets_config_and_prints_merged_rules(self):
+        for flag in ("dots-only", "1"):
+            sub_base = os.path.join(self.base, f"m-{flag}")
+            res = run(["init", "--yes", "--mode", flag, "--base", sub_base, "--dot", "DOT-A"], sub_base)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            cfg = d.load_json(os.path.join(sub_base, "dots.json"))
+            self.assertEqual(cfg["mode"], "dots-only")
+            self.assertIn("INIT mode dots-only (set)", res.stdout)
+            self.assertIn("# Critical Rules", res.stdout)
+            self.assertIn("Web GPT Agents MCP를 절대 사용하지 말고 네이티브 CLI 도구를 사용해라", res.stdout)
+            self.assertIn("# Coding Philosophy", res.stdout)
+            self.assertIn("# Safety", res.stdout)
+            self.assertIn("# Core Operating Instructions", res.stdout)
+            self.assertNotIn("hub start", res.stdout)
+            self.assertNotIn("AGENT_RULES", res.stdout)
+
+    def test_init_mode_sub_dots_sets_config_and_prints_reverse_bridge(self):
+        for flag in ("sub-dots", "2"):
+            sub_base = os.path.join(self.base, f"m-{flag}")
+            res = run(["init", "--yes", "--mode", flag, "--base", sub_base, "--dot", "DOT-A",
+                       "--project", "proj=proj-main"], sub_base)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            cfg = d.load_json(os.path.join(sub_base, "dots.json"))
+            self.assertEqual(cfg["mode"], "sub-dots")
+            self.assertIn("INIT mode sub-dots (set)", res.stdout)
+            self.assertIn("subdots.py", res.stdout)
+            self.assertIn("hub start", res.stdout)
+
+    def test_init_invalid_mode_is_refused_and_creates_nothing(self):
+        nested = os.path.join(self.base, "badmode", "nested")
+        res = run(["init", "--yes", "--mode", "bogus", "--base", nested, "--dot", "DOT-A"], self.base)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("--mode", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.base, "badmode")))
+
+    def test_interactive_init_accepts_mode_1_and_2(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        base1 = os.path.join(self.base, "tty1")
+        answers1 = iter([base1, "1", "DOT-1", ""])
+        buf1 = io.StringIO()
+        with mock.patch.dict(os.environ, {"DOTS_AUTO_UPDATE": "0"}), \
+             mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("builtins.input", side_effect=lambda _p="": next(answers1)), \
+             contextlib.redirect_stdout(buf1):
+            with self.assertRaises(SystemExit) as cm1:
+                d.main(["init"])
+            self.assertEqual(cm1.exception.code, 0)
+        self.assertEqual(d.load_json(os.path.join(base1, "dots.json"))["mode"], "dots-only")
+        self.assertIn("# Critical Rules", buf1.getvalue())
+
+        base2 = os.path.join(self.base, "tty2")
+        answers2 = iter([base2, "2", "DOT-2", "proj=proj-main", "", "", "", ""])
+        buf2 = io.StringIO()
+        with mock.patch.dict(os.environ, {"DOTS_AUTO_UPDATE": "0"}), \
+             mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("builtins.input", side_effect=lambda _p="": next(answers2)), \
+             contextlib.redirect_stdout(buf2):
+            with self.assertRaises(SystemExit) as cm2:
+                d.main(["init"])
+            self.assertEqual(cm2.exception.code, 0)
+        self.assertEqual(d.load_json(os.path.join(base2, "dots.json"))["mode"], "sub-dots")
+        self.assertIn("subdots.py", buf2.getvalue())
+
 
 
 class WithoutConfigTests(Base):
