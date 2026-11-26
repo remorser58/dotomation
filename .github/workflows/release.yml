@@ -1,4 +1,4 @@
-name: Release dots.py
+name: Release dotomation tools
 
 on:
   push:
@@ -28,11 +28,18 @@ jobs:
           python3 - <<'PY'
           import os
           import re
-          from dots import VERSION
+          from dots import VERSION as DOTS_VERSION
+          from subdots import VERSION as SUBDOTS_VERSION
 
           tag = os.environ["TAG"]
-          if tag != f"v{VERSION}" or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", VERSION):
-              raise SystemExit(f"Tag {tag!r} must match the stable version v{VERSION}")
+          if (
+              tag != f"v{DOTS_VERSION}"
+              or SUBDOTS_VERSION != DOTS_VERSION
+              or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", DOTS_VERSION)
+          ):
+              raise SystemExit(
+                  f"Tag {tag!r} must match v{DOTS_VERSION} (dots={DOTS_VERSION!r}, subdots={SUBDOTS_VERSION!r})"
+              )
           PY
       - run: python3 -m unittest discover -s tools
 
@@ -49,7 +56,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum tools/dots.py | sed 's#tools/##' > tools/dots.py.sha256
+          sha256sum tools/subdots.py | sed 's#tools/##' > tools/subdots.py.sha256
           # a re-run after a failed upload finds the release already there: create it only once,
-          # then upload (or replace) both assets so the pair always matches this commit
+          # then upload (or replace) all assets so the set always matches this commit
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
-          gh release upload "$TAG" tools/dots.py tools/dots.py.sha256 --clobber
+          gh release upload "$TAG" tools/dots.py tools/dots.py.sha256 tools/subdots.py tools/subdots.py.sha256 --clobber

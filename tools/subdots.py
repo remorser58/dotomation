@@ -72,7 +72,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROTOCOL_VERSION = 1
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
