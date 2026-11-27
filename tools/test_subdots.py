@@ -10,6 +10,7 @@ import os
 import pathlib
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1432,7 +1433,7 @@ class TestRound2RegressionAndHardening(HubTestBase):
         wtext_t2 = pathlib.Path(wake_log).read_text() if os.path.exists(wake_log) else ""
         self.assertNotIn("t2-w", wtext_t2)
         cli_run(["send", "t2-w", "task", "T2", "--text", "second", "--state-dir", self.state_dir], self.state_dir)
-        st_t2 = json.loads(cli_run(["status", "t2-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]
+        st_t2 = sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "t2-w"})["agent"]
         self.assertEqual(st_t2["state"], "working")
         self.assertGreater(st_t2["lease_remaining_s"], 0.0)
 
@@ -1562,7 +1563,7 @@ class TestRound2RegressionAndHardening(HubTestBase):
             mcp_proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n")
             mcp_proc.stdin.write(json.dumps({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "subdots_await_reply", "arguments": {"message_id": msg_id, "timeout_s": 20.0}},
+                "params": {"name": "subdots_await_reply", "arguments": {"agent_id": "wait0-w", "re_id": msg_id, "timeout_s": 20.0}},
             }) + "\n")
             mcp_proc.stdin.flush()
             time.sleep(0.15)
@@ -1694,6 +1695,1209 @@ class TestRound2RegressionAndHardening(HubTestBase):
                 srv_s.shutdown()
                 srv_s.server_close()
                 core_s.close()
+
+
+def _init_git_repo(repo_dir: str, initial_files: dict) -> None:
+    os.makedirs(repo_dir, exist_ok=True)
+    for rel, content in initial_files.items():
+        full = os.path.join(repo_dir, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    for cmd in (
+        ["git", "-C", repo_dir, "init"],
+        ["git", "-C", repo_dir, "config", "user.email", "subdots-test@example.com"],
+        ["git", "-C", repo_dir, "config", "user.name", "Subdots Tester"],
+        ["git", "-C", repo_dir, "add", "."],
+        ["git", "-C", repo_dir, "commit", "--no-gpg-sign", "-m", "init"],
+    ):
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"git command failed {cmd}: {proc.stderr or proc.stdout}")
+
+
+class TestEnforcedSteeringAndContracts(HubTestBase):
+    def test_contract_crud_cli_and_stdio_mcp(self):
+        self.start_hub()
+        ws = os.path.join(self._tmp.name, "ws-crud")
+        os.makedirs(ws, exist_ok=True)
+
+        cset = cli_run(
+            [
+                "contract", "set", "w1",
+                "--goal", "ship feature",
+                "--workspace", ws,
+                "--allow-path", "src/**",
+                "--forbid-path", "src/secrets/*",
+                "--forbid-cmd", "git push",
+                "--allow-cmd-prefix", "pytest",
+                "--require-check", "pytest -q",
+                "--enable-tools",
+                "--state-dir", self.state_dir,
+                "--json",
+            ],
+            self.state_dir,
+        )
+        self.assertEqual(cset.returncode, 0, cset.stderr)
+        cdoc = json.loads(cset.stdout)["contract"]
+        self.assertEqual(cdoc["agent_id"], "w1")
+        self.assertEqual(cdoc["allowed_paths"], ["src/**"])
+        self.assertEqual(cdoc["forbidden_paths"], ["src/secrets/*"])
+        self.assertTrue(cdoc["strict_steering"])
+        self.assertTrue(cdoc["enable_tools"])
+
+        cget = cli_run(["contract", "get", "w1", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(cget.returncode, 0, cget.stderr)
+        self.assertEqual(json.loads(cget.stdout)["contract"]["goal"], "ship feature")
+
+        cclr = cli_run(["contract", "clear", "w1", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(cclr.returncode, 0, cclr.stderr)
+        self.assertTrue(json.loads(cclr.stdout)["cleared"])
+
+        with subprocess.Popen(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "subdots.py"), "mcp-stdio", "--state-dir", self.state_dir],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as mcp_proc:
+            assert mcp_proc.stdin is not None and mcp_proc.stdout is not None
+            def rpc(req):
+                mcp_proc.stdin.write(json.dumps(req) + "\n")
+                mcp_proc.stdin.flush()
+                if "id" in req:
+                    raw = mcp_proc.stdout.readline()
+                    self.assertTrue(raw, "unexpected EOF from mcp-stdio")
+                    return json.loads(raw)
+                return None
+
+            rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+            rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            tl = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            tool_names = [t["name"] for t in tl["result"]["tools"]]
+            for expected in ("subdots_set_contract", "subdots_get_contract", "subdots_clear_contract", "subdots_brief", "subdots_await_any"):
+                self.assertIn(expected, tool_names)
+            rset = rpc({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "subdots_set_contract",
+                    "arguments": {"agent_id": "w1", "goal": "via mcp", "workspace_root": ws, "allowed_paths": ["src/*"]},
+                },
+            })
+            self.assertEqual(json.loads(rset["result"]["content"][0]["text"])["contract"]["goal"], "via mcp")
+            rget = rpc({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "subdots_get_contract", "arguments": {"agent_id": "w1"}},
+            })
+            self.assertEqual(json.loads(rget["result"]["content"][0]["text"])["contract"]["goal"], "via mcp")
+            rclr = rpc({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "subdots_clear_contract", "arguments": {"agent_id": "w1"}},
+            })
+            self.assertTrue(json.loads(rclr["result"]["content"][0]["text"])["cleared"])
+            mcp_proc.stdin.close()
+            mcp_proc.wait(timeout=5.0)
+
+    def test_strict_steering_hard_ack_gate_and_mandatory_readback(self):
+        self.start_hub(["--strict-steering"])
+        self.register_agent("w1")
+        rt = sd.read_runtime(self.state_dir)
+
+        sd_res = cli_run(
+            ["send", "w1", "steer", "T-RB", "--text", "switch target module to B", "--require-readback", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(sd_res.returncode, 0, sd_res.stderr)
+        mid = json.loads(sd_res.stdout)["message"]["id"]
+
+        # First exec attempt under strict_steering must promote queued -> offered AND block with STEERING_ACK_REQUIRED.
+        ex_blk = cli_run(
+            ["agent", "exec", "w1", "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "print('nope')"],
+            self.state_dir,
+        )
+        self.assertEqual(ex_blk.returncode, 2)
+        self.assertIn("STEERING_ACK_REQUIRED", ex_blk.stderr)
+        self.assertIn(mid, ex_blk.stderr)
+
+        # Agent step and gate-check are also blocked until ACKed.
+        st_blk = cli_run(
+            ["agent", "step", "w1", "step", "--task", "T-RB", "--note", "try", "--evidence", "none",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_blk.returncode, 2)
+        self.assertIn("STEERING_ACK_REQUIRED", st_blk.stderr)
+
+        code_g, body_g = http_raw(
+            f"{rt['http_url']}/agent/gate-check",
+            method="POST",
+            body={"agent_id": "w1", "epoch": 1, "session_token": sd.load_agent_session(self.state_dir, "w1", None, None, None)[1], "action": "exec"},
+        )
+        self.assertEqual(code_g, 409, body_g)
+        self.assertEqual(json.loads(body_g)["code"], "STEERING_ACK_REQUIRED")
+
+        # ACK without --readback or with too-short (<8 chars) readback must fail with READBACK_REQUIRED.
+        ack_no_rb = cli_run(["agent", "ack", "w1", mid, "--state-dir", self.state_dir], self.state_dir)
+        self.assertEqual(ack_no_rb.returncode, 2)
+        self.assertIn("READBACK_REQUIRED", ack_no_rb.stderr)
+
+        ack_short = cli_run(["agent", "ack", "w1", mid, "--readback", "ok", "--state-dir", self.state_dir], self.state_dir)
+        self.assertEqual(ack_short.returncode, 2)
+        self.assertIn("READBACK_REQUIRED", ack_short.stderr)
+
+        # Proper ACK with readback unlocks exec and step.
+        ack_ok = cli_run(
+            ["agent", "ack", "w1", mid, "--readback", "Switching work cleanly to module B", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(ack_ok.returncode, 0, ack_ok.stderr)
+
+        ex_ok = cli_run(
+            ["agent", "exec", "w1", "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "print('allowed')"],
+            self.state_dir,
+        )
+        self.assertEqual(ex_ok.returncode, 0, ex_ok.stderr)
+        self.assertIn("allowed", ex_ok.stdout)
+
+    def test_verified_done_gate_scope_checks_and_cmd_policy(self):
+        ws = os.path.join(self._tmp.name, "repo-done-gate")
+        _init_git_repo(ws, {"src/app.py": "x = 1\n", "src/secret.py": "k = 'v'\n", "docs/note.txt": "hi\n"})
+        self.start_hub()
+        reg = self.register_agent("w1")
+        req_check = f"{sys.executable} -B -c pass"
+        self.assertEqual(
+            cli_run(
+                [
+                    "contract", "set", "w1",
+                    "--workspace", ws,
+                    "--allow-path", "src/**",
+                    "--forbid-path", "src/secret.py",
+                    "--allow-cmd-prefix", f"{sys.executable} -B -c",
+                    "--forbid-cmd", r"rm\s+-rf",
+                    "--require-check", req_check,
+                    "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        t_res = json.loads(
+            cli_run(["send", "w1", "task", "T-GATE", "--text", "edit src/app.py cleanly", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout
+        )
+        t_mid = t_res["message"]["id"]
+
+        # 1) Out-of-scope dirty file (docs/note.txt) -> SCOPE_VIOLATION on step done.
+        with open(os.path.join(ws, "docs", "note.txt"), "w", encoding="utf-8") as fh:
+            fh.write("dirty outside scope\n")
+        st_oos = cli_run(
+            ["agent", "step", "w1", "done", "--ack", t_mid, "--task", "T-GATE", "--note", "d", "--evidence", "e",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        # First reply isn't sent yet OR scope check runs: wait reply first so only done gate is tested cleanly.
+        self.assertEqual(
+            cli_run(["agent", "reply", "w1", "result", "T-GATE", "--re", t_mid, "--text", "done", "--no-wait", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        st_oos = cli_run(
+            ["agent", "step", "w1", "done", "--task", "T-GATE", "--note", "d", "--evidence", "e",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_oos.returncode, 2)
+        self.assertIn("SCOPE_VIOLATION", st_oos.stderr)
+
+        # Restore docs/note.txt and dirty forbidden file src/secret.py -> SCOPE_VIOLATION.
+        subprocess.run(["git", "-C", ws, "checkout", "--", "docs/note.txt"], check=True)
+        with open(os.path.join(ws, "src", "secret.py"), "w", encoding="utf-8") as fh:
+            fh.write("k = 'changed'\n")
+        st_forb = cli_run(
+            ["agent", "step", "w1", "done", "--task", "T-GATE", "--note", "d", "--evidence", "e",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_forb.returncode, 2)
+        self.assertIn("SCOPE_VIOLATION", st_forb.stderr)
+        subprocess.run(["git", "-C", ws, "checkout", "--", "src/secret.py"], check=True)
+
+        # 2) Valid in-scope edit (src/app.py), but required check not yet executed -> VERIFICATION_REQUIRED.
+        with open(os.path.join(ws, "src", "app.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 2\n")
+        st_unver = cli_run(
+            ["agent", "step", "w1", "done", "--task", "T-GATE", "--note", "d", "--evidence", "e",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_unver.returncode, 2)
+        self.assertIn("VERIFICATION_REQUIRED", st_unver.stderr)
+
+        # Command policy negative checks:
+        # a) >2048-char padded forbidden command must still be blocked
+        pad_cmd = f"print({'1+' * 1100}1)" + " # rm -rf /"
+        ex_pad = cli_run(["agent", "exec", "w1", "--cwd", ws, "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", pad_cmd], self.state_dir)
+        self.assertEqual(ex_pad.returncode, 2)
+        self.assertIn("COMMAND_FORBIDDEN", ex_pad.stderr)
+
+        # b) shell metacharacters disallowed under allowed_cmd_prefixes
+        ex_meta = cli_run(["agent", "exec", "w1", "--cwd", ws, "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "print(1);echo"], self.state_dir)
+        self.assertEqual(ex_meta.returncode, 2)
+        self.assertIn("COMMAND_NOT_ALLOWED", ex_meta.stderr)
+
+        # c) cwd escaping workspace -> CWD_OUTSIDE_WORKSPACE
+        outside = os.path.join(self._tmp.name, "outside")
+        os.makedirs(outside, exist_ok=True)
+        ex_cwd = cli_run(["agent", "exec", "w1", "--cwd", outside, "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "pass"], self.state_dir)
+        self.assertEqual(ex_cwd.returncode, 2)
+        self.assertIn("CWD_OUTSIDE_WORKSPACE", ex_cwd.stderr)
+
+        # d) narrowed check (`--filter` / `-k`) does NOT satisfy required_check
+        ex_narrow = cli_run(["agent", "exec", "w1", "--cwd", ws, "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "pass", "--filter", "fast"], self.state_dir)
+        self.assertEqual(ex_narrow.returncode, 0, ex_narrow.stderr)
+        st_still_unver = cli_run(
+            ["agent", "step", "w1", "done", "--task", "T-GATE", "--note", "d", "--evidence", "e",
+             "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_still_unver.returncode, 2)
+        self.assertIn("VERIFICATION_REQUIRED", st_still_unver.stderr)
+
+        # 3) Run exact required check after mutation -> done gate passes!
+        time.sleep(0.02)
+        ex_pass = cli_run(["agent", "exec", "w1", "--cwd", ws, "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "pass"], self.state_dir)
+        self.assertEqual(ex_pass.returncode, 0, ex_pass.stderr)
+        st_ok = cli_run(
+            ["agent", "step", "w1", "done", "--task", "T-GATE", "--note", "verified", "--evidence", "check passed",
+             "--goal", "g", "--doing", "done", "--next", "wait", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(st_ok.returncode, 0, st_ok.stderr)
+        self.assertEqual(json.loads(st_ok.stdout)["agent"]["state"], "completed")
+        self.assertIsNotNone(reg)
+
+
+class TestContextCapsuleAndPhoenixLifecycle(HubTestBase):
+    def test_capsule_dead_ends_steering_footer_and_reverse_mcp_json_validity(self):
+        self.start_hub(["--capsule-every", "2", "--strict-steering"])
+        rt = sd.read_runtime(self.state_dir)
+
+        c1, b1 = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "subdots_register", "arguments": {"agent_id": "mcp-cap"}}},
+        )
+        self.assertEqual(c1, 200)
+        reg = json.loads(json.loads(b1)["result"]["content"][-1]["text"])
+        ep, tok = reg["epoch"], reg["session_token"]
+
+        # Checkpoint dead-ends (including duplicate normalization dedup)
+        c2, b2 = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body={
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "subdots_checkpoint",
+                    "arguments": {
+                        "agent_id": "mcp-cap", "epoch": ep, "session_token": tok,
+                        "task": "T-CAP", "phase": "debug", "next_action": "try approach B",
+                        "dead_ends": ["Approach A failed on Mac", "  approach   a  failed on mac "],
+                    },
+                },
+            },
+        )
+        self.assertEqual(c2, 200)
+        chk_doc = json.loads(json.loads(b2)["result"]["content"][-1]["text"])
+        self.assertEqual(len(chk_doc["checkpoint"]["dead_ends"]), 1)
+
+        # Send steering and verify Reverse MCP subdots_step keeps content[-1] as pure JSON
+        # while prefixing [ACTIVE_STEERING_FOOTER] and [CONTEXT_CAPSULE].
+        self.assertEqual(
+            cli_run(["steer", "mcp-cap", "--text", "Keep invariant X intact", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        c3, b3 = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body={
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "subdots_step",
+                    "arguments": {
+                        "agent_id": "mcp-cap", "epoch": ep, "session_token": tok,
+                        "state": "step", "task": "T-CAP", "note": "s1", "evidence": "e1",
+                        "goal": "g", "doing": "d", "next_step": "n",
+                    },
+                },
+            },
+        )
+        self.assertEqual(c3, 200)
+        blocks = json.loads(b3)["result"]["content"]
+        self.assertGreaterEqual(len(blocks), 2)
+        last_json = json.loads(blocks[-1]["text"])
+        self.assertIn("messages", last_json)
+        prefix_text = "\n".join(blk["text"] for blk in blocks[:-1])
+        self.assertIn("[ACTIVE_STEERING_FOOTER]", prefix_text)
+        self.assertIn("Keep invariant X intact", prefix_text)
+
+    def test_phoenix_rollover_epoch_fencing_and_keepalive_slice(self):
+        wake_log = os.path.join(self._tmp.name, "phoenix_wake.log")
+        wake_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({wake_log!r}); p.write_text((p.read_text() if p.exists() else '') + '|'.join(sys.argv[1:]) + '\\n')",
+            "{agent}", "{why}", "{state}",
+        ])
+        self.start_hub(["--lease-ttl", "0.25", "--dead-grace", "0.2", "--watchdog-interval", "0.08", "--wake-cmd", wake_cmd])
+        rt = sd.read_runtime(self.state_dir)
+        c_reg, b_reg = http_raw(f"{rt['http_url']}/agent/register", method="POST", body={"agent_id": "phx-w", "lease_ttl_s": 0.25})
+        self.assertEqual(c_reg, 200, b_reg)
+        reg_phx = json.loads(b_reg)
+        ep1, tok1 = reg_phx["epoch"], reg_phx["session_token"]
+        sd.control_rpc(
+            self.state_dir,
+            "contract.set",
+            {"agent_id": "phx-w", "rollover_max_calls": 2, "strict_steering": False},
+        )
+        last_step_doc = {}
+        for i in range(2):
+            c_st, b_st = http_raw(
+                f"{rt['http_url']}/agent/step",
+                method="POST",
+                body={
+                    "agent_id": "phx-w", "epoch": ep1, "session_token": tok1,
+                    "state": "step", "task": "T-PHX", "note": f"n{i}", "evidence": f"e{i}",
+                    "goal": "g", "doing": f"d{i}", "next_step": "n",
+                },
+            )
+            self.assertEqual(c_st, 200, b_st)
+            last_step_doc = json.loads(b_st)
+        self.assertTrue(any(m.get("kind") == "rollover" for m in last_step_doc.get("messages") or []))
+
+        c_chk, b_chk = http_raw(
+            f"{rt['http_url']}/agent/checkpoint",
+            method="POST",
+            body={
+                "agent_id": "phx-w", "epoch": ep1, "session_token": tok1,
+                "task": "T-PHX", "phase": "phase-2", "next_action": "apply final patch",
+                "completed": ["analyzed root cause"], "remaining": ["write test"],
+                "dead_ends": ["regex parser backtracked"], "ready_for_rollover": True,
+            },
+        )
+        self.assertEqual(c_chk, 200, b_chk)
+        chk_doc = json.loads(b_chk)
+        self.assertTrue(chk_doc["rollover_ready"])
+        self.assertEqual(chk_doc["agent"]["state"], "rollover_ready")
+        self.assertTrue(wait_until(lambda: os.path.exists(wake_log) and "PHOENIX_ROLLOVER" in pathlib.Path(wake_log).read_text(), timeout=3.0))
+
+        # Also verify CLI `--next-action` alias on checkpoint works cleanly.
+        # (Tested before resume advances epoch; keep lease fresh via resume right below.)
+
+        # Watchdog must NOT mark rollover_ready agent stalled/dead past lease_ttl + dead_grace.
+        time.sleep(0.55)
+        wtext = pathlib.Path(wake_log).read_text()
+        self.assertNotIn("WATCHDOG_STALLED", wtext)
+        self.assertNotIn("WATCHDOG_DEAD", wtext)
+
+        # Resume in new fresh context -> epoch advances to 2, capsule restores dead-end, epoch=1 fenced out.
+        res = cli_run(["agent", "resume", "phx-w", "--lease-ttl", "30", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rdoc = json.loads(res.stdout)
+        self.assertEqual(rdoc["epoch"], 2)
+        self.assertIn("regex parser backtracked", rdoc.get("capsule_text", ""))
+        self.assertEqual(rdoc["checkpoint"]["next_action"], "apply final patch")
+
+        stale = cli_run(
+            ["agent", "heartbeat", "phx-w", "--epoch", "1", "--session-token", "bogus", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(stale.returncode, 5)
+        self.assertIn("STALE_EPOCH", stale.stderr)
+
+        # Keepalive slice wait timeout emits both WAIT timeout and [KEEPALIVE_SLICE_DONE].
+        wt = cli_run(["agent", "wait", "phx-w", "--timeout", "0.2", "--chunk", "0.1", "--state-dir", self.state_dir], self.state_dir)
+        self.assertEqual(wt.returncode, 3)
+        self.assertIn("WAIT timeout agent=phx-w", wt.stdout)
+        self.assertIn("[KEEPALIVE_SLICE_DONE]", wt.stdout)
+
+    def test_hibernation_refusal_exemption_and_wakeup(self):
+        wake_log = os.path.join(self._tmp.name, "hib_wake.log")
+        wake_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({wake_log!r}); p.write_text((p.read_text() if p.exists() else '') + '|'.join(sys.argv[1:]) + '\\n')",
+            "{agent}", "{why}", "{state}",
+        ])
+        self.start_hub(["--lease-ttl", "0.2", "--dead-grace", "0.2", "--watchdog-interval", "0.08", "--wake-cmd", wake_cmd])
+        rt = sd.read_runtime(self.state_dir)
+        c_reg, b_reg = http_raw(f"{rt['http_url']}/agent/register", method="POST", body={"agent_id": "hib-w", "lease_ttl_s": 0.2})
+        self.assertEqual(c_reg, 200)
+        reg = json.loads(b_reg)
+        t_res = sd.control_rpc(self.state_dir, "message.send", {"agent_id": "hib-w", "kind": "task", "task": "T-HIB", "text": "finish before sleep"})
+        t_mid = t_res["message"]["id"]
+
+        # Unanswered work refuses hibernate.
+        c_href, b_href = http_raw(
+            f"{rt['http_url']}/agent/hibernate",
+            method="POST",
+            body={"agent_id": "hib-w", "epoch": reg["epoch"], "session_token": reg["session_token"]},
+        )
+        self.assertEqual(c_href, 409)
+        self.assertEqual(json.loads(b_href)["code"], "UNANSWERED_WORK")
+
+        c_rep, _ = http_raw(
+            f"{rt['http_url']}/agent/reply",
+            method="POST",
+            body={"agent_id": "hib-w", "epoch": reg["epoch"], "session_token": reg["session_token"], "kind": "result", "task": "T-HIB", "re_id": t_mid, "text": "all done"},
+        )
+        self.assertEqual(c_rep, 200)
+        c_hok, b_hok = http_raw(
+            f"{rt['http_url']}/agent/hibernate",
+            method="POST",
+            body={"agent_id": "hib-w", "epoch": reg["epoch"], "session_token": reg["session_token"], "summary": "cleanly parked", "next_action": "await task 2"},
+        )
+        self.assertEqual(c_hok, 200, b_hok)
+        self.assertEqual(json.loads(b_hok)["state"], "hibernating")
+
+        # Hibernating agent stays exempt past lease_ttl + dead_grace.
+        time.sleep(0.55)
+        st = json.loads(cli_run(["status", "hib-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]
+        self.assertEqual(st["state"], "hibernating")
+        self.assertFalse(os.path.exists(wake_log))
+
+        # Sending new work wakes hibernating agent via WAKE_FROM_HIBERNATION.
+        self.assertEqual(
+            cli_run(["send", "hib-w", "task", "T-WAKE", "--text", "wake up now", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        self.assertTrue(wait_until(lambda: os.path.exists(wake_log) and "WAKE_FROM_HIBERNATION" in pathlib.Path(wake_log).read_text(), timeout=3.0))
+
+
+class TestGatedToolProxyAndHostGuards(HubTestBase):
+    def test_tool_proxy_requires_both_hub_and_contract_opt_in(self):
+        # 1) Hub without --enable-tool-proxy rejects /agent/tool/read with 403 TOOL_PROXY_DISABLED
+        self.start_hub()
+        rt = sd.read_runtime(self.state_dir)
+        reg = self.register_agent("tp-off")
+        ws = os.path.join(self._tmp.name, "ws-tp-off")
+        os.makedirs(ws, exist_ok=True)
+        pathlib.Path(os.path.join(ws, "a.txt")).write_text("hi\n", encoding="utf-8")
+        cli_run(["contract", "set", "tp-off", "--workspace", ws, "--enable-tools", "--state-dir", self.state_dir], self.state_dir)
+        c1, b1 = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "tp-off", "epoch": reg["epoch"], "session_token": reg["session_token"], "path": "a.txt"},
+        )
+        self.assertEqual(c1, 403)
+        self.assertEqual(json.loads(b1)["code"], "TOOL_PROXY_DISABLED")
+
+        # 2) Hub with --enable-tool-proxy still rejects if contract lacks --enable-tools
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        self.start_hub(["--enable-tool-proxy"])
+        rt2 = sd.read_runtime(self.state_dir)
+        reg2 = self.register_agent("tp-no-c")
+        cli_run(["contract", "set", "tp-no-c", "--workspace", ws, "--state-dir", self.state_dir], self.state_dir)
+        c2, b2 = http_raw(
+            f"{rt2['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "tp-no-c", "epoch": reg2["epoch"], "session_token": reg2["session_token"], "path": "a.txt"},
+        )
+        self.assertEqual(c2, 403)
+        self.assertEqual(json.loads(b2)["code"], "TOOL_PROXY_DISABLED")
+
+    def test_reverse_mcp_tool_proxy_read_patch_exec_git_status_and_negative_bounds(self):
+        ws = os.path.join(self._tmp.name, "repo-proxy")
+        outside_file = os.path.join(self._tmp.name, "outside_secret.txt")
+        pathlib.Path(outside_file).write_text("TOP_SECRET\n", encoding="utf-8")
+        _init_git_repo(ws, {
+            "src/a.py": "#!/usr/bin/env python3\ndef fn():\n    return 1\n",
+            "src/dup.py": "x = 1\nx = 1\n",
+            "src/secret.txt": "forbidden\n",
+        })
+        os.chmod(os.path.join(ws, "src", "a.py"), 0o755)
+        os.symlink(outside_file, os.path.join(ws, "src", "link_out.txt"))
+
+        self.start_hub(["--enable-tool-proxy", "--strict-steering"])
+        rt = sd.read_runtime(self.state_dir)
+
+        def mcp_call(name, arguments, rpc_id=1):
+            return http_raw(
+                rt["mcp_url"],
+                method="POST",
+                body={"jsonrpc": "2.0", "id": rpc_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}},
+            )
+
+        c_r, b_r = mcp_call("subdots_register", {"agent_id": "mcp-tp"})
+        self.assertEqual(c_r, 200)
+        reg = json.loads(json.loads(b_r)["result"]["content"][-1]["text"])
+        ep, tok = reg["epoch"], reg["session_token"]
+
+        self.assertEqual(
+            cli_run(
+                [
+                    "contract", "set", "mcp-tp",
+                    "--workspace", ws,
+                    "--allow-path", "src/**",
+                    "--forbid-path", "src/secret.txt",
+                    "--require-check", f"{sys.executable} -B -c print('ok')",
+                    "--enable-tools",
+                    "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+
+        # Positive subdots_read (full file + line-sliced numbered view)
+        code, body = mcp_call("subdots_read", {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/a.py"})
+        self.assertEqual(code, 200)
+        res_rd = json.loads(json.loads(body)["result"]["content"][-1]["text"])
+        self.assertIn("def fn():", res_rd["content"])
+        code_sl, body_sl = mcp_call(
+            "subdots_read",
+            {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/a.py", "start_line": 2, "end_line": 2},
+        )
+        self.assertEqual(code_sl, 200)
+        self.assertEqual(json.loads(json.loads(body_sl)["result"]["content"][-1]["text"])["content"], "2: def fn():")
+
+        # Negative security boundaries via HTTP / Reverse MCP
+        for bad_path in ("../outside_secret.txt", "/etc/passwd", "src/link_out.txt", "src/bad\x00name"):
+            sc, sb = http_raw(
+                f"{rt['http_url']}/agent/tool/read",
+                method="POST",
+                body={"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": bad_path},
+            )
+            self.assertIn(sc, (400, 403), (bad_path, sc, sb))
+
+        # Patch refuses .git/config and forbidden paths
+        for bad_w in (".git/config", "src/secret.txt"):
+            wc, wb = http_raw(
+                f"{rt['http_url']}/agent/tool/patch",
+                method="POST",
+                body={"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": bad_w, "create": True, "replacement": "pwn"},
+            )
+            self.assertEqual(wc, 403, (bad_w, wc, wb))
+
+        # Patch refuses create=True on existing file without target (409 FILE_EXISTS) and non-unique target (409 TARGET_NOT_UNIQUE)
+        fc1, fb1 = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/a.py", "create": True, "replacement": "overwrite"},
+        )
+        self.assertEqual(fc1, 409, fb1)
+        self.assertEqual(json.loads(fb1)["code"], "FILE_EXISTS")
+
+        fc2, fb2 = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/dup.py", "target": "x = 1", "replacement": "x = 2"},
+        )
+        self.assertEqual(fc2, 409, fb2)
+        self.assertEqual(json.loads(fb2)["code"], "TARGET_NOT_UNIQUE")
+
+        # Unique patch preserves executable mode 0o755, and create=True writes new file cleanly
+        pc1, pb1 = mcp_call(
+            "subdots_patch",
+            {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/a.py", "target": "    return 1", "replacement": "    return 42"},
+        )
+        self.assertEqual(pc1, 200, pb1)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(ws, "src", "a.py")).st_mode), 0o755)
+        pc2, pb2 = mcp_call(
+            "subdots_patch",
+            {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "path": "src/new_mod.py", "create": True, "replacement": "NEW = True\n"},
+        )
+        self.assertEqual(pc2, 200, pb2)
+
+        # git_status sees both changes
+        gc, gb = mcp_call("subdots_git_status", {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok})
+        self.assertEqual(gc, 200)
+        gdoc = json.loads(json.loads(gb)["result"]["content"][-1]["text"])
+        self.assertIn("src/a.py", gdoc["dirty_files"])
+        self.assertIn("src/new_mod.py", gdoc["dirty_files"])
+
+        # subdots_exec with cwd="." works and satisfies required check (no shell=True)
+        time.sleep(0.02)
+        ec, eb = mcp_call(
+            "subdots_exec",
+            {"agent_id": "mcp-tp", "epoch": ep, "session_token": tok, "cwd": ".", "argv": [sys.executable, "-B", "-c", "print('ok')"]},
+        )
+        self.assertEqual(ec, 200, eb)
+        edoc = json.loads(json.loads(eb)["result"]["content"][-1]["text"])
+        self.assertEqual(edoc["exit_code"], 0)
+        self.assertIn("ok", edoc["output"])
+        st_tp = json.loads(cli_run(["status", "mcp-tp", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]
+        self.assertIn(f"{sys.executable} -B -c print('ok')", st_tp["observed_checks"])
+
+        # Live interrupt terminates in-flight tool_exec cleanly
+        box = {}
+        def _run_slow():
+            box["res"] = http_raw(
+                f"{rt['http_url']}/agent/tool/exec",
+                method="POST",
+                body={
+                    "agent_id": "mcp-tp", "epoch": ep, "session_token": tok,
+                    "argv": [sys.executable, "-B", "-c", "import time; time.sleep(10)"],
+                    "timeout_s": 10.0,
+                },
+                timeout=12.0,
+            )
+        th = threading.Thread(target=_run_slow, daemon=True)
+        th.start()
+        self.assertTrue(wait_until(
+            lambda: any(e["event_type"] == "exec_started" for e in json.loads(cli_run(["events", "mcp-tp", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["events"]),
+            timeout=3.0,
+        ))
+        cli_run(["steer", "mcp-tp", "--interrupt", "--text", "abort slow cmd", "--state-dir", self.state_dir], self.state_dir)
+        th.join(timeout=5.0)
+        self.assertFalse(th.is_alive())
+        ic, ib = box["res"]
+        self.assertEqual(ic, 200, ib)
+        idoc = json.loads(ib)
+        self.assertEqual(idoc["status"], "interrupted")
+
+    def test_install_git_hooks_real_commit_push_worktree_and_uninstall(self):
+        ws = os.path.join(self._tmp.name, "repo-hooks")
+        bare = os.path.join(self._tmp.name, "remote.git")
+        _init_git_repo(ws, {"src/ok.py": "v = 1\n", "README.md": "docs\n"})
+        subprocess.run(["git", "init", "--bare", bare], check=True, capture_output=True)
+        subprocess.run(["git", "-C", ws, "remote", "add", "origin", bare], check=True, capture_output=True)
+
+        # Existing non-managed hook must fail without --force
+        hook_file = os.path.join(ws, ".git", "hooks", "pre-commit")
+        pathlib.Path(hook_file).write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+        res_noforce = cli_run(["install-git-hooks", ws, "--agent", "codex:w1", "--state-dir", self.state_dir], self.state_dir)
+        self.assertNotEqual(res_noforce.returncode, 0)
+
+        self.start_hub(["--strict-steering"])
+        rt = sd.read_runtime(self.state_dir)
+        # Colon agent ID tests POSIX quoting fix
+        self.register_agent("codex:w1")
+        self.assertEqual(
+            cli_run(["contract", "set", "codex:w1", "--workspace", ws, "--allow-path", "src/**", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        # Worktree discovery check (--git-path hooks resolves shared common hooks dir)
+        wt_dir = os.path.join(self._tmp.name, "repo-wt")
+        subprocess.run(["git", "-C", ws, "worktree", "add", wt_dir, "-b", "wt-branch"], check=True, capture_output=True)
+        wt_ins = cli_run(["install-git-hooks", wt_dir, "--force", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(wt_ins.returncode, 0, wt_ins.stderr)
+        self.assertTrue(os.path.isdir(json.loads(wt_ins.stdout)["hooks_dir"]))
+
+        # Re-install pinned hook for codex:w1 (also covers ':' quoting and SUBDOTS_AGENT fallback)
+        ins = cli_run(
+            ["install-git-hooks", ws, "--agent", "codex:w1", "--force", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(ins.returncode, 0, ins.stderr)
+        hook_body = pathlib.Path(hook_file).read_text(encoding="utf-8")
+        self.assertIn("# subdots-managed-hook", hook_body)
+        self.assertNotIn(rt["token"], hook_body)
+        self.assertNotIn(rt["http_url"], hook_body)
+
+        # Out-of-scope file staged -> real `git commit` rejected by pre-commit hook!
+        pathlib.Path(os.path.join(ws, "README.md")).write_text("bad change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", ws, "add", "README.md"], check=True)
+        cm_bad = subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "bad"], capture_output=True, text=True)
+        self.assertNotEqual(cm_bad.returncode, 0)
+        self.assertIn("SCOPE_VIOLATION", cm_bad.stderr)
+        subprocess.run(["git", "-C", ws, "reset", "HEAD", "--", "README.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", ws, "checkout", "--", "README.md"], check=True, capture_output=True)
+
+        # In-scope file + unacked steering -> commit blocked; acking unlocks commit!
+        sd_res = json.loads(cli_run(["steer", "codex:w1", "--text", "ack before commit", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        mid = sd_res["message"]["id"]
+        pathlib.Path(os.path.join(ws, "src", "ok.py")).write_text("v = 2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", ws, "add", "src/ok.py"], check=True)
+        cm_unacked = subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "unacked"], capture_output=True, text=True)
+        self.assertNotEqual(cm_unacked.returncode, 0)
+        self.assertIn("STEERING_ACK_REQUIRED", cm_unacked.stderr)
+
+        self.assertEqual(cli_run(["agent", "ack", "codex:w1", mid, "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        cm_ok = subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "good"], capture_output=True, text=True)
+        self.assertEqual(cm_ok.returncode, 0, cm_ok.stderr)
+
+        # Real `git push origin HEAD` blocked by pre-push hook (PUSH_FORBIDDEN)!
+        push_blk = subprocess.run(["git", "-C", ws, "push", "origin", "HEAD"], capture_output=True, text=True)
+        self.assertNotEqual(push_blk.returncode, 0)
+        self.assertIn("PUSH_FORBIDDEN", push_blk.stderr)
+
+        # Uninstall cleans managed hooks only
+        unins = cli_run(["install-git-hooks", ws, "--uninstall", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(unins.returncode, 0, unins.stderr)
+        self.assertFalse(os.path.exists(hook_file))
+
+
+class TestLocalAutonomyReactorAndHooks(HubTestBase):
+    def test_await_any_brief_and_antigravity_local_hooks(self):
+        self.start_hub()
+        self.register_agent("rx-w", dot="DOT-A")
+        t_res = json.loads(cli_run(["send", "rx-w", "task", "T-RX", "--text", "ask question", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        t_mid = t_res["message"]["id"]
+
+        # 1) await-any timeout returns exit 3
+        aw_to = cli_run(["await-any", "--timeout", "0.1", "--after", "99999", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(aw_to.returncode, 3)
+        self.assertFalse(json.loads(aw_to.stdout)["triggered"])
+
+        # 2) Worker sends question -> await-any triggers immediately + brief reports unread
+        self.assertEqual(
+            cli_run(["agent", "reply", "rx-w", "question", "Q-RX", "--re", t_mid, "--text", "need guidance", "--no-wait", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        aw_hit = cli_run(["await-any", "--timeout", "1.0", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(aw_hit.returncode, 0, aw_hit.stderr)
+        aw_doc = json.loads(aw_hit.stdout)
+        self.assertTrue(aw_doc["triggered"])
+        self.assertGreaterEqual(len(aw_doc["unread_messages"]), 1)
+        q_mid = aw_doc["unread_messages"][0]["id"]
+
+        br = cli_run(["brief", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(br.returncode, 0, br.stderr)
+        br_doc = json.loads(br.stdout)
+        self.assertEqual(len(br_doc["unread_inbox"]), 1)
+        self.assertIn("rx-w", br_doc["text"])
+
+        # Stdio MCP subdots_brief and subdots_await_any also work
+        with subprocess.Popen(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "subdots.py"), "mcp-stdio", "--state-dir", self.state_dir],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as mcp_p2:
+            assert mcp_p2.stdin is not None and mcp_p2.stdout is not None
+            def rpc2(req):
+                mcp_p2.stdin.write(json.dumps(req) + "\n")
+                mcp_p2.stdin.flush()
+                raw = mcp_p2.stdout.readline()
+                self.assertTrue(raw, "unexpected EOF from mcp-stdio")
+                return json.loads(raw)
+
+            rpc2({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+            rb = rpc2({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "subdots_brief", "arguments": {}}})
+            self.assertIn("rx-w", json.loads(rb["result"]["content"][0]["text"])["text"])
+            ra = rpc2({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "subdots_await_any", "arguments": {"timeout_s": 0.2}}})
+            self.assertTrue(json.loads(ra["result"]["content"][0]["text"])["triggered"])
+            mcp_p2.stdin.close()
+            mcp_p2.wait(timeout=5.0)
+
+        # 3) Local Antigravity hooks: doctor, session-start, pre-invocation, stop + fail-open paths
+        doc_res = cli_run(["hook", "doctor", "--state-dir", self.state_dir], self.state_dir)
+        self.assertEqual(doc_res.returncode, 0, doc_res.stderr)
+        self.assertTrue(json.loads(doc_res.stdout)["hub_alive"])
+
+        ss = cli_run(["hook", "session-start", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1"}))
+        self.assertEqual(ss.returncode, 0)
+        ss_json = json.loads(ss.stdout)
+        self.assertIn("<subdots-status>", ss_json["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+        pre1 = cli_run(["hook", "pre-invocation", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1", "lastUserInput": "check"}))
+        self.assertIn("injectSteps", json.loads(pre1.stdout))
+        # Repeat with unchanged fingerprint does not spam duplicate injectSteps
+        pre2 = cli_run(["hook", "pre-invocation", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1", "lastUserInput": "check"}))
+        self.assertEqual(json.loads(pre2.stdout), {})
+
+        # Stop hook blocks exit while urgent question is unread, obeys continuationActive & MAX_HOOK_CONTINUATIONS
+        st_cont = cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1", "terminationReason": "NO_TOOL_CALL"}))
+        self.assertEqual(json.loads(st_cont.stdout)["decision"], "continue")
+
+        st_active = cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1", "continuationActive": True}))
+        self.assertEqual(json.loads(st_active.stdout), {})
+
+        st_term = cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1", "terminationReason": "MAX_TOKENS"}))
+        self.assertEqual(json.loads(st_term.stdout), {})
+
+        # Cap at MAX_HOOK_CONTINUATIONS -> eventually yields {}
+        last_stop = None
+        for _ in range(sd.MAX_HOOK_CONTINUATIONS + 2):
+            last_stop = json.loads(cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c2"})).stdout)
+        self.assertEqual(last_stop, {})
+
+        # Mark reply read -> stop returns {}
+        self.assertEqual(cli_run(["read", "rx-w", q_mid, "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        st_idle = cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "c1"}))
+        self.assertEqual(json.loads(st_idle.stdout), {})
+
+        # Corrupt stdin & missing DB & run-hook.sh fail-open checks
+        bad_in = cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text="{corrupt json")
+        self.assertEqual(bad_in.returncode, 0)
+        self.assertEqual(json.loads(bad_in.stdout), {})
+
+        missing_db = cli_run(["hook", "session-start", "--state-dir", os.path.join(self._tmp.name, "nonexistent")], self.state_dir, stdin_text="{}")
+        self.assertEqual(missing_db.returncode, 0)
+        self.assertEqual(json.loads(missing_db.stdout), {})
+
+        hook_sh = os.path.join(os.path.dirname(TOOLS_DIR), "modes", "sub-dots", "hooks", "run-hook.sh")
+        sh_res = subprocess.run([hook_sh, "doctor"], capture_output=True, text=True, check=False, env={"PATH": os.environ.get("PATH", ""), "HOME": self._tmp.name, "SUBDOTS_STATE_DIR": os.path.join(self._tmp.name, "nonexistent")})
+        self.assertEqual(sh_res.returncode, 0, sh_res.stderr)
+        self.assertTrue(json.loads(sh_res.stdout)["ok"])
+
+    def test_online_legacy_sqlite_migration(self):
+        legacy_dir = os.path.join(self._tmp.name, "legacy-state")
+        os.makedirs(legacy_dir, mode=0o700, exist_ok=True)
+        db_path = os.path.join(legacy_dir, "subdots.sqlite")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE agents (
+                    agent_id TEXT PRIMARY KEY,
+                    dot TEXT NOT NULL DEFAULT 'DOT',
+                    project TEXT NOT NULL DEFAULT 'default',
+                    role TEXT NOT NULL DEFAULT '구현',
+                    host TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    epoch INTEGER NOT NULL DEFAULT 1,
+                    session_token TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'registered',
+                    task TEXT NOT NULL DEFAULT '',
+                    goal TEXT NOT NULL DEFAULT '',
+                    doing TEXT NOT NULL DEFAULT '',
+                    next_step TEXT NOT NULL DEFAULT '',
+                    decisions_json TEXT NOT NULL DEFAULT '[]',
+                    blockers_json TEXT NOT NULL DEFAULT '[]',
+                    lease_ttl_s REAL NOT NULL DEFAULT 45.0,
+                    last_seen_at REAL NOT NULL,
+                    lease_expires_at REAL NOT NULL,
+                    active_poll_count INTEGER NOT NULL DEFAULT 0,
+                    wake_count INTEGER NOT NULL DEFAULT 0,
+                    last_wake_at REAL,
+                    stalled_since REAL,
+                    notified_dead_at REAL,
+                    spin_strikes INTEGER NOT NULL DEFAULT 0,
+                    spin_reason TEXT NOT NULL DEFAULT '',
+                    recent_steps_json TEXT NOT NULL DEFAULT '[]',
+                    recent_execs_json TEXT NOT NULL DEFAULT '[]',
+                    poll_timestamps_json TEXT NOT NULL DEFAULT '[]',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    request_id TEXT UNIQUE,
+                    payload_hash TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    project TEXT NOT NULL DEFAULT 'default',
+                    task TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 1,
+                    interrupt INTEGER NOT NULL DEFAULT 0,
+                    re_id TEXT,
+                    text TEXT NOT NULL,
+                    refs_json TEXT NOT NULL DEFAULT '[]',
+                    delivery_state TEXT NOT NULL,
+                    offer_count INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    created_at_iso TEXT NOT NULL,
+                    first_offered_at REAL,
+                    last_offered_at REAL,
+                    acked_at REAL,
+                    answered_at REAL
+                );
+                CREATE TABLE exec_runs (
+                    exec_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    cmd TEXT NOT NULL,
+                    cmd_norm TEXT NOT NULL,
+                    cwd TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    stderr_hash TEXT NOT NULL DEFAULT '',
+                    output_tail TEXT NOT NULL DEFAULT '',
+                    interrupted_by TEXT,
+                    started_at REAL NOT NULL,
+                    ended_at REAL
+                );
+                CREATE TABLE events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    ts_iso TEXT NOT NULL,
+                    agent_id TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+            now = sd.utc_now_ts()
+            conn.execute(
+                "INSERT INTO agents(agent_id, dot, project, epoch, session_token, state, last_seen_at, lease_expires_at, created_at, updated_at) "
+                "VALUES ('leg-w', 'DOT-LEG', 'p', 3, 'tok123', 'waiting', ?, ?, ?, ?)",
+                (now, now + 30.0, now, now),
+            )
+            conn.execute(
+                "INSERT INTO messages(id, payload_hash, direction, agent_id, task, kind, delivery_state, text, created_at, created_at_iso) "
+                "VALUES ('m-20260101T000000Z-abcd', 'h', 'to_agent', 'leg-w', 'T-LEG', 'task', 'queued', 'legacy msg', ?, '2026-01-01T00:00:00Z')",
+                (now,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(db_path, 0o600)
+
+        # Booting HubCore on legacy DB runs idempotent online ALTER TABLE migrations and creates new tables.
+        core = sd.HubCore(state_dir=legacy_dir)
+        try:
+            agents = core.local_list_agents()["agents"]
+            self.assertEqual(len(agents), 1)
+            self.assertEqual(agents[0]["agent_id"], "leg-w")
+            self.assertEqual(agents[0]["epoch"], 3)
+            st = core.local_agent_status("leg-w")
+            self.assertEqual(len(st["recent_messages"]), 1)
+            self.assertEqual(st["recent_messages"][0]["require_readback"], 0)
+            c_get = core.local_contract_get("leg-w")
+            self.assertIsNone(c_get["contract"])
+            # Also verify post-migration writes work (register + step + contract).
+            reg_m = core.agent_register({"agent_id": "leg-w", "dot": "DOT-LEG", "project": "p"})
+            self.assertEqual(reg_m["epoch"], 4)
+            core.local_contract_set({"agent_id": "leg-w", "goal": "post-migrate", "strict_steering": False})
+            st_m = core.agent_step({
+                "agent_id": "leg-w", "epoch": 4, "session_token": reg_m["session_token"],
+                "state": "step", "task": "T-MIG", "note": "ok", "evidence": "ok",
+                "goal": "post-migrate", "doing": "working", "next_step": "done",
+            })
+            self.assertTrue(st_m["ok"])
+        finally:
+            core.close()
+
+    def test_security_hardening_and_audit_regressions(self):
+        # 1) Case-insensitive .GIT/ & forbidden_paths blocks, tool_read .git ban & pre-slice/pre-truncation PEM/token redaction
+        ws = os.path.join(self._tmp.name, "repo-sec")
+        pem_body = "\n".join(["MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD"] * 4)
+        pem_file = f"-----BEGIN RSA PRIVATE KEY-----\n{pem_body}\n-----END RSA PRIVATE KEY-----\nvisible=after\n"
+        secret_tok = "abcdef0123456789abcdef0123456789abcdef0123456789"
+        long_prefix = ("a" * (sd.MAX_TOOL_OUTPUT_BYTES - 10))
+        long_file = f"{long_prefix}{secret_tok}\ntail_line\n"
+        _init_git_repo(ws, {
+            "src/secret.py": "SECRET_TOKEN = 'x'\n",
+            "src/key.pem": pem_file,
+            "src/big.txt": long_file,
+            "src/app.py": "ok = 1\n",
+        })
+        self.start_hub(["--enable-tool-proxy", "--strict-steering"])
+        rt = sd.read_runtime(self.state_dir)
+        reg = self.register_agent("sec-w")
+        ep, tok = reg["epoch"], reg["session_token"]
+        cli_run(
+            [
+                "contract", "set", "sec-w",
+                "--workspace", ws,
+                "--allow-path", "src/**",
+                "--forbid-path", "src/secret.py",
+                "--require-check", f"{sys.executable} -B -c pass",
+                "--enable-tools",
+                "--state-dir", self.state_dir,
+            ],
+            self.state_dir,
+        )
+
+        # Case-variant forbidden read/patch & .git read/patch must return 403 SCOPE_VIOLATION
+        for bad_read in (".git/config", ".GIT/config", "src/SECRET.PY"):
+            rc_c, rc_b = http_raw(
+                f"{rt['http_url']}/agent/tool/read",
+                method="POST",
+                body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": bad_read},
+            )
+            self.assertEqual(rc_c, 403, (bad_read, rc_c, rc_b))
+            self.assertEqual(json.loads(rc_b)["code"], "SCOPE_VIOLATION")
+        wc_git, wb_git = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": ".GIT/config", "create": True, "replacement": "[core]\n"},
+        )
+        self.assertEqual(wc_git, 403, wb_git)
+        self.assertEqual(json.loads(wb_git)["code"], "SCOPE_VIOLATION")
+
+        # Line-sliced PEM read (start_line=2, end_line=3 skips header/footer) must STILL redact base64 key
+        c_pem, b_pem = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/key.pem", "start_line": 2, "end_line": 3},
+        )
+        self.assertEqual(c_pem, 200, b_pem)
+        self.assertNotIn("MIIEvg", json.loads(b_pem)["content"])
+        c_pem1, b_pem1 = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/key.pem", "start_line": 1, "end_line": 2},
+        )
+        self.assertEqual(c_pem1, 200, b_pem1)
+        pem_out = json.loads(b_pem1)["content"]
+        self.assertNotIn("MIIEvg", pem_out)
+        self.assertIn("[REDACTED_PRIVATE_KEY]", pem_out)
+
+        # Token straddling MAX_TOOL_OUTPUT_BYTES must NOT leak prefix (file with custom header/url token straddling boundary)
+        tok_url = f"https://127.0.0.1:9999/{rt['token']}"
+        pad_url_file = ("b" * (sd.MAX_TOOL_OUTPUT_BYTES - 15)) + tok_url + "\n"
+        pathlib.Path(os.path.join(ws, "src", "bigurl.txt")).write_text(pad_url_file, encoding="utf-8")
+        c_big, b_big = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/bigurl.txt"},
+        )
+        self.assertEqual(c_big, 200, b_big)
+        self.assertNotIn(rt["token"][:12], json.loads(b_big)["content"])
+
+        # 2) Under --enable-tool-proxy, self-reported /agent/exec/finish MUST NOT credit required_checks,
+        #    and tool_exec narrowing flags (-ktest / --collect-only) MUST NOT satisfy required_checks.
+        c_es, b_es = http_raw(
+            f"{rt['http_url']}/agent/exec/start",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "cmd": f"{sys.executable} -B -c pass", "cwd": ws},
+        )
+        self.assertEqual(c_es, 200, b_es)
+        ex_spoof_id = json.loads(b_es)["exec_id"]
+        c_ef, b_ef = http_raw(
+            f"{rt['http_url']}/agent/exec/finish",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "exec_id": ex_spoof_id, "status": "completed", "exit_code": 0},
+        )
+        self.assertEqual(c_ef, 200, b_ef)
+        st_unver = cli_run(
+            ["agent", "step", "sec-w", "done", "--task", "T", "--note", "d", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_unver.returncode, 2)
+        self.assertIn("VERIFICATION_REQUIRED", st_unver.stderr)
+
+        c_tex_bad, b_tex_bad = http_raw(
+            f"{rt['http_url']}/agent/tool/exec",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "argv": [sys.executable, "-B", "-c", "pass", "--collect-only"]},
+        )
+        self.assertEqual(c_tex_bad, 200, b_tex_bad)
+        st_unver2 = cli_run(
+            ["agent", "step", "sec-w", "done", "--task", "T", "--note", "d", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_unver2.returncode, 2)
+        self.assertIn("VERIFICATION_REQUIRED", st_unver2.stderr)
+
+        # 3) Committed out-of-scope change caught by base_git_head + monorepo subdir prefix mapping
+        pathlib.Path(os.path.join(ws, "README_OOS.md")).write_text("oops\n", encoding="utf-8")
+        subprocess.run(["git", "-C", ws, "add", "README_OOS.md"], check=True)
+        subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "oos commit"], check=True, capture_output=True)
+        st_git_oos = cli_run(
+            ["agent", "step", "sec-w", "done", "--task", "T", "--note", "d", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(st_git_oos.returncode, 2)
+        self.assertIn("SCOPE_VIOLATION", st_git_oos.stderr)
+
+        base_head = sd.control_rpc(self.state_dir, "contract.get", {"agent_id": "sec-w"})["contract"]["base_git_head"]
+        gi_sub = sd.inspect_git_workspace(os.path.join(ws, "src"), base_head=base_head)
+        self.assertTrue(gi_sub["is_git"])
+        self.assertIn("../README_OOS.md", gi_sub["dirty_files"])
+
+        # 4) Git hook rejects SUBDOTS_AGENT=-h / --help flag injection
+        self.assertEqual(
+            cli_run(["install-git-hooks", ws, "--force", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        pathlib.Path(os.path.join(ws, "src", "app.py")).write_text("ok = 2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", ws, "add", "src/app.py"], check=True)
+        hook_env = dict(os.environ, SUBDOTS_AGENT="-h")
+        cm_flag = subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "bypass"], env=hook_env, capture_output=True, text=True)
+        self.assertNotEqual(cm_flag.returncode, 0)
+        self.assertIn("invalid agent id", cm_flag.stderr)
+
+        # 5) Mid-exec --require-readback interrupt closes exec_runs without leaving status='running'
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        self.start_hub(["--spin-cmd-repeats", "2"])
+        rt_ir = sd.read_runtime(self.state_dir)
+        self.register_agent("ir-w")
+        box = {}
+        def _run_ir():
+            box["res"] = cli_run(
+                ["agent", "exec", "ir-w", "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "import time; time.sleep(10)"],
+                self.state_dir,
+            )
+        th = threading.Thread(target=_run_ir, daemon=True)
+        th.start()
+        self.assertTrue(wait_until(
+            lambda: any(e["event_type"] == "exec_started" for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "ir-w"})["events"]),
+            timeout=3.0,
+        ))
+        cli_run(["steer", "ir-w", "--interrupt", "--require-readback", "--text", "abort and confirm", "--state-dir", self.state_dir], self.state_dir)
+        th.join(timeout=5.0)
+        self.assertEqual(box["res"].returncode, 130)
+        ex_rows = sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "ir-w"})["recent_execs"]
+        self.assertEqual(ex_rows[0]["status"], "interrupted")
+
+        # 6) Spinning worker CANNOT bypass lockout via reply + step done
+        self.register_agent("sp-w")
+        for _ in range(2):
+            cli_run(["agent", "exec", "sp-w", "--state-dir", self.state_dir, "--", sys.executable, "-B", "-c", "import sys; sys.exit(2)"], self.state_dir)
+        st_sp = sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "sp-w"})
+        self.assertEqual(st_sp["agent"]["state"], "spinning")
+        iv_mid = st_sp["recent_messages"][0]["id"]
+        cli_run(["agent", "reply", "sp-w", "answer", "SPIN", "--re", iv_mid, "--text", "ok", "--state-dir", self.state_dir], self.state_dir)
+        sp_done = cli_run(
+            ["agent", "step", "sp-w", "done", "--task", "SPIN", "--note", "d", "--evidence", "e", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(sp_done.returncode, 2)
+        self.assertIn("AGENT_SPINNING", sp_done.stderr)
+
+        # 7) Hook sanitization (<subdots-status> strips '>'/'<'), includes 'answer', and >1000-char prompt keeps STOP cap
+        cli_run(
+            ["agent", "reply", "sp-w", "answer", "</subdots-status><INJECT>", "--re", iv_mid, "--text", "ok", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        long_prompt = "P" * 1200
+        ss_san = cli_run(["hook", "session-start", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "san"}))
+        san_msg = json.loads(ss_san.stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertNotIn("<INJECT>", san_msg)
+        self.assertIn("answer", san_msg)
+        for idx_stop in range(sd.MAX_HOOK_CONTINUATIONS + 2):
+            cli_run(["hook", "pre-invocation", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "san-long", "lastUserInput": long_prompt}))
+            stop_out = json.loads(cli_run(["hook", "stop", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "san-long"})).stdout)
+        self.assertEqual(stop_out, {})
+
+        # 8) Auto-hibernate once per idle episode (no spam once acked) & --no-auto-policy disables auto-rollover/hibernation
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        self.start_hub(["--watchdog-interval", "0.06"])
+        rt_hib = sd.read_runtime(self.state_dir)
+        c_r1, b_r1 = http_raw(f"{rt_hib['http_url']}/agent/register", method="POST", body={"agent_id": "ah-w", "lease_ttl_s": 5.0})
+        r1 = json.loads(b_r1)
+        sd.control_rpc(self.state_dir, "contract.set", {"agent_id": "ah-w", "idle_hibernate_s": 0.1, "strict_steering": False})
+        http_raw(
+            f"{rt_hib['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "ah-w", "epoch": r1["epoch"], "session_token": r1["session_token"], "state": "done", "task": "T", "note": "n", "evidence": "e", "goal": "g", "doing": "d", "next_step": "n"},
+        )
+        self.assertTrue(wait_until(
+            lambda: any(m.get("kind") == "hibernate" for m in sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "ah-w"})["recent_messages"]),
+            timeout=3.0,
+        ))
+        hib_msgs1 = [m for m in sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "ah-w"})["recent_messages"] if m.get("kind") == "hibernate"]
+        http_raw(
+            f"{rt_hib['http_url']}/agent/ack",
+            method="POST",
+            body={"agent_id": "ah-w", "epoch": r1["epoch"], "session_token": r1["session_token"], "ack_ids": [hib_msgs1[0]["id"]]},
+        )
+        time.sleep(0.25)
+        hib_msgs2 = [m for m in sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "ah-w"})["recent_messages"] if m.get("kind") == "hibernate"]
+        self.assertEqual(len(hib_msgs2), 1)
+        # Also exercise checkpoint --next-action alias cleanly
+        chk_alias = cli_run(
+            [
+                "agent", "checkpoint", "ah-w",
+                "--epoch", str(r1["epoch"]), "--session-token", r1["session_token"],
+                "--next-action", "stay warm", "--state-dir", self.state_dir, "--json",
+            ],
+            self.state_dir,
+        )
+        self.assertEqual(chk_alias.returncode, 0, chk_alias.stderr)
+        self.assertEqual(json.loads(chk_alias.stdout)["checkpoint"]["next_action"], "stay warm")
+
+        # Verify --no-auto-policy disables automatic rollover & idle hibernation
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        self.start_hub(["--no-auto-policy", "--watchdog-interval", "0.06"])
+        rt_nap = sd.read_runtime(self.state_dir)
+        r_nap = json.loads(http_raw(f"{rt_nap['http_url']}/agent/register", method="POST", body={"agent_id": "nap-w", "lease_ttl_s": 5.0})[1])
+        sd.control_rpc(self.state_dir, "contract.set", {"agent_id": "nap-w", "rollover_max_calls": 1, "idle_hibernate_s": 0.05, "strict_steering": False})
+        _, b_nap_st = http_raw(
+            f"{rt_nap['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "nap-w", "epoch": r_nap["epoch"], "session_token": r_nap["session_token"], "state": "done", "task": "T", "note": "n", "evidence": "e", "goal": "g", "doing": "d", "next_step": "n"},
+        )
+        self.assertNotIn("rollover_requested", json.loads(b_nap_st))
+        time.sleep(0.2)
+        nap_msgs = sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "nap-w"})["recent_messages"]
+        self.assertFalse(any(m.get("kind") in ("rollover", "hibernate") for m in nap_msgs))
 
 
 if __name__ == "__main__":

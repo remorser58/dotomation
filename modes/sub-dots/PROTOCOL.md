@@ -1,50 +1,42 @@
-# Mode 2: `sub-dots` Protocol & Contract (`tools/subdots.py`)
+# Mode 2: `sub-dots` Protocol & Contract (`tools/subdots.py` v1.2)
 
 ## 1. Storage & Security Boundary
 
 - **Owner-private directory:** `~/.subdots` (or `--state-dir` / `$SUBDOTS_STATE_DIR`), enforced mode `0700`, non-symlink, owned by current UID.
-  - Strictly separate from any Dots-root-writable `.dots-ops/` folder so a Dots root cannot forge hub state, wake commands, or delivery markers.
-  - **Same-UID vs multi-agent isolation:** Processes running under the same OS UID share access to `c.sock`, `runtime.json`, and `sessions/<agent>.json`. When running untrusted sub-agents under separate OS users or containers/VMs, use `subdots.py provision <agentId>` to issue per-agent `/a/<agent_token>` URLs (optionally paired with `hub start --require-provision` to disable open global-token registration) so one sub-agent cannot impersonate or bump another agent's epoch.
-  - **Hook placeholders:** `{task}` and `{why}` are allowlist-sanitized to single non-whitespace tokens (`[^A-Za-z0-9._:/@+,=-]+` -> `_`, no leading `-`) before argv substitution and must never be interpolated into remote shell commands (e.g., `ssh ... sh -c`) or script interpreters (`osascript -e`); pass them strictly as standalone argv items.
-- **`runtime.json` (`0600`), `hub.lock` (`0600`):** Written atomically / flocked with `O_NONBLOCK` + `O_NOFOLLOW`. `hub.lock` prevents concurrent Hubs on the same state directory. Holds `pid`, `socket_path`, `http_host`, `http_port`, `token`, `http_url`, `mcp_url`, `public_host`, `ops_base`, `require_provision`.
-- **Unix control socket (`c.sock`, `0600`):** Uses `<state_dir>/c.sock` when UTF-8 path length is `<= 96` bytes, else `/tmp/sd-<sha256[:8]>-<random>/c.sock` inside an unpredictable `0700` `mkdtemp` dir (preventing macOS `ENAMETOOLONG` and shared-`/tmp` pre-creation races).
-- **SQLite WAL ledger (`subdots.sqlite`, `-wal`, `-shm`, mode `0600`):** `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, serialized through a single `RLock` without holding the lock across `Condition.wait()` or subprocess calls. Events preserve redacted payloads with bounded 10,000-row retention.
+  - Strictly separate from any Dots-root-writable `.dots-ops/` folder and holds `subdots.sqlite`, `runtime.json` (`0600`), `hub.lock` (`0600`), `heartbeat.json` (`0600`), `hub.log` (`0600`), `sessions/`, `hook_state.json` (`0600`), and `hook_state.lock`.
+  - **Contract privilege separation:** Owner contracts (`contracts` table) can ONLY be mutated over the owner-private Unix control socket (`contract.set` / `contract.clear` / `subdots_set_contract`) — NEVER via HTTP `/agent/*` or Reverse MCP.
+  - **Per-agent isolation:** `subdots.py provision <agentId>` issues scoped `/a/<agent_token>` URLs; paired with `--require-provision`, open global-token registration is disabled.
+  - **Hook placeholders:** `{task}` and `{why}` are allowlist-sanitized before argv substitution and must never be interpolated into remote shell strings.
+- **SQLite WAL ledger (`subdots.sqlite`, `-wal`, `-shm`, mode `0600`):**
+  - Core tables: `agents` (tracks liveness, fatigue counters, `observed_dirty_json`, `observed_checks_json`), `messages` (`require_readback`, `readback_text`), `events` (bounded 10,000-row retention), `exec_runs`, `contracts`, and `checkpoints`.
+  - Existing pre-v1.2 databases migrate online and idempotently in `Ledger.__init__`.
 
-## 2. Two-Phase Guaranteed Delivery & Piggyback
+## 2. Two-Phase Delivery, Hard Steering Gates & Done Proof
 
-1. **Enqueue (`to_agent`):** Local session calls `send`, `steer`, `ask`, `pause`, `resume`, `cancel`, `release`, or stdio MCP `subdots_send`/`subdots_steer`/`subdots_control`.
-   - Optional `request_id` enforces idempotency via SHA-256 `payload_hash` (identical retry returns existing receipt; mismatched payload raises `409 REQUEST_ID_CONFLICT`).
-2. **Offer (`queued -> offered`):** Any sub-agent call (`register`, `poll`, `step`, `heartbeat`, `reply`, `exec/start`, `exec/heartbeat`, `exec/finish`, or Reverse MCP `tools/call`) collects pending `to_agent` messages ordered by `(priority DESC, created_at ASC)` and marks them `offered`. Agents receiving a task on `register` should immediately run `agent step ... start --ack <id>` and start working without first blocking in `agent wait`. Additionally, polling while in `completed` state (e.g., awaiting coordinator `answer`/`release` after `step done`) preserves `completed` rather than reverting to `waiting`.
-3. **Re-offer & Escalation:** If an `offered` message is not ACKed within `reoffer_s` (default `45s`), the next call re-offers it up to `max_offers` (default `5`). Exceeding `max_offers` marks it `unacked_failed` and triggers `--notify-cmd` (still recoverable via `--ack` or `reply --re`).
-4. **Ack (`offered -> acked`) & Answer (`answered`):** Passing `ack_ids` promotes `queued`/`offered`/`unacked_failed` messages to `acked`. Calling `agent reply ... --re <id>` promotes that message to `answered`.
-5. **Done Gate & Spin Lockout:** `agent step ... done` returns `409 UNANSWERED_WORK` (exit `2`) while any `task`, `steer`, `interrupt`, `question`, `review`, or `intervention` message lacks an answer (`queued`, `offered`, `acked`, or `unacked_failed`). `agent exec` refuses execution (`409 AGENT_SPINNING`) while the agent is in `spinning` state or has a pending intervention.
+1. **Enqueue (`to_agent`):** Local session calls `send`, `steer`, `ask`, `pause`, `resume`, `cancel`, `release`, or stdio MCP `subdots_send`/`subdots_steer`/`subdots_control` (optionally with `require_readback=True` and idempotent `request_id`).
+2. **Offer & Sandwich Injection:** Every sub-agent call (`register`, `resume`, `poll`, `step`, `heartbeat`, `reply`, `exec/*`, `checkpoint`, `tool/*`, or Reverse MCP `tools/call`) collects pending messages (`queued -> offered`), periodically injects `[CONTEXT_CAPSULE]` every `capsule_every_n` calls, and appends `[ACTIVE_STEERING_FOOTER]` after tool output when alerts remain.
+3. **Read-Back Ack (`READBACK_REQUIRED`):** Acking any message marked `require_readback=1` without `--readback` (minimum 8 non-whitespace chars) fails with `400 READBACK_REQUIRED`.
+4. **Hard Steering Gate (`STEERING_ACK_REQUIRED`):** When hub `--strict-steering` or `contract.strict_steering` is active (or a `require_readback` message is unacked), `exec_start`, `agent gate-check`, `tool_*`, and previously offered `step` reports fail with `409 STEERING_ACK_REQUIRED`, promoting queued messages to `offered` and returning `[STEERING_INPUT]` + `[ACTIVE_STEERING_FOOTER]` (HTTP/Reverse MCP responses also include `[CONTEXT_CAPSULE]`).
+5. **Verified Done Gate:** `agent_step(..., state="done")` checks:
+   - `409 AGENT_PAUSED` / `409 AGENT_SPINNING` if paused or spinning
+   - `409 UNANSWERED_WORK` if any `task`/`steer`/`interrupt`/`question`/`review`/`intervention` remains unanswered
+   - `409 SCOPE_VIOLATION` if any live `git status` or `base_git_head..HEAD` committed path (or `observed_dirty`) violates `contract.allowed_paths` / `contract.forbidden_paths` (also emitting `scope_violation`)
+   - `409 VERIFICATION_REQUIRED` if any `contract.required_checks` lacks an exact passing (`exit_code == 0`) execution recorded at or after the latest mutation / dirty file or commit timestamp (self-reported `/agent/exec/finish` is not credited when `--enable-tool-proxy` / `enable_tools` is active).
 
-## 3. Epoch Fencing
+## 3. Epoch Fencing & 3-State Phoenix Lifecycle
 
-- Every `agent register` increments `epoch` and issues a fresh 48-hex `session_token`, re-queueing any unacked `offered` messages for the new session.
-- All subsequent agent calls validate `(epoch, session_token)` in constant time; stale callers receive `409 STALE_EPOCH` (exit `5`).
+- **`register` / `resume`:** Bumps `epoch`, issues a fresh `session_token`, resets per-epoch fatigue counters (`epoch_tool_calls`, `epoch_output_bytes`, `epoch_started_at`), re-queues `offered` messages, and on `resume` (or whenever contract/checkpoint exists) injects the full `[CONTEXT_CAPSULE]` including cumulative `dead_ends` (`MAX_DEAD_ENDS=30`). Stale epochs always receive `409 STALE_EPOCH` (exit `5`).
+- **Context Fatigue Rollover:** Crossing `rollover_max_calls`, `rollover_max_bytes`, or `rollover_max_age_s` emits `rollover_requested` and enqueues priority-8 `kind="rollover"` (`[ROLLOVER_PREPARE]`). Submitting `agent checkpoint --ready-for-rollover` sets `state='rollover_ready'`, emits `rollover_ready`, and invokes `--wake-cmd` with `why=PHOENIX_ROLLOVER`.
+- **Hibernation & On-Demand Wake:** `agent hibernate` (refused if unanswered work exists) parks `state='hibernating'` (watchdog-exempt). Sending new steering to `hibernating`/`rollover_ready` re-arms `working` and triggers `--wake-cmd` (`why=WAKE_FROM_HIBERNATION`). Contracts with `idle_hibernate_s > 0` auto-enqueue `kind="hibernate"` during `watchdog_tick`.
 
-## 4. Anti-Death Lease Watchdog
+## 4. Gated Reverse MCP Tool Proxy & Host Guards
 
-- Agents renew `lease_expires_at` (`now + lease_ttl_s`, default `45s`) on every call and continuously while holding `/agent/poll` (`active_poll_count > 0`).
-- When `active_poll_count == 0` and `now > lease_expires_at`, the background watchdog transitions the agent to `stalled` (`lease_expired` event) and invokes `--wake-cmd` with exponential backoff (`wake_backoff_s * 2**wake_count`, capped at `max_wakes`).
-- Past `lease_expires_at + dead_grace_s` (default `60s`), the agent transitions to `dead` (`agent_dead` event) and triggers `--notify-cmd` once per outage episode (past `notify_after_s`).
+- **Opt-in defense in depth:** `tool_read`, `tool_patch`, `tool_exec`, and `tool_git_status` reject all requests with `403 TOOL_PROXY_DISABLED` unless **BOTH** the Hub was started with `--enable-tool-proxy` **AND** the owner contract sets `enable_tools=True` with a valid non-symlink `workspace_root`.
+- **Workspace path safety:** Rejects absolute paths, `..` traversal, backslashes, NUL bytes, symlink components/targets, case-insensitive `.git/` read/write access (`forbid_git_dir=True`), and `forbidden_paths`/`allowed_paths` mismatches (`403 SCOPE_VIOLATION`, with case-insensitive `forbidden_paths`), reading/patching via `O_NOFOLLOW` + `dir_fd` (`<= 512 KiB`) and scrubbing full file content prior to line-slicing/truncation without holding the SQLite lock across I/O.
+- **Command policy:** Enforces workspace-contained `cwd` (walking directory segments with `O_NOFOLLOW`, forbidding `.git`), rejects `forbidden_cmds` regex matches (`403 COMMAND_FORBIDDEN`), validates `allowed_cmd_prefixes` without shell chaining/redirection metacharacters (`403 COMMAND_NOT_ALLOWED`), runs argv-only (`shell=False`) with a sanitized minimal child environment and live process-group kill on interrupt/timeout.
+- **Git hooks (`install-git-hooks`):** Installs worktree-aware `# subdots-managed-hook` `pre-commit` (`agent gate-check --action commit`) and `pre-push` (hard block) contained inside the repository/common git directory, rejecting flag-like `SUBDOTS_AGENT` values and without storing Hub bearer tokens in `.git/hooks`.
 
-## 5. Deterministic Anti-Spin Detector
+## 5. Control Socket, Local MCP & IDE Hooks
 
-1. `SPIN_COMMAND_LOOP`: Within `spin_window_s` (default `600s`), identical `(cmd_norm, exit_code, stderr_hash)` fails (`exit_code != 0`) `>= spin_cmd_repeats` (default `3`) times. A `0` exit clears prior failures for `cmd_norm`.
-2. `SPIN_NO_PROGRESS`: Within `spin_window_s`, `>= spin_step_repeats` (default `4`) consecutive `start`/`step` calls carry the exact same normalized `(state, task, doing, note, evidence)` signature without an intervening `reply`.
-3. `SPIN_POLL_THRASH`: `>= spin_poll_burst` (default `12`) zero-hold empty polls (`hold_s < 1.0` and `elapsed < 0.5s`) within `60s`. Legitimate chunked `wait` calls (`hold_s >= 1.0`) never trigger this rule.
-
-Triggering any rule sets agent state to `spinning`, increments `spin_strikes`, enqueues a priority-10 `[HARNESS_INTERVENTION]` message, and triggers `--notify-cmd`.
-
-## 6. HTTP, Reverse Streamable-HTTP MCP & Control Socket
-
-- **HTTP Security:** Rejects non-loopback `Host` (unless matching `--public-host`) with `403`, rejects non-loopback `Origin` with `403`, rejects protocol-relative `//` targets / obs-fold / invalid header names (`400`), enforces `16 KiB` head / `2 MiB` body limits under monotonic deadlines (`431`/`413`/`408`), authenticates path `/<token>/...`, per-agent `/a/<agent_token>/...`, or `Authorization: Bearer ...` in constant time (`401`/`403`), and answers `GET /.well-known/oauth-protected-resource/(?:a/)?<token>/mcp` per RFC 9728.
-- **Reverse MCP (`/<token>/mcp` or `/a/<agent_token>/mcp`):** Supports `initialize`, `ping`, `tools/list`, `tools/call` (`subdots_register`, `subdots_wait` bounded to `<= 25s`, `subdots_step`, `subdots_reply`, `subdots_ack`, `subdots_heartbeat`).
-- **Local Stdio MCP (`subdots.py mcp-stdio`):** Exposes 9 owner tools over `c.sock`: `subdots_list_agents`, `subdots_agent_status`, `subdots_inbox`, `subdots_mark_read`, `subdots_send`, `subdots_steer`, `subdots_await_reply`, `subdots_events`, `subdots_control`.
-- **Control Socket (`c.sock`):** Line-delimited JSON with `hello` (`protocol_version=1`), unary commands (`hub.status`, `hub.stop`, `agent.list`, `agent.provision`, `agent.status`, `message.send`, `message.await`, `message.inbox`, `message.mark_read`, `events.list`, `control.*`), and `events.follow` NDJSON streaming.
-
-## 7. `.dots-ops/` Mirroring
-
-When `--ops-base` (or `--mirror-ops` with `$DOTS_OPS_BASE`) is set on `hub start`, the Hub mirrors messages (`mail-v1`), steps (`live-record-v1`), and memory (`memory-v1`) using `O_NONBLOCK` + `S_ISREG` checks so `dots.py board` and `dots_monitor.py` can read Mode 2 activity safely.
+- **Control Socket (`c.sock`):** Supports `hub.status`, `hub.stop`, `hub.brief`, `agent.list`, `agent.provision`, `agent.status`, `contract.set`, `contract.get`, `contract.clear`, `message.send`, `message.await`, `message.inbox`, `message.mark_read`, `events.list`, `events.follow`, `events.await_any`, `control.*`.
+- **Local Hooks (`subdots.py hook <session-start|pre-invocation|stop|doctor>`):** Fail-open `{}` on stopped hub/invalid input, deduplicated sanitized `<subdots-status>` injection, and bounded (`MAX_HOOK_CONTINUATIONS=8`) `Stop` continuation when unread inbox / spin / dead / rollover alarms remain.
