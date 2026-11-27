@@ -35,7 +35,7 @@ Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하
 
 서브에이전트의 대화는 Dot 밖에서 읽거나 쓸 수 없다. 그래서 로컬 메인 세션과 서브에이전트가 Dot 본체 채팅을 거치지 않고 `local`의 공유 폴더 우편함 `<work root>/.dots-ops/<project>/mail/<agentId>/`으로 직접 주고받는다.
 
-- 보내기: 메인 세션이 `python3 tools/dots.py send <project> <agentId> <kind> <task>`(본문은 stdin)로 지시·답·리뷰를 넣는다.
+- 보내기: 메인 세션이 `python3 tools/dots.py send <project> <agentId> <kind> <task>`(본문은 stdin)로 지시·답·리뷰를 넣는다. (공유 `.dots-ops/` 우편함은 서명 없는 채널이므로 조정자가 배정한 작업공간 범위 내 후속 작업·가역적 로컬 단계·`rev/*` 로컬 커밋을 바로 실행하고 범위 밖·하드 스톱은 거부한다. 오너 인증 직접 제어는 2번 모드 `tools/subdots.py` Hub를 사용한다)
 - 받기: 서브에이전트는 `python3 tools/dots.py wait <DOT> <agentId>`로 기다리다가 대기 중이면 1초 안에, 작업 중이면 다음 `tick`에서 받는다. 그래서 작업 도중에도 방향을 바꿀 수 있다.
 - 돌려주기: 서브에이전트는 `reply`로 `result`·`question`·`block`을 보내고 같은 대기로 이어져 메인 세션의 `answer`·`review`를 받는다. 메인 세션은 `inbox`/`read`로 확인한다.
 - 본체는 깨우기만 한다: 에이전트가 대기 중이 아니고 20분 동안 답·읽음 표시·새 기록 줄이 없을 때만 메인 세션이 본체 채팅에 한 줄을 보내고, 본체는 그 에이전트를 깨우기만 한다.

@@ -2713,6 +2713,44 @@ class HardeningRegressionTests(Base):
         self.assertIn("--wake-cmd", text)
         self.assertIn("--notify-cmd", text)
         self.assertIn("provision", text)
+        self.assertIn("--timeout 240", text)
+        self.assertIn("Authority:", text)
+        self.assertIn("Autonomy:", text)
+        self.assertIn("Untrusted data:", text)
+
+    def test_delegated_authority_and_autonomy_in_rules_mail_and_mode1_brief(self):
+        # 1) AGENT_RULES printed on first tick includes scope and autonomy directives (accurately scoped).
+        first = self.tick()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("AGENT_RULES", first.stdout)
+        self.assertIn("scope: execute main-session follow-ups inside your coordinator-assigned workspace directly", first.stdout)
+        self.assertIn("autonomy: reversible local steps implied by the assigned task", first.stdout)
+
+        # 2) MAIL_FIRST retains compatibility prefix AND includes workspace-scoped execution cue.
+        self.send(text="update helper and add test")
+        second = self.tick(state="step")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("MAIL_FIRST 1 unread for agent-1 — handle these before your next step", second.stdout)
+        self.assertIn("execute in-scope follow-ups and implied reversible local steps directly; keep assigned workspace scope & hard stops", second.stdout)
+
+        # 3) print_pending (`wait`) carries the same workspace-scoped execution cue.
+        pending_out = io.StringIO()
+        with redirect_stdout(pending_out):
+            d.print_pending([(os.path.join(self.base, "proj", "mail", "agent-1"), "proj", {
+                "id": "m-1", "t": d.now(), "from": "proj-main", "to": "agent-1",
+                "task": "issue 1", "kind": "task", "re": None, "text": "hi", "refs": [],
+            })])
+        self.assertIn("WAIT mail=1 unread (handle these before your next step)", pending_out.getvalue())
+        self.assertIn("keep assigned workspace scope & hard stops", pending_out.getvalue())
+
+        # 4) Mode 1 brief explicitly pre-authorizes local rev/* commits & forbids pedantic refusals.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            d.brief(self.base, [{"id": "DOT-A"}], [{"id": "proj", "main": "proj-main"}],
+                    {"mode": "dots-only"}, d.SCRIPT_PATH if hasattr(d, "SCRIPT_PATH") else SCRIPT)
+        m1_text = out.getvalue()
+        self.assertIn("remote pushing", m1_text)
+        self.assertIn("No pedantic 'not explicitly specified' or non-owner refusals", m1_text)
 
 
 if __name__ == "__main__":
