@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 UNIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -189,7 +189,7 @@ def _clean_oneline(value):
 
 
 def _redact_text(value):
-    return _SECRET_RE.sub("[REDACTED]", str(value))
+    return _SECRET_RE.sub("[REDACTED]", _clean_term(value))
 
 
 def _redact_tree(value):
@@ -1283,6 +1283,8 @@ def cmd_init(args):
     if os.path.lexists(cfg_path) and not args.force:
         print(f"PILOT_INIT_KEPT config={cfg_path} (pass --force to overwrite)", flush=True)
         cfg = _load_private_json(cfg_path, pilot_dir, default=cfg)
+        if not isinstance(cfg, dict):
+            _die("existing config.json is not a JSON object")
         ok_kept, dots_py, apply_sha, err_kept = _verify_dots_pin(cfg)
         if not ok_kept:
             _die(err_kept)
@@ -1465,9 +1467,20 @@ def _run_once_locked(cfg, pilot_dir):
         print(f"PILOT_LOOP_STATUS_WARN exit={lproc.returncode} detail={err_txt}", flush=True)
     else:
         try:
-            loop_tracks = (json.loads(lproc.stdout) or {}).get("tracks") or []
-        except ValueError:
-            loop_tracks = []
+            parsed = json.loads(lproc.stdout)
+            if not isinstance(parsed, dict):
+                print(
+                    f"PILOT_LOOP_STATUS_WARN exit=0 detail=invalid loop status JSON shape: {type(parsed).__name__}",
+                    flush=True,
+                )
+            else:
+                raw_tracks = parsed.get("tracks")
+                loop_tracks = raw_tracks if isinstance(raw_tracks, list) else []
+        except ValueError as exc:
+            print(
+                f"PILOT_LOOP_STATUS_WARN exit=0 detail=invalid loop status JSON: {_clean_oneline(_redact_text(str(exc)))}",
+                flush=True,
+            )
 
     current = _now_utc()
     wake_events = [ev for ev in events if ev.get("kind") in ("wake", "fill", "idle")]
@@ -1622,7 +1635,12 @@ def cmd_status(args):
             loop_status_err = _clean_oneline(_redact_text(lproc.stderr or lproc.stdout or f"exit={lproc.returncode}"))
         else:
             try:
-                tracks = (json.loads(lproc.stdout) or {}).get("tracks") or []
+                parsed = json.loads(lproc.stdout)
+                if not isinstance(parsed, dict):
+                    loop_status_err = f"invalid loop status JSON shape: {type(parsed).__name__}"
+                else:
+                    raw_tracks = parsed.get("tracks")
+                    tracks = raw_tracks if isinstance(raw_tracks, list) else []
             except ValueError as exc:
                 loop_status_err = _clean_oneline(f"invalid loop status JSON: {exc}")
     out = _redact_tree({
@@ -1645,13 +1663,15 @@ def cmd_status(args):
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 0
-    print(f"PILOT_STATUS dot={out['dot'] or '-'} project={out['project'] or '-'} pin={'ok' if ok_pin else pin_err} tracks={len(tracks)}")
+    print(f"PILOT_STATUS dot={out['dot'] or '-'} project={out['project'] or '-'} pin={'ok' if ok_pin else _clean_oneline(out['dots_pin_error'] or '')} tracks={len(out['tracks'])}")
     if loop_status_err:
         print(f"  loop_status_error={_clean_oneline(_redact_text(loop_status_err))}")
-    if hb:
-        print(f"  heartbeat t={hb.get('t')} wakes={hb.get('wakes')} notifies={hb.get('notifies')}")
+    out_hb = out.get("heartbeat")
+    if isinstance(out_hb, dict):
+        print(f"  heartbeat t={_clean_oneline(out_hb.get('t'))} wakes={out_hb.get('wakes')} notifies={out_hb.get('notifies')}")
     for t in out["tracks"]:
-        print(f"  track={_clean_oneline(t.get('track'))} done={t.get('done')} queued={t.get('queued')} blocked={t.get('blocked')} paused={t.get('paused')}")
+        if isinstance(t, dict):
+            print(f"  track={_clean_oneline(t.get('track'))} done={t.get('done')} queued={t.get('queued')} blocked={t.get('blocked')} paused={t.get('paused')}")
     return 0
 
 

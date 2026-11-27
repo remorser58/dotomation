@@ -571,6 +571,31 @@ class DotsPilotTests(unittest.TestCase):
             self.assertIn("loop_status_error=", st_err_txt.stdout)
             self.assertNotIn("sk-secret1234567890", st_err_txt.stdout)
 
+            # Version alignment, ANSI-obfuscated redaction, non-dict JSON `loop status`, and `config.json == null`
+            self.assertEqual(dp.VERSION, "1.2.0")
+            self.assertEqual(dp._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
+
+            badjson_dots = os.path.join(self.tmp, "dots_badjson.py")
+            badjson_src = "import sys\nprint('[]')\nsys.exit(0)\n"
+            pathlib.Path(badjson_dots).write_text(badjson_src, encoding="utf-8")
+            p3_cfg["dots_py"] = badjson_dots
+            p3_cfg["dots_sha256"] = hashlib.sha256(badjson_src.encode("utf-8")).hexdigest()
+            _write_json(p3_cfg_path, p3_cfg)
+
+            once_badjson = run_pilot(["once"], p3)
+            self.assertEqual(once_badjson.returncode, 0, once_badjson.stdout + once_badjson.stderr)
+            self.assertIn("PILOT_LOOP_STATUS_WARN exit=0", once_badjson.stdout)
+
+            st_badjson = run_pilot(["status", "--json"], p3)
+            self.assertEqual(st_badjson.returncode, 0, st_badjson.stderr)
+            st_badjson_doc = json.loads(st_badjson.stdout)
+            self.assertIsNotNone(st_badjson_doc["loop_status_error"])
+
+            pathlib.Path(p3_cfg_path).write_text("null\n", encoding="utf-8")
+            null_cfg_init = run_pilot(["init", "--ops-base", ops3], p3)
+            self.assertEqual(null_cfg_init.returncode, 2)
+            self.assertIn("not a JSON object", null_cfg_init.stderr)
+
             # 8) CDP tab exact/prefix disambiguation (/dots/1 must not match /dots/10) + IPv6 [::1] Host bracket check
             fake_tabs = [{"type": "page", "url": "https://chatgpt.com/dots/10", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/10"}]
             with mock.patch("urllib.request.build_opener") as mock_opener:

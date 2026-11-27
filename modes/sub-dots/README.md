@@ -48,7 +48,7 @@ Dots 본체(루트 채팅)를 경유해 대화를 중계하지 않으며, **하�
    - `register`/`resume`, `wait` 기상, `steer` 차단, 매 N회 호출마다 `[CONTEXT_CAPSULE]`(`AUTONOMY:` 오너 위임 로컬 자율 실행 앵커 포함)을 자동 주입해 Dots 내부 컴팩션에서도 실패 이력과 목표·실행 권한을 잃지 않습니다.
 4. **3-State Phoenix Lifecycle (장기 세션 무손실 릴레이 & 동면):**
    - **Hot Keep-Alive:** 안전한 슬라이스 `wait` 타임아웃마다 `[KEEPALIVE_SLICE_DONE]` 재진입 지시를 출력합니다.
-   - **Planned Phoenix Rollover:** 피로도(`rollover_max_calls`/`bytes`/`age`) 도달 시 `[ROLLOVER_PREPARE]`를 주입하고 `checkpoint --ready-for-rollover` 후 `--wake-cmd`로 새 epoch 워커를 깨워 `agent resume`으로 바통을 넘깁니다.
+   - **Planned Phoenix Rollover & Watchdog Autonomy (v1.2):** 피로도(`rollover_max_calls`/`bytes`/`age`) 도달 시 `[ROLLOVER_PREPARE]`를 주입하고 `checkpoint --ready-for-rollover` 후 `--wake-cmd`로 새 epoch 워커를 깨워 `agent resume`으로 바통을 넘깁니다. v1.2 워치독은 `rollover_ready`를 `stalled`/`lease_expired`보다 우선시하며 `rollover_stalled`를 에스컬레이션하고, `--idle-slot-after-s`(옵트인) 경과 시 유휴 슬롯 `slot_underfilled`/`slot_underfilled_wake` 독립 예산을 발화합니다. 또한 `SPIN_START_CHURN`(연속 start-only 스핀) 및 `wake_failed` 이벤트를 기록하며, `brief` 요약에 `hibernating`/`paused`/`registered`/`idle_completed` 카운트를 함께 표시합니다.
    - **Hibernate + On-Demand Wake:** 장기 유휴 시 `agent hibernate`(`state=hibernating`)로 워치독 오탐 없이 동면하고, 로컬에서 `send`/`steer` 시 `--wake-cmd`로 즉시 기상합니다.
 5. **우회 차단 도구 프록시 (`hub start --enable-tool-proxy` + `contract --enable-tools`) & Git Hook:**
    - Reverse MCP에 `subdots_read`, `subdots_patch`, `subdots_exec`, `subdots_git_status`를 제공해 파일/셸 실행을 허브 게이트 뒤로 통합할 수 있습니다.

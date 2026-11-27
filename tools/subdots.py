@@ -164,7 +164,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 _SECRET_KEY_RE = re.compile(
-    r"(?i)(?:token|(?:api|private|secret|access|signing|auth)[_-]?key|secret|password|passwd|credential|session|bearer)"
+    r"(?i)(?:token|(?:api|private|secret|access|signing|auth)[_-]?key|secret|password|passwd|credential|session|bearer|webhook[_-]?url)"
 )
 _ASSIGN_SECRET_RE = re.compile(
     r"""(?i)\b([A-Za-z0-9_-]{1,96})([ \t]*[=:][ \t]*)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s,;\"']+))"""
@@ -174,7 +174,7 @@ _CLI_SECRET_FLAG_RE = re.compile(
 )
 _SPLIT_SECRET_FLAGS = {
     "--token", "--api-key", "--api_key", "--auth-token", "--auth_token", "--access-token", "--access_token",
-    "--session-token", "--secret", "--password", "--passwd", "--bearer", "--credential",
+    "--session-token", "--session_token", "--secret", "--password", "--passwd", "--bearer", "--credential",
     "--webhook-url", "--webhook_url", "-k", "-p",
 }
 _JSON_SECRET_RE = re.compile(
@@ -201,6 +201,8 @@ REDACT_RULES = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[REDACTED]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b"), "[REDACTED]"),
     (re.compile(r"((?:https?|wss?|postgres(?:ql)?|mysql|redis|mongodb(?:\+srv)?|amqp|ftp)://)[^/\s:@]*:[^/\s@]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{10,}"), "[REDACTED]"),
+    (re.compile(r"https://(?:discord\.com|discordapp\.com)/api/webhooks/[A-Za-z0-9/_-]{10,}"), "[REDACTED]"),
     (re.compile(r"(?i)\b(authorization:\s*(?:bearer|basic|token|apikey|api-key|aws4-hmac-sha256)\s+)[^\s,;]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b((?:bearer|basic|apikey)\s+)[A-Za-z0-9._+/=-]{16,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([?&](?:token|key|secret|password|passwd|auth|access_token|api_key)=)[^&\s]+"), r"\1[REDACTED]"),
@@ -3641,7 +3643,7 @@ class HubCore:
             if ws_root_probe:
                 git_info = inspect_git_workspace(ws_root_probe, base_head=base_head_probe)
 
-        spin_trigger: Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]], int]] = None
+        spin_trigger: Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]], int, str]] = None
         mirror_payload: Optional[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, str]], List[str]]] = None
         deferred_exc: Optional[HubError] = None
         deferred_failed: List[Dict[str, Any]] = []

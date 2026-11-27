@@ -233,7 +233,7 @@ SECRET = re.compile(
 
 
 def _redact_text(value):
-    return SECRET.sub("[REDACTED]", str(value))
+    return SECRET.sub("[REDACTED]", _clean_term(value))
 
 
 def _redact_tree(value):
@@ -1168,16 +1168,16 @@ def board(a):
         flags = f"  [{' '.join(r['flags'])}]" if r["flags"] else ""
         print(f"{_clean_oneline(r['dot'])} {_clean_oneline(r['agent'])}  {_clean_oneline(r['state'] or '-')} {age} "
               f"host={_clean_oneline(_redact_text(r['host'] or '-'))} roster={_clean_oneline(_redact_text(r['roster'] or '-'))} (the root's claim)  "
-              f"{_redact_text(clip(r['task'], 60))}{flags}")
+              f"{clip(_redact_text(r['task'] or ''), 60)}{flags}")
         if r.get("claim_stale"):
-            print(f"    claim: {_redact_text(clip(r['claim_stale'], 140))}")
+            print(f"    claim: {clip(_redact_text(r['claim_stale']), 140)}")
         if r.get("start_churn"):
-            print(f"    churn: {_redact_text(clip(r['start_churn'], 140))}")
+            print(f"    churn: {clip(_redact_text(r['start_churn']), 140)}")
         if r["doing"] or r["next"]:
-            print(f"    doing: {_redact_text(clip(r['doing']))}")
-            print(f"    next:  {_redact_text(clip(r['next']))}")
+            print(f"    doing: {clip(_redact_text(r['doing'] or ''))}")
+            print(f"    next:  {clip(_redact_text(r['next'] or ''))}")
         for b in r["blockers"][:3]:
-            print(f"    block: {_redact_text(clip(b))}")
+            print(f"    block: {clip(_redact_text(b or ''))}")
         if r["mail"]:
             m = r["mail"]
             waiting = (f"; {m['waiting']} waiting (oldest {age_label(m['oldest_waiting_min'])})"
@@ -3011,13 +3011,22 @@ _LOOP_HARD_STOP_RE = re.compile(
 )
 _LOOP_FALSE_REFUSAL_RE = re.compile(
     r"(?is)("
-    r"not\s+explicitly\s+(?:specified|authorized|instructed|permitted)"
+    r"not\s+explicitly\s+(?:specified|authorized|instructed|permitted|mentioned|requested|listed|stated)"
     r"|not\s+(?:expressly|directly)\s+authorized"
-    r"|need(?:s|ed)?\s+(?:owner|user|root)\s+(?:approval|confirmation|permission)"
-    r"|(?:waiting|awaiting)\s+(?:for|on)\s+(?:owner|root|user)"
+    r"|(?:not|isn't|is\s+not|cannot\s+be)\s+(?:from\s+)?(?:the\s+)?(?:direct\s+)?(?:owner|user)\b"
+    r"|(?:only|requires?|needs?|must\s+(?:come|be)|without)\s+(?:direct\s+)?(?:the\s+)?(?:owner|user)(?:'s)?\s+(?:direct\s+)?(?:approval|confirmation|instruction|permission|order|request|chat|message)\b"
+    r"|(?:waiting|awaiting)\s+(?:for|on)\s+(?:the\s+)?(?:owner|root|user)"
+    r"|(?:confirm|verify)\s+with\s+(?:the\s+)?(?:owner|user)\s+(?:directly|first|before)\b"
+    r"|without\s+explicit\s+(?:approval|confirmation|instruction)"
+    r"|(?:tool\s+output|hub\s+message|bridge\s+message|mail\s+message|steering\s+message|local\s+session)\s+(?:cannot|does\s+not|doesn't|never)\s+(?:grant|authorize|authorise|approve)\b"
     r"|no\s+further\s+(?:instruction|action)"
-    r"|명시되지\s*않|직접\s*지시.{0,12}없|재승인|승인\s*미확인|허락.{0,8}필요"
-    r"|오너\s*(?:승인|허락|확인).{0,10}대기|루트\s*(?:지시|승인).{0,10}대기|후속\s*지시.{0,8}없"
+    r"|명시(?:되|돼|되어\s*있|돼\s*있|해\s*주)(?:지|어\s*있지)?\s*않|명시적이지\s*않"
+    r"|명시적(?:으로)?\s*(?:지시|요청|언급|승인|허용|포함|지정)(?:되|돼|되어\s*있|돼\s*있)?(?:지)?\s*않"
+    r"|직접\s*지시.{0,12}없|재승인|승인\s*미확인|허락.{0,8}필요"
+    r"|(?:오너|소유자|사용자|루트)(?:님)?(?:의)?\s*(?:직접\s*)?(?:지시|말|명령|승인|허락|허가|확인)(?:이|가|만|은|는|을)?\s*(?:아니|없|필요|대기|전에는|받아야|요청|후)"
+    r"|(?:오너|소유자|사용자)(?:님|께서)?(?:가|께서)?\s*직접\s*(?:지시|요청|승인|확인|말)(?:하지\s*않|한\s*것이\s*아니|해야)"
+    r"|(?:별도|추가|명시적)(?:인|의)?\s*(?:승인|지시|확인|허가|허락)\s*(?:없이|없이는|필요|전에는)"
+    r"|후속\s*지시.{0,8}없"
     r")"
 )
 _DEFAULT_LOOP_PREAUTHORIZED = (
