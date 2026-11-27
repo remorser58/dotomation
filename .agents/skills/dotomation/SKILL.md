@@ -8,7 +8,7 @@ description: "Route approved Dots goal, ULW/WISH, plan, execute, loop, research 
 ## Mode selection (1: `dots-only` vs 2: `sub-dots`)
 
 Before routing work, identify which mode the user selected (`dots.json` `"mode"` or explicit instruction):
-- **Mode 1 (`dots-only`):** Runs 100% on Dots quota (zero local session quota). Load and obey [`modes/dots-only/RULES.md`](../../../modes/dots-only/RULES.md) — confirm VM vs connected local Mac first, never use Web GPT Agents MCP on a connected local Mac (use native CLI), and execute directly without unnecessary scaffolding.
+- **Mode 1 (`dots-only`):** Runs 100% on Dots quota (zero local session quota). Load and obey [`modes/dots-only/RULES.md`](../../../modes/dots-only/RULES.md) — confirm VM vs connected local Mac first, never use Web GPT Agents MCP on a connected local Mac (use native CLI), and execute directly without unnecessary scaffolding. For multi-track autonomous pipelines without external bridge daemons, use `tools/dots.py loop` (`init`/`enqueue`/`claim`/`progress`/`complete`/`block`/`status` standing Goal Contracts & `--feeds-to` handoffs) and optionally [`tools/dots_pilot.py`](../../../tools/dots_pilot.py) (`research-3track` / `ux-ui-impl-3track` presets, zero personal AI tokens).
 - **Mode 2 (`sub-dots`):** Reverse `web-gpt-agent` direct steering from the local session to Dots sub-agents without routing through the Dots root, using [`tools/subdots.py`](../../../tools/subdots.py) and [`modes/sub-dots/README.md`](../../../modes/sub-dots/README.md) (with optional `.dots-ops/` mirror).
 
 ## Choose the requested behavior

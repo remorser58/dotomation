@@ -3502,7 +3502,15 @@ class TestMode2AutonomyAndWatchdogV12(HubTestBase):
             "--wake-backoff", "0.05",
             "--max-wakes", "2",
             "--idle-slot-after-s", "0.15",
-            "--wake-cmd", json.dumps(["/nonexistent-wake-bin-dotomation", "--token", "SPLIT_SECRET_VALUE_98765", "--agent", "{agent}"]),
+            "--wake-cmd", json.dumps([
+                "/nonexistent-wake-bin-dotomation",
+                "--token", "SPLIT_SECRET_VALUE_98765",
+                "--session_token", "SESSION_SECRET_VALUE_54321",
+                "--webhook_url=https://hooks.example.com/secret123",
+                "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXX",
+                "https://discord.com/api/webhooks/12345/abcdef67890",
+                "--agent", "{agent}",
+            ]),
         ])
         self.register_agent("w-roll", lease_ttl=0.25)
         self.assertEqual(cli_run(["send", "w-roll", "task", "T-R", "--text", "pending work", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
@@ -3545,7 +3553,14 @@ class TestMode2AutonomyAndWatchdogV12(HubTestBase):
                     if e["event_type"] == "wake_triggered"]
         self.assertTrue(wake_evs)
         serialized_fail = json.dumps(wake_evs[0])
-        self.assertNotIn("SPLIT_SECRET_VALUE_98765", serialized_fail)
+        for leaked in (
+            "SPLIT_SECRET_VALUE_98765",
+            "SESSION_SECRET_VALUE_54321",
+            "hooks.example.com/secret123",
+            "T000/B000/XXXXXXXXXXXX",
+            "12345/abcdef67890",
+        ):
+            self.assertNotIn(leaked, serialized_fail)
         self.assertIn("[REDACTED]", serialized_fail)
 
         # Verify brief text includes hibernating=, paused=, registered=

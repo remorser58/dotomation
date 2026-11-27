@@ -3333,6 +3333,47 @@ class LoopTests(Base):
             self.assertEqual(d._redact_text("Basic verification step 1"), "Basic verification step 1")
             self.assertEqual(d._redact_text("Basic dXNlcjpwYXNz"), "[REDACTED]")
             self.assertEqual(d._redact_text("sort_key=priority"), "sort_key=priority")
+            self.assertEqual(d._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
+
+            # Text board() redacts secrets BEFORE clip(..., 60) truncation
+            d.append_line(os.path.join(self.base, "live", "DOT-F", "w2.jsonl"), {
+                "t": d.now(), "agent": "w2", "role": "worker", "model": "m",
+                "project": "rem", "task": ("x" * 45) + " Bearer zzzzzz1111112222223333",
+                "state": "step", "host": "local", "note": "n", "evidence": "e",
+            })
+            board_txt = run(["board", "DOT-F"], self.base)
+            self.assertEqual(board_txt.returncode, 0)
+            self.assertNotIn("zzzzzz", board_txt.stdout)
+            self.assertIn("[REDACTED]", board_txt.stdout)
+
+            # 12) Korean & English false-refusal overrides vs hard-stop preservation in loop block
+            self.assertEqual(run(["loop", "init", "DOT-G", "research", "--project", "rem", "--continuous", "--max-consecutive-blocks", "10", "--objective", "Analyze lectures"], self.base).returncode, 0)
+            for idx, reason in enumerate(("오너 승인 필요하여 실행하지 못함", "사용자 확인 없이 진행 불가", "requires owner approval"), 1):
+                enq_g = run(["loop", "enqueue", "DOT-G", "research", "--title", f"Lec-{idx}"], self.base)
+                iid_g = enq_g.stdout.splitlines()[0].split()[1]
+                self.assertEqual(run(["loop", "claim", "DOT-G", "research", "--agent", "w1"], self.base).returncode, 0)
+                ov = run(["loop", "block", "DOT-G", "research", "--agent", "w1", "--item", iid_g, "--reason", reason], self.base)
+                self.assertEqual(ov.returncode, 0, ov.stderr)
+                self.assertIn("LOOP_AUTONOMY_OVERRIDE", ov.stdout, reason)
+                st_g = d.load_json(os.path.join(self.base, "loops", "DOT-G", "research.state.json"))
+                self.assertIsNotNone(st_g["active"])
+                if idx == 1:
+                    # 2nd false refusal on the SAME item parks it so an endless loop cannot spin
+                    blk2 = run(["loop", "block", "DOT-G", "research", "--agent", "w1", "--item", iid_g, "--reason", "오너 승인 필요하여 실행하지 못함"], self.base)
+                    self.assertEqual(blk2.returncode, 0, blk2.stderr)
+                    self.assertIn("LOOP_BLOCKED", blk2.stdout)
+                else:
+                    comp_g = run(["loop", "complete", "DOT-G", "research", "--agent", "w1", "--item", iid_g, "--summary", "Analyzed", "--evidence", f"notes/lec{idx}.md"], self.base)
+                    self.assertEqual(comp_g.returncode, 0, comp_g.stderr)
+
+            for hidx, hreason in enumerate(("원격 푸시 승인 필요", "원본 영상 파일 누락으로 진행 불가"), 1):
+                enq_h = run(["loop", "enqueue", "DOT-G", "research", "--title", f"Hard-{hidx}"], self.base)
+                iid_h = enq_h.stdout.splitlines()[0].split()[1]
+                self.assertEqual(run(["loop", "claim", "DOT-G", "research", "--agent", "w1"], self.base).returncode, 0)
+                hard_blk = run(["loop", "block", "DOT-G", "research", "--agent", "w1", "--item", iid_h, "--reason", hreason], self.base)
+                self.assertEqual(hard_blk.returncode, 0, hard_blk.stderr)
+                self.assertIn("LOOP_BLOCKED", hard_blk.stdout)
+                self.assertNotIn("LOOP_AUTONOMY_OVERRIDE", hard_blk.stdout)
 
             # 11) Reserved 'loops' rejected in loop init and planted loops/mail does not deadlock tick done
             self.assertEqual(run(["loop", "init", "DOT-E", "t-res", "--project", "loops", "--objective", "Bad"], self.base).returncode, 2)

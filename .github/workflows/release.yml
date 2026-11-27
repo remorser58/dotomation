@@ -32,15 +32,17 @@ jobs:
           import re
           from dots import VERSION as DOTS_VERSION
           from subdots import VERSION as SUBDOTS_VERSION
+          from dots_pilot import VERSION as PILOT_VERSION
 
           tag = os.environ["TAG"]
           if (
               tag != f"v{DOTS_VERSION}"
               or SUBDOTS_VERSION != DOTS_VERSION
+              or PILOT_VERSION != DOTS_VERSION
               or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", DOTS_VERSION)
           ):
               raise SystemExit(
-                  f"Tag {tag!r} must match v{DOTS_VERSION} (dots={DOTS_VERSION!r}, subdots={SUBDOTS_VERSION!r})"
+                  f"Tag {tag!r} must match v{DOTS_VERSION} (dots={DOTS_VERSION!r}, subdots={SUBDOTS_VERSION!r}, pilot={PILOT_VERSION!r})"
               )
           PY
       - run: python3 -m unittest discover -s tools
@@ -67,7 +69,9 @@ jobs:
           PY
           sha256sum tools/dots.py | sed 's#tools/##' > tools/dots.py.sha256
           sha256sum tools/subdots.py | sed 's#tools/##' > tools/subdots.py.sha256
+          sha256sum tools/dots_pilot.py | sed 's#tools/##' > tools/dots_pilot.py.sha256
+          sha256sum tools/dots_monitor.py | sed 's#tools/##' > tools/dots_monitor.py.sha256
           # a re-run after a failed upload finds the release already there: create it only once,
           # then upload (or replace) all assets so the set always matches this commit
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --verify-tag --generate-notes
-          gh release upload "$TAG" tools/dots.py tools/dots.py.sha256 tools/subdots.py tools/subdots.py.sha256 --clobber
+          gh release upload "$TAG" tools/dots.py tools/dots.py.sha256 tools/subdots.py tools/subdots.py.sha256 tools/dots_pilot.py tools/dots_pilot.py.sha256 tools/dots_monitor.py tools/dots_monitor.py.sha256 --clobber
