@@ -21,7 +21,7 @@ The dot's sub-agent threads cannot be read from outside the dot, so each agent k
 | `goal` | What the assignment is for, inside the coordinator's brief. At most 500 characters. |
 | `doing` | What the agent is doing now. At most 500 characters. |
 | `next` | The next concrete step. At most 500 characters. |
-| `decisions` | `{t, text}` choices the agent made on this task, oldest first. A choice reserved for the owner or the coordinator is asked for, not recorded here as made. |
+| `decisions` | `{t, text}` choices the agent made on this task, oldest first. Make routine, reversible implementation choices autonomously and record them here; ask only for consequential hard-stop or irreversible choices. |
 | `blockers` | Open blockers, each naming the missing fact or capability. Empty when none; never empty while `state` is `blocked`. |
 
 No secrets, credentials, tokens, personal identifiers, raw logs or unrelated source text, as in every other record in the shared folder.
@@ -48,4 +48,4 @@ One tick replaces three separate calls (append the line, rewrite the memory, rea
 - It is the agent's own summary, like the live record. It is not a `submit`, a `check`, gate evidence or a closure, and it does not prove the agent did what `doing` says. [Monitoring](monitoring.md) still compares claims with real tool activity.
 - When the memory and the live log disagree, the newer live line is the record; the board shows `MEMO-BEHIND` unless that line is `done`, since a finished agent owes no memory.
 - It is not a message route. A `next` that mentions another agent does not reach that agent; mail or the native exchange does.
-- It is files in the shared folder on `local`: no service, watcher, scheduler, hook, dashboard or telemetry. The route grants nothing; the owner's approval for that dot is the only grant.
+- It is files in the shared folder on `local`: no service, watcher, scheduler, hook, dashboard or telemetry. Memory files themselves are read-only status records, not external-action approvals; owner-authenticated `subdots.py` Hub steering carries delegated owner authority, while unsigned `.dots-ops/` direct-mail remains bounded by coordinator-assigned workspace scope.

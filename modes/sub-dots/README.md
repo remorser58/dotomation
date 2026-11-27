@@ -38,13 +38,14 @@ Dots 본체(루트 채팅)를 경유해 대화를 중계하지 않으며, **하�
 1. **Hard Steering Gate (`--strict-steering` / 계약 기본 활성):**
    - 미확인 `steer`/`task`/`review`/`question`이 있으면 `agent exec`, gated tools(`subdots_read`/`patch`/`exec`), 다음 `step`을 `409 STEERING_ACK_REQUIRED`로 기계적으로 차단합니다.
    - `send`/`steer --require-readback` 메시지는 `--readback "<바뀐 방침 1줄>"` 없이는 ACK 자체가 거부(`400 READBACK_REQUIRED`)됩니다.
-   - **Sandwich Injection:** `[HARNESS_INTERVENTION]`·`[STEERING_INPUT]`은 상단에, `[ACTIVE_STEERING_FOOTER]`는 긴 출력 하단에 반복 출력합니다.
+   - **Sandwich Injection:** `[HARNESS_INTERVENTION]`·`[STEERING_INPUT]`(인증된 오너 위임 `AUTHORITY: OWNER-DELEGATED LOCAL SESSION` 헤더 포함)은 상단에, `[ACTIVE_STEERING_FOOTER]`는 긴 출력 하단에 반복 출력합니다.
+   - **Anti-False-Refusal Guard (`autonomy_guard`, 기본 활성):** 워커가 `reply block`/`question` 또는 `step blocked`에서 "오너/사용자 직접 지시가 아님/비신뢰 허브·도구 출력" 또는 "명시되지 않아 실행 불가" 같은 허위 거부를 내면(단 `git push`/PR/배포/파괴적 삭제/`.git`/심볼릭링크/결제/Codex/자격증명·호스트 확인 누락/`SCOPE_VIOLATION`/외부 비신뢰 입력 프롬프트 인젝션 및 `question`의 일반 기술 질문은 예외로 보존), 로컬 수신함 전달은 유지하면서 `false_refusal_detected` 이벤트를 기록하고 `[AUTONOMY_DIRECTIVE]`를 즉시 반환합니다. `reply`와 `step`은 `spin_window_s` 창 내 **통합 카운터**를 공유하며, 1차 허위 거부는 부모 메시지 `answered` 처리와 스핀 초기화 없이(`UNANSWERED_WORK` 유지) CLI `agent reply`가 대기 hang 없이 즉시 복귀(`auto_resume=True`)해 작업 재개를 강제하고, 창 내 누적 2회차 진입 시 `escalated=True`로 전환되어 `--notify-cmd`를 1회 트리거합니다.
 2. **Owner-Pinned Contract & Verified Done Gate (`subdots.py contract set`):**
    - 오너만 설정하는 계약에 `goal`, `--workspace`, `--allow-path`, `--forbid-path`, `--forbid-cmd`, `--allow-cmd-prefix`, `--require-check`, `--rollover-max-calls`, `--idle-hibernate`를 고정합니다.
    - `agent step done` 시 허브가 **실제 `git status` 변경 파일 범위(`409 SCOPE_VIOLATION`)** 와 **마지막 편집 이후 `required_checks` 통과 여부(`409 VERIFICATION_REQUIRED`)** 를 검증합니다.
 3. **Context Capsule & Dead-Ends (`agent checkpoint` / `agent resume`):**
    - `agent checkpoint`로 `phase`, `remaining`, `verified_facts`, **`dead_ends`(누적 저장)**, `next_action`을 SQLite에 영구 보존합니다.
-   - `register`/`resume`, `wait` 기상, `steer` 차단, 매 N회 호출마다 `[CONTEXT_CAPSULE]`을 자동 주입해 Dots 내부 컴팩션에서도 실패 이력과 목표를 잃지 않습니다.
+   - `register`/`resume`, `wait` 기상, `steer` 차단, 매 N회 호출마다 `[CONTEXT_CAPSULE]`(`AUTONOMY:` 오너 위임 로컬 자율 실행 앵커 포함)을 자동 주입해 Dots 내부 컴팩션에서도 실패 이력과 목표·실행 권한을 잃지 않습니다.
 4. **3-State Phoenix Lifecycle (장기 세션 무손실 릴레이 & 동면):**
    - **Hot Keep-Alive:** 안전한 슬라이스 `wait` 타임아웃마다 `[KEEPALIVE_SLICE_DONE]` 재진입 지시를 출력합니다.
    - **Planned Phoenix Rollover:** 피로도(`rollover_max_calls`/`bytes`/`age`) 도달 시 `[ROLLOVER_PREPARE]`를 주입하고 `checkpoint --ready-for-rollover` 후 `--wake-cmd`로 새 epoch 워커를 깨워 `agent resume`으로 바통을 넘깁니다.
