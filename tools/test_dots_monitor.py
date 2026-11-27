@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -878,6 +879,270 @@ class TestWatchDedup(unittest.TestCase):
         self.assertIn("WORKING", table)
         self.assertIn("activity local", table)
         self.assertIn("writer", table)
+
+
+class TestDaemonHealthStartChurnAndLargeRoster(unittest.TestCase):
+    def test_large_roster_parses_within_cap_and_oversized_reports_explicit_error(self):
+        big_actors = [
+            {"agent": f"a-{i}", "occupies_slot": True, "slot_state": "working", "pad": "x" * 280}
+            for i in range(900)
+        ]
+        roster_big = {"updated_at": dm.iso(NOW), "slots_total": 900, "slots_unassigned": 1, "actors": big_actors}
+        big_bytes = len(json.dumps(roster_big).encode("utf-8"))
+        self.assertGreater(big_bytes, 262144)
+        self.assertLess(big_bytes, 1048576)
+
+        cfg = base_config()
+        cfg["limits"]["roster_max_bytes"] = 1048576
+        snapshot, _, errors = snapshot_for({"DOT-A": {"a-0.jsonl": record(agent="a-0")}},
+                                           activity_text=log_line(1), roster=roster_big, config=cfg)
+        self.assertFalse(any(e.get("source") == "roster" for e in errors), errors)
+        self.assertEqual(snapshot["dots"]["DOT-A"]["roster"]["slots"], 900)
+
+        cfg_small = base_config()
+        cfg_small["limits"]["roster_max_bytes"] = 2048
+        snapshot2, _, errors2 = snapshot_for({"DOT-A": {"a-0.jsonl": record(agent="a-0")}},
+                                             activity_text=log_line(1), roster=roster_big, config=cfg_small)
+        roster_errs = [e["detail"] for e in errors2 if e.get("source") == "roster"]
+        self.assertTrue(roster_errs and "exceeds 2048 bytes" in roster_errs[0], roster_errs)
+        self.assertNotIn("not JSON", " ".join(roster_errs))
+        self.assertEqual(snapshot2["dots"]["DOT-A"]["roster"]["slots"], 0)
+
+    def test_daemon_health_script_detection_false_positive_filter_and_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "wgpt data")
+            sess_dir = os.path.join(data_dir, "sessions", "s1")
+            os.makedirs(sess_dir, exist_ok=True)
+            ev_path = os.path.join(sess_dir, "events.jsonl")
+
+            # Use current UTC timestamps so both POSIX find -mmin and _analyze_daemon_session_text accept them.
+            now_dt = dm.utcnow()
+            now_s = dm.iso(now_dt)
+            real_rejection = (
+                "Rejected exec call: `cmd`: CreateProcess { message: "
+                '"too many retained terminal sessions (limit 64); close one before starting another" }'
+            )
+            fake_grep_ok = {
+                "ts": now_s,
+                "type": "tool_result",
+                "call": {
+                    "outcome": "ok",
+                    "result": {"text": "grep match:\n" + real_rejection},
+                },
+            }
+            benign_false = {"ts": now_s, "type": "status", "chat_error": False}
+            real_limit = {
+                "ts": now_s,
+                "type": "tool_result",
+                "call": {
+                    "outcome": "tool_rejected",
+                    "result": {"text": real_rejection},
+                },
+            }
+            real_chat_err = {"ts": now_s, "type": "chat_error", "message": "upstream 502"}
+
+            Path(ev_path).write_text(
+                "\n".join(json.dumps(x) for x in (fake_grep_ok, benign_false)) + "\n",
+                encoding="utf-8",
+            )
+            nonce = dm.new_nonce()
+            script = dm.daemon_health_script([data_dir], 65536, 10, 30, nonce)
+            sh_check = subprocess.run(["/bin/sh", "-n"], input=script, text=True, capture_output=True)
+            self.assertEqual(sh_check.returncode, 0, sh_check.stderr)
+
+            class LocalOnlyTransport(dm.Transport):
+                def run(self, host, sc):
+                    if "==DIR " in sc:
+                        return super().run("local", sc)
+                    if "==DOT " in sc:
+                        return ledger_dump({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}}, nonce=NONCE_RE.search(sc).group(1)), None
+                    return activity_dump([log_line(1)], nonce=NONCE_RE.search(sc).group(1)), None
+
+            cfg = base_config()
+            cfg["activity"] = [{"dot": "DOT-A", "host": "local", "label": "osaka\nbad", "path": os.path.join(data_dir, "app.log")}]
+            cfg["daemon_health"] = {"enabled": True, "window_minutes": 30, "max_session_files": 10, "tail_bytes": 65536}
+            tr = LocalOnlyTransport()
+
+            # 1) Benign chat_error: false and outcome="ok" quoting the rejection must NOT trigger alerts.
+            snap_clean = dm.build_snapshot(cfg, tr, now_dt, [])
+            dh_clean = snap_clean["dots"]["DOT-A"]["daemon_health"]["osaka\nbad"]
+            self.assertEqual(dh_clean["sessions_scanned"], 1)
+            self.assertEqual(dh_clean["retained_limit_hits"], 0)
+            self.assertEqual(dh_clean["chat_error_hits"], 0)
+
+            # 2) Appending real tool_rejected limit + real chat_error triggers ALERT + events once.
+            with open(ev_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(real_limit) + "\n")
+                fh.write(json.dumps(real_chat_err) + "\n")
+            prev = {"agents": {}, "activity": {}, "errors": set(), "daemon_health": {}}
+            snap_bad = dm.build_snapshot(cfg, tr, now_dt, [])
+            dh_bad = snap_bad["dots"]["DOT-A"]["daemon_health"]["osaka\nbad"]
+            self.assertEqual(dh_bad["retained_limit_hits"], 1)
+            self.assertEqual(dh_bad["retained_limit"], 64)
+            self.assertEqual(dh_bad["chat_error_hits"], 1)
+
+            table = dm.render_table(snap_bad)
+            self.assertIn("ALERT daemon osaka bad", table)
+            self.assertIn("retained_limit_hits=1 limit=64 chat_errors=1", table)
+
+            evs1, st1 = dm.diff_events(prev, snap_bad)
+            ev_names1 = [e["event"] for e in evs1]
+            self.assertIn("DOTS_DAEMON_LIMIT", ev_names1)
+            self.assertIn("DOTS_CHAT_ERROR", ev_names1)
+
+            evs_dup, st2 = dm.diff_events(st1, snap_bad)
+            self.assertEqual([e["event"] for e in evs_dup], [])
+
+            # 3) Clearing errors triggers DOTS_DAEMON_RECOVERED.
+            Path(ev_path).write_text(json.dumps(benign_false) + "\n", encoding="utf-8")
+            snap_rec = dm.build_snapshot(cfg, tr, now_dt, [])
+            evs_rec, _ = dm.diff_events(st2, snap_rec)
+            self.assertIn("DOTS_DAEMON_RECOVERED", [e["event"] for e in evs_rec])
+
+    def test_start_churn_detection_render_and_diff_event(self):
+        churn_lines = "\n".join([
+            record(agent="churner", minutes_ago=25, state="start", task="t1"),
+            record(agent="churner", minutes_ago=18, state="start", task="t2"),
+            record(agent="churner", minutes_ago=10, state="start", task="t3"),
+        ])
+        healthy_lines = "\n".join([
+            record(agent="healthy", minutes_ago=25, state="start", task="h1"),
+            record(agent="healthy", minutes_ago=15, state="step", task="h1"),
+            record(agent="healthy", minutes_ago=5, state="start", task="h2"),
+        ])
+        snap, _, _ = snapshot_for(
+            {"DOT-A": {"churner.jsonl": churn_lines, "healthy.jsonl": healthy_lines}},
+            activity_text=log_line(1),
+        )
+        r = rows(snap)
+        self.assertTrue(r["churner"]["start_churn"])
+        self.assertFalse(r["healthy"]["start_churn"])
+        table = dm.render_table(snap)
+        self.assertIn("warn: START-CHURN", table)
+
+        prev = {"agents": {}, "activity": {}, "errors": set(), "daemon_health": {}}
+        evs, st = dm.diff_events(prev, snap)
+        self.assertEqual([e["agent"] for e in evs if e["event"] == "DOTS_START_CHURN"], ["churner"])
+        evs2, _ = dm.diff_events(st, snap)
+        self.assertFalse(any(e["event"] == "DOTS_START_CHURN" for e in evs2))
+
+    def test_daemon_health_exact_sessions_dir_truncation_and_transient_carryforward(self):
+        now_dt = datetime(2026, 11, 22, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sess_root = os.path.join(tmp, "custom_sessions")
+            for idx in range(3):
+                sdir = os.path.join(sess_root, "sess-%d" % idx)
+                os.makedirs(sdir, exist_ok=True)
+                p = os.path.join(sdir, "events.jsonl")
+                # Also make one session file unreadable on non-root, or exercise chat-message false-positive ignore
+                if idx == 0:
+                    line = json.dumps({"ts": dm.iso(now_dt), "type": "response_item", "payload": {
+                        "type": "message",
+                        "content": "too many retained terminal sessions (limit 64); close one before starting another",
+                    }})
+                    Path(p).write_text(line + "\n", encoding="utf-8")
+                else:
+                    Path(p).write_text(json.dumps({
+                        "ts": dm.iso(now_dt), "type": "tool_result",
+                        "call": {"outcome": "tool_rejected",
+                                 "result": {"text": '`: CreateProcess { message: "too many retained terminal sessions (limit 64); close one before starting another" }'}},
+                    }) + "\n", encoding="utf-8")
+
+            class LocalTransport(dm.Transport):
+                def run(self, host, sc):
+                    if "==DIR " in sc:
+                        return super().run("local", sc)
+                    if "==DOT " in sc:
+                        return ledger_dump({"DOT-A": {"writer.jsonl": record(minutes_ago=5)}}, nonce=NONCE_RE.search(sc).group(1)), None
+                    return activity_dump([log_line(1)], nonce=NONCE_RE.search(sc).group(1)), None
+
+            cfg = base_config()
+            cfg["activity"] = [{
+                "dot": "DOT-A", "host": "local",
+                "label": "act\x1b[31m\nlab",
+                "path": os.path.join(tmp, "app.log"),
+                "sessions_dir": sess_root,
+            }]
+            # Clamp check: tail_bytes=0 / max_session_files=0 still emit safe positive script bounds
+            clamped_sh = dm.daemon_health_script([tmp], 0, 0, 0, dm.new_nonce())
+            self.assertIn('[ "$n" -le 1 ]', clamped_sh)
+            self.assertIn("limit=${4:-1}", clamped_sh)
+            self.assertIn("-mmin -1", clamped_sh)
+            # Clamp max_session_files=2 with normal tail_bytes so 3 session dirs triggers truncated_scan + reads events
+            cfg["daemon_health"] = {"enabled": True, "window_minutes": 30, "max_session_files": 2, "tail_bytes": 65536}
+            errs = []
+            snap = dm.build_snapshot(cfg, LocalTransport(), now_dt, errs)
+            dh = snap["dots"]["DOT-A"]["daemon_health"]["act\x1b[31m\nlab"]
+            self.assertTrue(dh["truncated_scan"])
+            table = dm.render_table(snap)
+            self.assertIn("ALERT daemon act lab", table)
+            self.assertIn("(truncated >max_files)", table)
+            self.assertNotIn("\x1b[31m", table)
+
+            # evidence_refs must reject '..' traversal segments
+            bad_refs1, _ = dm.evidence_refs("https://github.com/owner/../commits/abc1234")
+            self.assertEqual([r["kind"] for r in bad_refs1], ["invalid"])
+            bad_refs2, _ = dm.evidence_refs("https://github.com/owner/repo/commit/..")
+            self.assertEqual([r["kind"] for r in bad_refs2], ["invalid"])
+
+            # diff_events preserves previous["daemon_health"] when transient daemon_health error occurs
+            evs1, st1 = dm.diff_events({"agents": {}, "activity": {}, "errors": set(), "daemon_health": {}}, snap)
+            self.assertIn("DOTS_DAEMON_LIMIT", [e["event"] for e in evs1])
+            transient_snap = {
+                "generated_at": dm.iso(now_dt),
+                "errors": [{"source": "daemon_health", "host": "local", "detail": "ssh timeout"}],
+                "dots": {
+                    "DOT-A": {
+                        "agents": snap["dots"]["DOT-A"]["agents"],
+                        "activity": {},
+                        "daemon_health": {},
+                    }
+                },
+            }
+            evs2, st2 = dm.diff_events(st1, transient_snap)
+            self.assertFalse(any(e["event"] == "DOTS_DAEMON_RECOVERED" for e in evs2))
+            self.assertIn(("DOT-A", "act\x1b[31m\nlab"), st2["daemon_health"])
+
+            # Empty activity[] still honors daemon_health.sessions_dir and partial error carries forward failing host only
+            cfg_empty_act = base_config()
+            cfg_empty_act["activity"] = []
+            cfg_empty_act["daemon_health"] = {
+                "enabled": True, "sessions_dir": sess_root,
+                "window_minutes": 30, "max_session_files": 20, "tail_bytes": 65536,
+            }
+            snap_empty = dm.build_snapshot(cfg_empty_act, LocalTransport(), now_dt, [])
+            self.assertIn("local-sessions", snap_empty["dots"]["DOT-A"]["daemon_health"])
+
+            prev_multi = {
+                "agents": {}, "activity": {}, "errors": set(),
+                "daemon_health": {
+                    ("DOT-A", "h1"): {"retained": True, "chat": False},
+                    ("DOT-A", "h2"): {"retained": True, "chat": False},
+                },
+            }
+            partial_snap = {
+                "generated_at": dm.iso(now_dt),
+                "errors": [{"source": "daemon_health", "host": "h2", "detail": "ssh timeout"}],
+                "dots": {
+                    "DOT-A": {
+                        "agents": {},
+                        "activity": {},
+                        "daemon_health": {
+                            "h1": {"retained_limit_hits": 0, "chat_error_hits": 0},
+                        },
+                    }
+                },
+            }
+            evs_m, st_m = dm.diff_events(prev_multi, partial_snap)
+            rec = [e for e in evs_m if e["event"] == "DOTS_DAEMON_RECOVERED"]
+            self.assertEqual([e["detail"]["source"] for e in rec], ["h1"])
+            self.assertIn(("DOT-A", "h2"), st_m["daemon_health"])
+
+            # load_config clamps non-positive thresholds.stall_minutes to >= 1
+            bad_cfg_path = os.path.join(tmp, "stall_zero.json")
+            Path(bad_cfg_path).write_text(json.dumps({"thresholds": {"stall_minutes": 0}}) + "\n", encoding="utf-8")
+            loaded_zero = dm.load_config(bad_cfg_path)
+            self.assertEqual(loaded_zero["thresholds"]["stall_minutes"], 1)
 
 
 if __name__ == "__main__":

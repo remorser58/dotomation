@@ -30,9 +30,44 @@
 - **Coding Philosophy:** 계획/RFC/승인 게이트/래퍼/감독 하네스 같은 불필요한 절차적 스캐폴딩을 추가하지 않고 요청된 작업부터 바로 시작해 최소한의 완전한 변경만 수행합니다.
 - **Safety & Core Operating Instructions:** 실제 사용자/운영자 흐름으로 검증하고, 관련 없는 기존 작업은 보존하며, 파괴적 작업이나 push/merge/release/deploy 전에는 명시적 승인을 받습니다.
 
-## 선택적 읽기 도구
+## 멀티트랙 자율 루프 (Dots 본체 개입 최소화)
 
-`dots-only` 모드에서도 필요하면 오너 측에서 다음 도구를 선택적으로 실행할 수 있습니다.
+외부 AI 세션(`subdots.py`) 없이 **1번 모드(`dots-only`)만으로** 연구 → 온톨로지/명세 → 구현·문항 제작 같은 2~3트랙 파이프라인을 멈춤 없이 돌리려면 [`tools/dots.py`](../../tools/dots.py)의 `loop` 하네스를 사용합니다.
 
-- **실제 작업 확인 (읽기 전용):** `python3 tools/dots_monitor.py --config <config> snapshot` ([모니터링](../../workflows/monitoring.md))
-- **빈 슬롯 유지 감시 (오너 전용):** `python3 tools/dots.py watch --keep-full <DOT> --idle-cmd '<argv JSON>'`
+```bash
+# 1) 상시 목표 계약(Goal Contract) 및 트랙 파이프라인 초기화 (외부 세션 0)
+python3 tools/dots.py loop init REM17 research --project kice --continuous \
+  --feeds-to ontology --objective "Analyze lecture videos and items sequentially; extract verified units"
+python3 tools/dots.py loop init REM17 ontology --project kice --continuous \
+  --feeds-to authoring --objective "Formalize verified insight units into ontology rules"
+python3 tools/dots.py loop init REM17 authoring --project kice --continuous \
+  --objective "Implement and test generation algorithms from ontology rules" --gate UNIT_TESTS
+
+# 2) 각 서브에이전트 루프 (본체 보고 없이 순차·자율 완주):
+#    claim [--wait 1800] -> 로컬 가역 작업 직접 수행 -> progress -> complete (자동 다음 트랙 인계) -> 즉시 다음 claim
+#    단건 입력 누락/하드 스톱만 `loop block`으로 격리하고 다른 비차단 작업으로 바로 건너뜀(skip-blocked).
+```
+
+## 선택적 읽기·감시 도구
+
+`dots-only` 모드에서도 오너 측에서 다음 도구를 선택적으로 실행할 수 있습니다.
+
+- **실제 작업·데몬 건전성 확인 (읽기 전용):** `python3 tools/dots_monitor.py --config <config> snapshot --daemon-health` ([모니터링](../../workflows/monitoring.md))
+- **빈 슬롯·중단 없는 루프 감시 (오너 전용):** `python3 tools/dots.py watch --keep-full <DOT> --fill-cmd '<argv JSON>' --idle-cmd '<argv JSON>'` (로스터가 120분 이상 오래되면 live 기록 기준으로 빈/정체 레인을 판별하고, 실패한 깨우기도 `--wake-retries`만큼 재시도)
+
+## 단일 저장소 제로 토큰 파일럿 (`tools/dots_pilot.py`)
+
+Cataly나 개인 AI 토큰 기반 코디네이터 없이 이 저장소만으로 Mode 1 파이프라인 초기화·감시·깨우기를 자동화할 수 있습니다(`python3` 표준 라이브러리만 사용, 비공개 상태는 `~/.dotomation-pilot` `0700`/`0600`):
+
+```bash
+# 1) 연구->온톨로지->제작 3트랙(KICE형) 또는 UX->UI->구현 3트랙(REMORSWARM형) 초기화
+python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset research-3track
+# 또는: python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset ux-ui-impl-3track
+
+# 2) 환경·권한·SHA-256 핀 점검 및 1회 파일럿 틱 실행
+python3 tools/dots_pilot.py doctor
+python3 tools/dots_pilot.py once
+
+# 3) 필요 시 소유자가 직접 launchd/systemd 유닛 템플릿 출력 (자동 설치 안 함)
+python3 tools/dots_pilot.py render-service --target launchd
+```

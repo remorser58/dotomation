@@ -48,6 +48,15 @@ The 30 minutes are `thresholds.stall_minutes` (or `--stall-minutes`); the legend
 
 On a [direct mail](direct-mail.md) task, a `done` or `step` that cites a SHA not yet published to GitHub is `UNPROVEN` by design until the main session publishes it. For that window, read the agent's newest `result` and the main session's `review` or `answer` in `mail/<agentId>/` to tell a pending handover from bad evidence.
 
+## Daemon Health (`--daemon-health`) & Large Rosters
+
+- `limits.roster_max_bytes` defaults to `1048576` (1 MiB), separate from `limits.tail_bytes` (`262144`), so large coordinator `roster.json` files are read intact without truncation; rosters exceeding `roster_max_bytes` report an explicit size error instead of `"not JSON"`.
+- Passing `--daemon-health` on `snapshot` or `watch` (or setting `"daemon_health": {"enabled": true}`) extends the read-only scan to `<data_dir>/sessions/*/events.jsonl` (or an explicit `daemon_health.sessions_dir`) modified within `window_minutes` (default 30, bounded by `max_session_files=20` and `tail_bytes=131072`):
+  - **Retained terminal session exhaustion:** matches the exact suffix signature emitted when a Web GPT Agent daemon hits its retained terminal session cap (`too many retained terminal sessions`), without false-positiving on commands that merely grep or mention the string (`DOTS_DAEMON_LIMIT` in `watch`, `ALERT daemon` in `snapshot`).
+  - **Chat errors:** counts recent `chat_error` events (`DOTS_CHAT_ERROR` in `watch`), and emits `DOTS_DAEMON_RECOVERED` when cleared. Note: `build_snapshot` does not auto-restart or modify daemon processes; opt-in cooldown-guarded restarts belong strictly to [`tools/dots_pilot.py`](../tools/dots_pilot.py) when explicitly enabled by the owner.
+  - **`START-CHURN`:** `snapshot` flags consecutive `start`-only thrash without `step`/`done`, and `watch` emits `DOTS_START_CHURN`.
+- **Retained-session self-heal pattern:** If an external operator daemon monitor restarts a unit on retained-session exhaustion, guard it with a non-blocking single-instance file lock (`flock -n`) and a per-unit cooldown window (e.g. >=10 minutes) so dropped SSH connections never leave duplicate killers racing the daemon.
+
 ## What the activity counts do and do not prove
 
 They are per **account and host**, not per agent. A dot whose account is calling tools is really working; the count cannot say which sub-agent made the call. That is why the class needs both halves: the record names the agent and the task, the request count shows the account was alive at that time. Two dots on the same account share the count; the config keeps them separate by log path.

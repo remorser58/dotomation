@@ -4,7 +4,7 @@ Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하
 
 | 선택 | 모드 | 누구의 쿼터를 쓰나 | 핵심 목적 | 문서 / 도구 |
 |---|---|---|---|---|
-| **1번** | **`dots-only`** | **Dots 자체 쿼터만** (로컬 쿼터 0) | 로컬 세션 개입 없이 Dots가 VM/연결 맥 판별·네이티브 CLI·최소 변경 원칙으로 끝까지 완주 | [modes/dots-only/README.md](modes/dots-only/README.md) · [RULES.md](modes/dots-only/RULES.md) · [BRIEF.md](modes/dots-only/BRIEF.md) |
+| **1번** | **`dots-only`** | **Dots 자체 쿼터만** (로컬 쿼터 0) | 로컬 세션 개입 없이 Dots가 VM/연결 맥 판별·네이티브 CLI·`dots.py loop` 멀티트랙 자율 파이프라인으로 끝까지 완주 | [modes/dots-only/README.md](modes/dots-only/README.md) · [RULES.md](modes/dots-only/RULES.md) · [BRIEF.md](modes/dots-only/BRIEF.md) |
 | **2번** | **`sub-dots`** | 로컬 메인 세션 + Dots 서브에이전트 | `web-gpt-agent`의 정반대 방향(로컬 세션 → 로컬 허브 → Dots 서브에이전트)으로 **Dots 본체를 경유하지 않고** 직접 실시간 스티어링·중단·죽음/헛돌기 감시 | [modes/sub-dots/README.md](modes/sub-dots/README.md) · [`tools/subdots.py`](tools/subdots.py) · [PROTOCOL.md](modes/sub-dots/PROTOCOL.md) |
 
 ---
@@ -29,13 +29,26 @@ Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하
 
 로컬 세션이 Dot 본체를 거치지 않고 Dots 서브에이전트에게 일을 보내고, 작업 도중 방향을 바꾸고, 결과를 돌려받게 하는 키트다. 실시간 대화가 아니라 공유 폴더 우편함으로 주고받는 비실시간 스티어링이다. 여기에 서브에이전트가 그 우편을 놓치지 않고 이어서 일하게 붙잡아 두는 서브에이전트 하네스(규칙·대기·기록·메모리·감시)를 함께 둔다.
 
-실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 예외는 소유자가 요청한 도구들뿐이다: 읽기 전용 점검 도구 `tools/dots_monitor.py`([모니터링](workflows/monitoring.md)), 공유 폴더 우편·대기 도구 `tools/dots.py`([직통 우편](workflows/direct-mail.md#steering-send-wait-reply)), 그리고 2번 모드(`sub-dots`) 역방향 브릿지·감시 하네스 `tools/subdots.py`([`sub-dots`](modes/sub-dots/README.md), [AGENTS.md](AGENTS.md))는 모두 표준 라이브러리만 사용한다.
+실행 프로그램이나 OMP 확장이 아니다. 셸, 서비스, 계정, 별도 큐, 패키지 설치가 필요 없다. 예외는 소유자가 요청한 도구들뿐이다: 읽기 전용 점검 도구 `tools/dots_monitor.py`([모니터링](workflows/monitoring.md)), 공유 폴더 우편·대기·루프 도구 `tools/dots.py`([직통 우편](workflows/direct-mail.md#steering-send-wait-reply)), 개인 AI 토큰 없이 단일 저장소에서 Mode 1 멀티트랙 루프를 자동 구동·감시하는 `tools/dots_pilot.py`([`dots-only`](modes/dots-only/README.md#단일-저장소-제로-토큰-파일럿-toolsdots_pilotpy)), 그리고 2번 모드(`sub-dots`) 역방향 브릿지·감시 하네스 `tools/subdots.py`([`sub-dots`](modes/sub-dots/README.md), [AGENTS.md](AGENTS.md))는 모두 표준 라이브러리만 사용한다.
+
+### 제로 AI 토큰 단일 저장소 부트스트랩 (`tools/dots_pilot.py`)
+
+Cataly 같은 외부 LLM 코디네이터나 개인 AI 토큰 없이 이 저장소 하나만으로 Mode 1 멀티트랙 루프를 바로 세팅·운용할 수 있습니다(`tools/dots-pilot.example.json` 참고):
+
+```bash
+python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset research-3track
+# 또는 UX -> UI -> 구현 3트랙:
+python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset ux-ui-impl-3track
+python3 tools/dots_pilot.py doctor
+python3 tools/dots_pilot.py once        # 1회 점검·깨우기(단일 인스턴스 flock + nonce 인증 sentinel)
+python3 tools/dots_pilot.py render-service --target launchd  # 서비스 파일 출력만 (자동 설치 없음)
+```
 
 ## 핵심 1: 본체 중계 없는 비실시간 스티어링
 
 서브에이전트의 대화는 Dot 밖에서 읽거나 쓸 수 없다. 그래서 로컬 메인 세션과 서브에이전트가 Dot 본체 채팅을 거치지 않고 `local`의 공유 폴더 우편함 `<work root>/.dots-ops/<project>/mail/<agentId>/`으로 직접 주고받는다.
 
-- 보내기: 메인 세션이 `python3 tools/dots.py send <project> <agentId> <kind> <task>`(본문은 stdin)로 지시·답·리뷰를 넣는다. (공유 `.dots-ops/` 우편함은 서명 없는 채널이므로 조정자가 배정한 작업공간 범위 내 후속 작업·가역적 로컬 단계·`rev/*` 로컬 커밋을 바로 실행하고 범위 밖·하드 스톱은 거부한다. 오너 인증 직접 제어는 2번 모드 `tools/subdots.py` Hub를 사용한다)
+- 보내기: 메인 세션이 `python3 tools/dots.py send <project> <agentId> <kind> <task>`(본문은 stdin)로 지시·답·리뷰를 넣는다. (`live`, `memory`, `listen`, `watch`, `loops`는 예약 디렉터리이므로 프로젝트명으로 쓸 수 없다. 공유 `.dots-ops/` 우편함은 서명 없는 채널이므로 조정자가 배정한 작업공간 범위 내 후속 작업·가역적 로컬 단계·`rev/*` 로컬 커밋을 바로 실행하고 범위 밖·하드 스톱은 거부한다. 오너 인증 직접 제어는 2번 모드 `tools/subdots.py` Hub를 사용한다)
 - 받기: 서브에이전트는 `python3 tools/dots.py wait <DOT> <agentId>`로 기다리다가 대기 중이면 1초 안에, 작업 중이면 다음 `tick`에서 받는다. 그래서 작업 도중에도 방향을 바꿀 수 있다.
 - 돌려주기: 서브에이전트는 `reply`로 `result`·`question`·`block`을 보내고 같은 대기로 이어져 메인 세션의 `answer`·`review`를 받는다. 메인 세션은 `inbox`/`read`로 확인한다.
 - 본체는 깨우기만 한다: 에이전트가 대기 중이 아니고 20분 동안 답·읽음 표시·새 기록 줄이 없을 때만 메인 세션이 본체 채팅에 한 줄을 보내고, 본체는 그 에이전트를 깨우기만 한다.
@@ -79,7 +92,7 @@ Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하
 - 맡은 작업이 없는 서브에이전트는 턴을 끝내지 않고 `dots.py wait <DOT> <agentId>`로 55분간 대기한다. 메인 세션이 `dots.py send`로 보내면 그 줄이 1초 안에 출력되고 `wait`가 끝나므로, 조정자가 깨우지 않아도 다음 지시가 작업 도중에 들어간다. `wait`는 출력한 줄을 읽음으로 표시하므로 같은 지시가 두 번 오지 않고, 시간 초과(exit 3)면 `step`을 남기고 다시 대기하며, 신호로 끊기면(exit 4) 다시 대기한다. 대기 자체는 비용이 없지만 세션 폴링이 최대 5분에 한 번 모델 호출이고, 매 폴링은 그 에이전트의 우편함을 디스크에서 다시 읽는다. 작업을 넘길 때도 같은 대기다: `reply`는 `result`·`question`·`block`을 쓰고 계속 기다려 답을 출력하며(`--no-wait`로 끌 수 있다), 답할 우편이 남아 있으면 `tick done`이 거부된다: [직통 우편](workflows/direct-mail.md#steering-send-wait-reply).
 - 오너가 정한 프로젝트(메인 세션 `<project>-main`)에서는 메인 세션이 Dot 본체를 거치지 않고 `local`의 공유 폴더 `<work root>/.dots-ops/<project>/mail/<agentId>/` 우편함으로 서브에이전트와 직접 주고받는다. 메인 세션은 `dots.py send`로 보내고 `inbox`/`read`로 답을 확인하며, 서브에이전트는 `reply`로 답한다. 서브에이전트는 코드를 GitHub에 올리지 않는다. push 경로가 승인된 작업 공간이면 프로젝트의 rev-out 저장소에 `rev/*` 커밋을 push 하고, 아니면 커밋을 그 자리에 두고 `local:<작업 경로>`로 적는다. 메인 세션은 자기 환경에서 게이트별로 검증한 뒤 GitHub에 올리고 PR을 연다. 조정자는 수락 답이 온 최신 결과만 닫는다. 에이전트는 `result`를 보낼 때 `done`을 남기고, 수락 답이 오면 그 답과 GitHub에 올린 SHA를 인용한 `done`을 한 줄 더 남긴다. 에이전트가 대기 중이 아니고, 답도 읽음 표시도 새 live 줄도 없이 20분이 지나면 메인 세션이 본체 채팅에 한 줄을 보내고, 본체는 그 에이전트를 깨우기만 한다: [직통 우편함](workflows/direct-mail.md), [mail-v1](protocol/mail-v1.schema.json).
 - Dot 루트를 신뢰할 수 없는 경우를 기준으로 만들었다. 메모리 파일이 아직 없는 에이전트의 첫 `dots.py` 명령은 규칙을 먼저 출력하고(루트가 브리핑을 붙이지 않아도 된다), 답할 우편이 남아 있으면 `tick done`을 거부하며, `dots.py board`의 `MAIL_WAITING`·`CLAIM-STALE`은 로스터가 아니라 우편·기록 줄·대기 표시에서만 나온다. 로스터 값은 `roster=<상태> (the root's claim)`으로만 보여 준다. 오너는 `dots.py watch --loop 5 --expect-sha256 <dots.py의 sha256>`을 직접 띄워 둘 수 있다(명령·간격·장부 경로는 `--wake-cmd`·`--notify-cmd`·`--after-min`·`--notify-after-min`·`--state`로 직접 주면 `dots.json`보다 우선한다: 그 파일은 루트가 쓸 수 있는 폴더에 있고, 실행마다 `WATCH_CONFIG` 한 줄이 값의 출처를 밝힌다): 답이 필요한 우편을 찾아 `after_min`(기본 10분) 뒤 한 번 깨우고, 그 뒤 `notify_after_min`(기본 20분)이 지나도 답이 없으면(읽었든 아니든) 한 번 알리고, 알릴 차례인데 notify 명령이 없으면 `WATCH_ERROR`를 남긴다. 다시 켜도 두 번 울리지 않도록 자기 장부를 `watch/state.json`에 두고, 동작마다 `WATCH_WAKE`·`WATCH_NOTIFY`·`WATCH_STUCK`·`WATCH_HELD`·`WATCH_SKIP`·`WATCH_RESOLVED`·`WATCH_TOOL_CHANGED`·`WATCH_ERROR` 한 줄을 출력하며, 읽음 표시가 찍힌 우편도 답이 없으면 `WATCH_STUCK`을 남기고 알림을 건너뛰지 않는다. 한계는 분명하다: 끝난 서브에이전트를 다시 띄우는 것은 Dot 루트만 할 수 있으므로 `watch`는 설정된 wake 명령을 실행하고, 없으면 `WATCH_ERROR`로 말한다: [Dot 루트를 신뢰할 수 없을 때](workflows/direct-mail.md#if-the-dot-root-is-not-trusted).
-- 오너는 `watch --keep-full REM17`처럼 명령줄로만 감시 대상 Dot을 지정한다(플래그 반복 가능). `board`와 `board --json`의 `free`는 미배정 슬롯(`unassigned`)과 자리를 차지했지만 로스터의 `slot_state`가 `blocked*`, `awaits*`, `*_hold`, `waiting`, `idle`인 슬롯(`parked`)의 합이며 `total`과 함께 표시된다. 로스터에 명시된 수가 없으면 `actors[].occupies_slot`에서 계산하며, 둘 다 없으면 점유 여부가 표시된 전체 actor 수를 전체 슬롯 수로 본다. 판정할 수 없는 값은 미확인이다. 처음 관측한 시각을 장부에 보존하며 `--fill-after-min`(기본 10분)이 지나면 `WATCH_UNDERFILLED`에 `parked` 수와 `parked_agents`를 출력하고 오너가 설정한 `--idle-cmd`를 coordinator 대상으로만 호출한다. 계속 비면 `--rewake-min` 간격(keep-full 기본 10분, 일반 idle 깨우기 기본 120분)으로 반복한다. 억제하면 `WATCH_SKIP`, 미배정과 parked가 모두 0이 되면 `WATCH_FILLED`를 한 번 출력한다. 감시기는 이 판정으로 슬롯을 재배정하거나 로스터·보류를 바꾸지 않는다.
+- 오너는 `watch --keep-full REM17`처럼 명령줄로만 감시 대상 Dot을 지정한다(플래그 반복 가능). `board`와 `board --json`의 `free`는 미배정 슬롯(`unassigned`)과 자리를 차지했지만 로스터의 `slot_state`가 `blocked*`, `awaits*`, `*_hold`, `waiting`, `idle`인 슬롯(`parked`)의 합이며 `total`과 함께 표시된다. 로스터에 명시된 수가 없으면 `actors[].occupies_slot`에서 계산하며, 둘 다 없으면 점유 여부가 표시된 전체 actor 수를 전체 슬롯 수로 본다. 판정할 수 없는 값은 미확인이다. 로스터가 `--roster-fresh-min`(기본 120분) 이상 오래되었거나 갱신 시각이 손상되면 `live/<DOT>/*.jsonl` 및 잔여 미배정 슬롯 기준으로 빈 레인을 판별한다(허위 `WATCH_FILLED` 금지). `--fill-after-min`(기본 10분)이 지나면 `WATCH_UNDERFILLED`에 `parked` 수와 `parked_agents`를 출력하고, 활성 루프 트랙(`loops/<DOT>/`)의 `LOOP_IDLE`·`LOOP_STALLED`까지 포함해 오너가 설정한 `--fill-cmd`(미지정 시 `--idle-cmd`)를 호출한다. 실패 시 `--wake-retries`(기본 3회)까지 재시도하고, `--idle-max-age-min`으로 오래된 정체 깨우기를 건너뛸 수 있다. 계속 비면 `--rewake-min` 간격(keep-full 기본 10분, 일반 idle 깨우기 기본 120분)으로 반복한다. 억제하면 `WATCH_SKIP`, 미배정과 parked가 모두 0이 되면 `WATCH_FILLED`를 한 번 출력한다. 감시기는 이 판정으로 슬롯을 재배정하거나 로스터·보류를 바꾸지 않는다.
 - VM 작업은 단계마다 `local`에 체크포인트를 남긴다. 리셋이 의심되면 `state:"blocked"`, `note:"vm reset suspected"`로 남기고, 복구는 마지막 확정 체크포인트의 다음 단계 하나부터 진행한다: [VM watchdog](workflows/vm-watchdog.md).
 - 기록은 자기 보고다. 실제로 일하는지는 `python3 tools/dots_monitor.py --config <인스턴스 설정> snapshot`으로 본다(설정 파일은 `tools/dots-monitor.example.json`을 저장소 밖에 복사해 채운다). 각 에이전트의 마지막 기록과 그 계정의 Web GPT Agent 데몬 요청 수(15분·60분)를 맞대고, 기록의 증거 링크(PR·커밋·이슈·댓글·CI 실행)가 GitHub에 실제로 있는지 확인해 WORKING·QUIET·STALLED·BLOCKED·DONE·UNPROVEN·LEGACY로 나눈다. `watch --interval 60`은 상태가 바뀔 때만 `DOTS_STALLED` 같은 한 줄을 출력한다. 읽기만 하며 기록을 고치거나 Dot에 메시지를 보내거나 작업을 배정하지 않는다: [모니터링](workflows/monitoring.md).
 

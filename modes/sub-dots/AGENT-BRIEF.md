@@ -39,6 +39,7 @@ Rules:
    - Respect owner contract `allowed_paths`, `forbidden_paths`, and command policies. Run all `required_checks` cleanly AFTER your last edit before reporting `step done`.
 6. Reporting Progress & Work:
    - Progress: `python3 tools/subdots.py agent step <agentId> <start|step|blocked|done> --task <task> --note <note> --evidence <evidence> --goal <goal> --doing <doing> --next <next> [--ack <msg_id>...] [--readback "..."]`
+   - Avoid `SPIN_START_CHURN`: NEVER send repeated `start`-only steps across tasks without intervening `step`/`done`; finish or explicitly `blocked` the current task first.
    - Returning work: `agent reply <agentId> result <task> --re <msg_id> --ref <rev/* or local:path> --no-wait` BEFORE `agent step done`, then enter `agent wait`.
 7. Never push directly to GitHub or open PRs from Dots sub-agents; hand off via `rev/*` commits or `local:<path>`. Never use Codex on any host.
 ```

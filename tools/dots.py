@@ -50,10 +50,10 @@ Readers (read-only):
 
 Owner side (the dot root is not trusted):
   dots.py watch [--loop MINUTES] [--expect-sha256 HEX] [--wake-cmd ARGV] [--notify-cmd ARGV]
-      [--after-min N] [--notify-after-min N] [--state PATH] [--idle-cmd ARGV] [--rewake-min N]
-      [--blocked-after-min N] [--dot ID]... [--keep-full DOT]... [--fill-after-min N]
-      [--recovery-script PATH --recovery-sha256 HEX
-      --ledger DOT=DIR...]   --loop 0 (the default) runs once
+      [--after-min N] [--notify-after-min N] [--state PATH] [--idle-cmd ARGV] [--fill-cmd ARGV]
+      [--rewake-min N] [--blocked-after-min N] [--dot ID]... [--keep-full DOT]...
+      [--fill-after-min N] [--roster-fresh-min N] [--wake-retries N] [--idle-max-age-min N]
+      [--recovery-script PATH --recovery-sha256 HEX --ledger DOT=DIR...]   --loop 0 runs once
       For every inbox line that still owes an answer and whose agent holds no live wait marker:
       after `after_min` minutes run the wake argv once; if the line is still unanswered
       `notify_after_min` minutes later, run the notify argv once. A message counts as owed until
@@ -62,32 +62,34 @@ Owner side (the dot root is not trusted):
       (`argv`, `dots.json`, `default`), and the flags win, because dots.json sits in the folder the
       dot root writes. The ledger defaults to <base>/watch/state.json; --state keeps it elsewhere.
       The ledger may only add a line: a record that suppresses a step prints WATCH_SKIP. Other
-      lines are WATCH_WAKE, WATCH_NOTIFY, WATCH_STUCK, WATCH_RESOLVED, WATCH_TOOL_CHANGED and
-      WATCH_ERROR. --expect-sha256 compares this file's own bytes each run: the shared folder is
-      writable by the dot root, the command line is not.
+      lines are WATCH_WAKE, WATCH_WAKE_GAVE_UP, WATCH_NOTIFY, WATCH_STUCK, WATCH_RESOLVED,
+      WATCH_START_CHURN, WATCH_TOOL_CHANGED and WATCH_ERROR. --expect-sha256 compares this file's
+      own bytes each run: the shared folder is writable by the dot root, the command line is not.
       A marker counts as a waiter only with a `until` between now and a day out, so a marker naming
       a live local pid with a plausible `until` is the one case the tool cannot tell from a real
       wait; workflows/direct-mail.md says how to check it.
       With --idle-cmd (command line only) each run also reads the board: a STALLED or CLAIM-STALE
-      row runs the idle argv, again every `rewake_min` minutes while the same line stays; a BLOCKED
-      row runs it once per blocked line and prints one WATCH_BLOCKED_OPEN after `blocked_after_min`.
-      A roster report is printed once as WATCH_ROSTER_STALE. With --recovery-script, a working
-      host=vm line in a dot whose ledger (read through the pinned script's inspect()) has no
-      unfinished job is printed once as WATCH_VM_UNREGISTERED. Lines: WATCH_IDLE, WATCH_BLOCKED_OPEN,
-      WATCH_ROSTER_STALE, WATCH_VM_UNREGISTERED. Every run writes heartbeat.json beside the ledger;
-      `board` reports it when it is older than max(15 minutes, three loops).
-      --keep-full DOT (repeatable, command line only) tracks free slots: unassigned plus parked.
-      Parked means a roster actor occupies a slot but has a blocked*, awaits*, *_hold, waiting
-      or idle slot_state. After --fill-after-min (default 10), WATCH_UNDERFILLED lists the parked
-      actors and runs --idle-cmd for the coordinator, not for those actors. Repeats every
-      --rewake-min while underfilled (keep-full default 10; ordinary idle-wake default still 120).
-      WATCH_FILLED ends the episode once; the ledger keeps the first observation across restarts.
-      Board shows free, unassigned, parked and total counts even without monitoring. No roster
-      or hold is changed, and unknown counts are not proof of a full roster.
+      row runs the idle argv (unless older than --idle-max-age-min), again every `rewake_min` minutes
+      while the same line stays; a BLOCKED row runs it once per blocked line and prints one
+      WATCH_BLOCKED_OPEN after `blocked_after_min`. Consecutive start-only churn prints
+      WATCH_START_CHURN once per streak. A roster report is printed once as WATCH_ROSTER_STALE.
+      With --recovery-script, a working host=vm line in a dot whose ledger (read through the pinned
+      script's inspect()) has no unfinished job is printed once as WATCH_VM_UNREGISTERED.
+      Every run writes heartbeat.json beside the ledger; `board` reports it when older than
+      max(15 minutes, three loops).
+      --keep-full DOT (repeatable, command line only) tracks free slots (unassigned plus parked)
+      and any initialized `dots.py loop` tracks for that dot. When roster.json is older than
+      --roster-fresh-min (default 120m) it falls back to live/<DOT>/*.jsonl lanes plus valid
+      unassigned slots; idle/stalled loop tracks emit WATCH_LOOP_IDLE / WATCH_LOOP_STALLED.
+      Coordinator rings use --fill-cmd (or --idle-cmd by default) with bounded --wake-retries.
+      See also `tools/dots_pilot.py` for zero-AI-token 24/7 autonomous operation from this repo.
+
+Self-driving multi-track loops (Mode 1 `dots-only`, zero external session):
+  dots.py loop <init|enqueue|claim|progress|complete|block|pause|resume|status> ...
 
 Setup (once per machine; idempotent, adds only):
-  dots.py init [--base DIR] [--dot ID]... [--project ID=MAIN]... [--host LABEL=PURPOSE]...
-      [--wake-cmd ARGV-JSON] [--notify-cmd ARGV-JSON] [--yes]
+  dots.py init [--mode 1|dots-only|2|sub-dots] [--base DIR] [--dot ID]... [--project ID=MAIN]...
+      [--host LABEL=PURPOSE]... [--wake-cmd ARGV-JSON] [--notify-cmd ARGV-JSON] [--yes]
       Interactive when stdin is a terminal, scriptable with the flags otherwise. Writes
       <base>/dots.json, live/<DOT>/, memory/<DOT>/ and <project>/mail/, then prints the brief
       to paste to each dot root. Never deletes or rewrites an existing record or entry.
@@ -125,7 +127,7 @@ MAX_JSONL_BYTES = 16 * 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 4096
 LOCK_TIMEOUT_S = 5.0
-RESERVED_OPS_DIRS = ("live", "memory", "listen", "watch")
+RESERVED_OPS_DIRS = ("live", "memory", "listen", "watch", "loops")
 _TERM_CTRL_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b]"
 )
@@ -133,6 +135,47 @@ _TERM_CTRL_RE = re.compile(
 
 def _clean_term(value):
     return _TERM_CTRL_RE.sub("", str(value))
+
+
+def _clean_oneline(value):
+    return re.sub(r"[\r\n]+", " ", _clean_term(value)).strip()
+
+
+def _safe_int(value, default=0, minimum=None):
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        out = value
+    elif isinstance(value, str) and re.fullmatch(r"\s*[+-]?\d+\s*", value):
+        out = int(value)
+    else:
+        return default
+    if minimum is not None and out < minimum:
+        return default
+    return out
+
+
+def _check_no_symlink_under(base, path):
+    """Refuse any symlink along segments strictly below `base` so root cannot redirect writes outside BASE."""
+    base_abs = os.path.abspath(base)
+    target_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(target_abs, base_abs)
+    except ValueError:
+        return
+    if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+        return
+    cur = base_abs
+    for part in rel.split(os.sep):
+        if not part or part == ".":
+            continue
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+            if stat.S_ISLNK(st.st_mode):
+                raise OSError(f"{cur} is a symlink under {base_abs}")
+        except FileNotFoundError:
+            break
 
 
 def default_base():
@@ -154,11 +197,17 @@ TO_MAIN = ("ack", "answer", "question", "result", "block", "note")
 NEEDS_ANSWER = ("task", "question", "review")   # an inbox kind that owes an out.jsonl line with re=id
 REPLY_WAITS = ("result", "question", "block")   # an agent's reply that keeps the command open for the answer
 STALL_MIN = 30
+WAIT_STALL_MIN = 65        # active `dots.py wait` defaults to 55m (3300s) + 10m slack
+ROSTER_FRESH_MIN = 120     # older roster.json triggers live-lane fallback in keep-full
+LIVE_LANE_WINDOW_MIN = 360 # 6h live-lane fallback horizon beyond occupying roster actors
+START_CHURN_WINDOW_MIN = 60
+START_CHURN_MIN = 3
+DEFAULT_WAKE_RETRIES = 3
 # dots.json "watch": {...} overrides; the command line overrides both
 WATCH_DEFAULTS = {"after_min": 10, "notify_after_min": 20, "rewake_min": 120, "blocked_after_min": 120}
 HEARTBEAT_MIN = 15  # a watchdog heartbeat older than max(this, 3 loops) is reported on the board
 ROSTER_DONE = ("done", "idle", "free", "closed", "finished")  # a claim the live line can disprove
-PLACEHOLDER = re.compile(r"\{(project|agent|id|dot|age|task|state|why)\}")
+PLACEHOLDER = re.compile(r"\{(project|agent|id|dot|age|task|state|why|lanes|track)\}")
 MAX_TEXT = 500      # goal, doing, next
 MAX_ITEM = 300      # one decision or blocker
 MAX_DECISIONS = 20  # newest kept; the full history is the live log
@@ -168,9 +217,34 @@ WAKE_TIMEOUT = 25   # one wake command, once, never retried; under the connector
 LISTEN_MAX_S = 86400  # a listen marker that claims a longer wait than this is not evidence of a waiter
 LISTEN_SLACK_S = 3600  # the reader's clock may lag the waiter's, so that cap is judged with slack
 SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-                    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY"
-                    r"|Bearer\s+[A-Za-z0-9._~+/-]{20,})")
+SECRET = re.compile(
+    r"(sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+    r"|(?i:\bBearer\s+[A-Za-z0-9._~+/-]{16,}|Authorization:\s*Basic\s+[A-Za-z0-9._+/=-]{8,})"
+    r"|\b(?i:Basic)\s+(?=[A-Za-z0-9+/=]{8,}\b)(?:(?=[A-Za-z0-9+/=]*[0-9+/=])|(?=[A-Za-z0-9+/=]{12,}\b)(?=[A-Za-z0-9+/=]*[A-Z])(?=[A-Za-z0-9+/=]*[a-z]))[A-Za-z0-9+/=]{8,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r"|https?://[^/\s:@]+:[^/\s@]+@"
+    r"|https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{10,}"
+    r"|https://(?:discord\.com|discordapp\.com)/api/webhooks/[A-Za-z0-9/_-]{10,}"
+    r"|(?i:\b(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|webhook[_-]?url)\s*[:=]\s*[\"']?[^\s\"',;]{6,})"
+    r"|(?i:[?&](?:token|key|api_key|access_token|secret|password|auth|sig|signature)=[^&\s]+))"
+)
+
+
+def _redact_text(value):
+    return SECRET.sub("[REDACTED]", str(value))
+
+
+def _redact_tree(value):
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {(_redact_text(k) if isinstance(k, str) else k): _redact_tree(v) for k, v in value.items()}
+    return value
+
 
 def die(msg):
     print(f"dots: {msg}", file=sys.stderr)
@@ -207,7 +281,7 @@ def text(name, value, limit=None):
         die(f"--{name} must be one non-empty line")
     if limit and len(value) > limit:
         die(f"--{name} is {len(value)} characters; keep it under {limit}")
-    if SECRET.search(value):
+    if SECRET.search(value) or SECRET.search(_clean_term(value)):
         die(f"--{name} looks like it contains a secret; leave it out")
     return value.strip()
 
@@ -215,7 +289,7 @@ def block(name, value):
     """Mail text: several lines are allowed, an empty or whitespace-only body is not."""
     if not isinstance(value, str) or not value.strip():
         die(f"{name} on stdin is empty")
-    if SECRET.search(value):
+    if SECRET.search(value) or SECRET.search(_clean_term(value)):
         die(f"{name} looks like it contains a secret; leave it out")
     return value.strip("\r\n")
 
@@ -263,6 +337,11 @@ def skipped_lines(path, count):
 def open_raw(path):
     """An open descriptor for reading, or None. O_NONBLOCK + O_NOFOLLOW + fstat(S_ISREG) prevent
     blocking on a FIFO or following a symlink planted by a hostile writer."""
+    try:
+        _check_no_symlink_under(BASE, path)
+    except OSError as exc:
+        unreadable(path, exc)
+        return None
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | nofollow)
@@ -421,10 +500,15 @@ def base_glob(*parts):
     here; each caller escapes its own variable part."""
     return glob.glob(os.path.join(glob.escape(BASE), *parts))
 
+def _ensure_dir_under(root, path):
+    _check_no_symlink_under(root, path)
+    os.makedirs(path, exist_ok=True)
+
+
 def ensure_dir(path):
-    """Create a folder the tool writes into, or exit 2 when the root left a file in its place."""
+    """Create a folder the tool writes into, or exit 2 when the root left a file or symlink in its place."""
     try:
-        os.makedirs(path, exist_ok=True)
+        _ensure_dir_under(BASE, path)
     except OSError as exc:
         die(f"cannot create {path} ({exc.__class__.__name__})")
 
@@ -434,7 +518,10 @@ def str_list(value):
 
 def mailboxes(agent):
     token("agent", agent)
-    return sorted(d for d in base_glob("*", "mail", glob.escape(agent)) if os.path.isdir(d))
+    return sorted(
+        d for d in base_glob("*", "mail", glob.escape(agent))
+        if os.path.isdir(d) and project_of(d) not in RESERVED_OPS_DIRS
+    )
 
 def answered_ids(outbox):
     """Ids that a line in `outbox` answers. Only a string `re` can match an inbox id, so a line the
@@ -476,6 +563,7 @@ def waiting_on(box):
 
 def _open_parent_dir_nofollow(parent):
     d = parent or "."
+    _check_no_symlink_under(BASE, d)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     o_dir = getattr(os, "O_DIRECTORY", 0)
     dfd = os.open(d, os.O_RDONLY | o_dir | nofollow | os.O_NONBLOCK)
@@ -611,16 +699,22 @@ def append_unique(path, msg):
         os.fsync(fh.fileno())
 
 def show_mail(project, m, tag):
-    re_ = f" re={_clean_term(m['re'])}" if m.get("re") else ""
-    refs = [_clean_term(x) for x in m["refs"] if isinstance(x, str)] if isinstance(m.get("refs"), list) else []
+    re_ = f" re={_clean_oneline(_redact_text(m['re']))}" if m.get("re") else ""
+    refs = [_clean_oneline(_redact_text(x)) for x in m["refs"] if isinstance(x, str)] if isinstance(m.get("refs"), list) else []
     refs = f" refs={','.join(refs)}" if refs else ""
-    print(f"{tag} {_clean_term(project)} {_clean_term(m.get('id'))} {_clean_term(m.get('t'))} "
-          f"{_clean_term(m.get('from'))} kind={_clean_term(m.get('kind'))} task={_clean_term(m.get('task'))}{re_}{refs}")
-    print(f"    {_clean_term(m.get('text', ''))}")
+    print(f"{tag} {_clean_oneline(_redact_text(project))} {_clean_oneline(_redact_text(m.get('id')))} "
+          f"{_clean_oneline(_redact_text(m.get('t')))} {_clean_oneline(_redact_text(m.get('from')))} "
+          f"kind={_clean_oneline(_redact_text(m.get('kind')))} "
+          f"task={_clean_oneline(_redact_text(m.get('task')))}{re_}{refs}")
+    print(f"    {_clean_term(_redact_text(m.get('text', '')))}")
 
 @contextlib.contextmanager
 def dot_lock(live_dir):
     """Serialize ticks per dot by locking the dot's live folder itself, so no lock file is ever created."""
+    try:
+        _check_no_symlink_under(BASE, live_dir)
+    except OSError as exc:
+        die(f"cannot lock {live_dir}: {exc}")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     o_dir = getattr(os, "O_DIRECTORY", 0)
     fd = os.open(live_dir, os.O_RDONLY | o_dir | nofollow | os.O_NONBLOCK)
@@ -653,6 +747,8 @@ def tick_locked(a, dot, agent, live_dir):
         if not v:
             die(f"--{f} is required: {agent} has no earlier v1 line to take it from")
         line[f] = text(f, v)
+    if line["project"] in RESERVED_OPS_DIRS:
+        die(f"bad project {line['project']!r}: reserved ops folder")
     line["task"] = text("task", a.task)
     line["state"] = a.state
     line["host"] = text("host", a.host)
@@ -691,10 +787,14 @@ def tick_locked(a, dot, agent, live_dir):
         if owed:
             out = [f"dots: done refused: {agent} still owes an answer to {len(owed)} message(s)"]
             for project, m in owed:
-                out.append(f"  {m.get('id')} {project} kind={m.get('kind')} task={m.get('task')}")
+                out.append(
+                    f"  {_clean_oneline(_redact_text(m.get('id')))} {_clean_oneline(_redact_text(project))} "
+                    f"kind={_clean_oneline(_redact_text(m.get('kind')))} "
+                    f"task={_clean_oneline(_redact_text(m.get('task')))}"
+                )
             project, m = owed[0]
-            out.append(f"  answer it: python3 {os.path.abspath(__file__)} reply {project} {agent} result "
-                       f"{json.dumps(m.get('task'), ensure_ascii=False)} --re {m.get('id')} "
+            out.append(f"  answer it: python3 {os.path.abspath(__file__)} reply {_clean_oneline(_redact_text(project))} {agent} result "
+                       f"{json.dumps(_clean_oneline(_redact_text(m.get('task'))), ensure_ascii=False)} --re {_clean_oneline(_redact_text(m.get('id')))} "
                        f"--ref <what it is about>")
             out.append("  that reply stays open and prints the main session's answer, so it is the way out; "
                        "nothing was written")
@@ -772,6 +872,120 @@ def roster_capacity(roster):
             free = total - used
     return (free, total) if 0 <= free <= total else (None, None)
 
+def roster_coordinator(roster):
+    """Return the validated coordinator agent id from top-level `coordinator` or unique occupying coordinator actor."""
+    if not isinstance(roster, dict):
+        return None
+    if "coordinator" in roster and roster["coordinator"] is not None:
+        coord = roster["coordinator"]
+        return coord if isinstance(coord, str) and TOKEN.fullmatch(coord) else None
+    actors = roster.get("actors")
+    if not isinstance(actors, list):
+        return None
+    coords = set()
+    for actor in actors:
+        if not isinstance(actor, dict) or actor.get("occupies_slot") is not True:
+            continue
+        role = str(actor.get("role") or "").strip().lower()
+        name = actor.get("agent") or actor.get("agent_id") or actor.get("id")
+        if role == "coordinator" and isinstance(name, str) and TOKEN.fullmatch(name):
+            coords.add(name)
+    return next(iter(coords)) if len(coords) == 1 else None
+
+
+def detect_start_churn(lines, window_min=START_CHURN_WINDOW_MIN, min_starts=START_CHURN_MIN):
+    """Flag consecutive recent start lines with no intervening step/done/blocked line."""
+    if not lines:
+        return None
+    count = 0
+    tasks = set()
+    for ln in reversed(lines):
+        if ln.get("state") != "start":
+            break
+        age = age_min(ln.get("t"))
+        if age is None or age < -5 or age > window_min:
+            break
+        count += 1
+        tval = str(ln.get("task") or "").strip()
+        if tval:
+            tasks.add(tval)
+    if count >= min_starts and (len(tasks) >= 2 or count >= min_starts + 1):
+        return f"{count} consecutive start lines ({len(tasks)} task(s)) in {window_min}m without step/done"
+    return None
+
+
+def live_lane_summary(dot, coordinator=None, fill_after_min=10, window_min=LIVE_LANE_WINDOW_MIN, roster_doc=None):
+    """Classify worker lanes from live/<dot>/*.jsonl (occupying roster actors + recent live files)."""
+    out = {"empty": [], "parked": [], "stalled": [], "busy": []}
+    live_dir = os.path.join(BASE, "live", dot)
+    if not os.path.isdir(live_dir):
+        return out
+    coord_names = {coordinator} if coordinator else set()
+    roster_meta = {}
+    if isinstance(roster_doc, dict) and isinstance(roster_doc.get("actors"), list):
+        for actor in roster_doc["actors"]:
+            if not isinstance(actor, dict):
+                continue
+            name = actor.get("agent") or actor.get("agent_id") or actor.get("id")
+            if not isinstance(name, str) or not TOKEN.fullmatch(name):
+                continue
+            role = str(actor.get("role") or "").strip().lower()
+            if role == "coordinator":
+                coord_names.add(name)
+                continue
+            if actor.get("occupies_slot") is True and name not in roster_meta:
+                roster_meta[name] = str(actor.get("slot_state") or "").strip().lower()
+    agents = set(roster_meta)
+    try:
+        entries = os.listdir(live_dir)
+    except OSError:
+        entries = []
+    for fname in entries:
+        if not fname.endswith(".jsonl"):
+            continue
+        agent = fname[:-6]
+        if not TOKEN.fullmatch(agent) or agent in coord_names:
+            continue
+        if agent in agents:
+            continue
+        path = os.path.join(live_dir, fname)
+        lines = v1_lines(path)
+        if not lines:
+            continue
+        age = age_min(lines[-1]["t"])
+        if age is not None and 0 <= age <= window_min:
+            agents.add(agent)
+    for agent in sorted(agents - coord_names):
+        live_path = os.path.join(live_dir, f"{agent}.jsonl")
+        lines = v1_lines(live_path) if os.path.exists(live_path) else []
+        last = lines[-1] if lines else None
+        if last is None:
+            rstate = roster_meta.get(agent, "")
+            if rstate.startswith(("blocked", "awaits")) or rstate.endswith("_hold") or rstate == "waiting":
+                out["parked"].append(agent)
+            elif rstate in ROSTER_DONE:
+                out["empty"].append(agent)
+            elif rstate:
+                out["stalled"].append(agent)
+            continue
+        age = age_min(last["t"])
+        state = last["state"]
+        if state == "done":
+            if age is None or age >= fill_after_min:
+                out["empty"].append(agent)
+            else:
+                out["busy"].append(agent)
+        elif state == "blocked":
+            out["parked"].append(agent)
+        else:
+            eff_stall = WAIT_STALL_MIN if listen_state(agent) is not None else STALL_MIN
+            if age is None or age > eff_stall:
+                out["stalled"].append(agent)
+            else:
+                out["busy"].append(agent)
+    return out
+
+
 def roster_slot_summary(roster):
     unassigned, total = roster_capacity(roster)
     actors = (roster or {}).get("actors")
@@ -805,7 +1019,11 @@ def board_rows(dots):
             continue
         mem_dir = os.path.join(BASE, "memory", dot)
         roster_doc = load_json(os.path.join(live_dir, "roster.json"))
-        slots[dot] = roster_slot_summary(roster_doc)
+        slot_info = roster_slot_summary(roster_doc)
+        r_age = age_min(roster_doc.get("updated_at")) if isinstance(roster_doc, dict) else None
+        slot_info["roster_age_min"] = None if r_age is None else round(r_age)
+        slot_info["live_lanes"] = live_lane_summary(dot, coordinator=roster_coordinator(roster_doc), roster_doc=roster_doc)
+        slots[dot] = slot_info
         roster, dropped = roster_states(roster_doc)
         if dropped:
             errors.append({"dot": dot, "error": f"roster.json: {dropped} slot(s) without a valid agent id skipped"})
@@ -816,9 +1034,11 @@ def board_rows(dots):
             names += sorted(f[:-5] for f in os.listdir(mem_dir) if f.endswith(".json") and f[:-5] not in names and TOKEN.match(f[:-5]))
         for agent in names:
             live_path = os.path.join(live_dir, f"{agent}.jsonl")
-            last = (v1_lines(live_path) or [None])[-1]
+            lines = v1_lines(live_path)
+            last = (lines or [None])[-1]
             mem = load_json(os.path.join(mem_dir, f"{agent}.json"))
             age = age_min(last["t"]) if last else None
+            listener = listen_state(agent)
             flags = []
             if not last:
                 flags.append("NO-LIVE")
@@ -828,8 +1048,13 @@ def board_rows(dots):
                     flags.append("STALLED")
             elif last["state"] == "blocked":
                 flags.append("BLOCKED")
-            elif last["state"] in ("start", "step") and age is not None and age > STALL_MIN:
-                flags.append("STALLED")
+            elif last["state"] in ("start", "step") and age is not None:
+                effective_stall = WAIT_STALL_MIN if listener is not None else STALL_MIN
+                if age > effective_stall:
+                    flags.append("STALLED")
+            churn = detect_start_churn(lines)
+            if churn:
+                flags.append("START-CHURN")
             if last and (newest is None or (parse_t(last["t"]) or last_t_min()) > newest[0]):
                 newest = (parse_t(last["t"]) or last_t_min(), agent)
             # a memory is owed while the agent works or is blocked; a finished agent owes none
@@ -851,7 +1076,7 @@ def board_rows(dots):
             if mail["unanswered"]:
                 flags.append("MAIL-UNANSWERED")
             # an agent that holds a wait open will read it; one that ended its turn never will
-            if waiting and listen_state(agent) is None:
+            if waiting and listener is None:
                 flags.append("MAIL_WAITING")
             claim = claim_stale(last, waiting, roster.get(agent))
             if claim:
@@ -861,6 +1086,8 @@ def board_rows(dots):
                          "state": last["state"] if last else None, "t": last["t"] if last else None,
                          "age_min": None if age is None else round(age), "task": last["task"] if last else None,
                          "host": last["host"] if last else None,
+                         "listening": listener is not None,
+                         "start_churn": churn,
                          "doing": (mem or {}).get("doing"), "next": (mem or {}).get("next"),
                          "blockers": str_list((mem or {}).get("blockers")), "mail": mail if boxes else None,
                          "claim_stale": claim, "flags": flags})
@@ -911,7 +1138,7 @@ def last_t_min():
     return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 def clip(s, n=110):
-    s = _clean_term(s or "-")
+    s = _clean_oneline(s or "-") or "-"
     return s if len(s) <= n else s[:n - 1] + "…"
 
 def board(a):
@@ -927,7 +1154,7 @@ def board(a):
     if beat:
         errors.append({"dot": "watch", "error": beat})
     if a.json:
-        print(json.dumps({"t": now(), "agents": rows, "errors": errors, "slots": slots}, ensure_ascii=False, indent=1))
+        print(json.dumps(_redact_tree({"t": now(), "agents": rows, "errors": errors, "slots": slots}), ensure_ascii=False, indent=1))
         return
     print(f"board {now()}  stall>{STALL_MIN}min")
     for dot, count in slots.items():
@@ -935,20 +1162,22 @@ def board(a):
                           for k in ("free", "total", "unassigned", "parked"))
         print(f"{dot} slots {values}")
     for e in errors:
-        print(f"{_clean_term(e['dot'])}: {_clean_term(e['error'])}")
+        print(f"{_clean_oneline(e['dot'])}: {_clean_oneline(_redact_text(e['error']))}")
     for r in rows:
         age = "-" if r["age_min"] is None else f"{r['age_min']}m"
         flags = f"  [{' '.join(r['flags'])}]" if r["flags"] else ""
-        print(f"{_clean_term(r['dot'])} {_clean_term(r['agent'])}  {_clean_term(r['state'] or '-')} {age} "
-              f"host={_clean_term(r['host'] or '-')} roster={_clean_term(r['roster'] or '-')} (the root's claim)  "
-              f"{clip(r['task'], 60)}{flags}")
+        print(f"{_clean_oneline(r['dot'])} {_clean_oneline(r['agent'])}  {_clean_oneline(r['state'] or '-')} {age} "
+              f"host={_clean_oneline(_redact_text(r['host'] or '-'))} roster={_clean_oneline(_redact_text(r['roster'] or '-'))} (the root's claim)  "
+              f"{_redact_text(clip(r['task'], 60))}{flags}")
         if r.get("claim_stale"):
-            print(f"    claim: {clip(r['claim_stale'], 140)}")
+            print(f"    claim: {_redact_text(clip(r['claim_stale'], 140))}")
+        if r.get("start_churn"):
+            print(f"    churn: {_redact_text(clip(r['start_churn'], 140))}")
         if r["doing"] or r["next"]:
-            print(f"    doing: {clip(r['doing'])}")
-            print(f"    next:  {clip(r['next'])}")
+            print(f"    doing: {_redact_text(clip(r['doing']))}")
+            print(f"    next:  {_redact_text(clip(r['next']))}")
         for b in r["blockers"][:3]:
-            print(f"    block: {clip(b)}")
+            print(f"    block: {_redact_text(clip(b))}")
         if r["mail"]:
             m = r["mail"]
             waiting = (f"; {m['waiting']} waiting (oldest {age_label(m['oldest_waiting_min'])})"
@@ -960,10 +1189,13 @@ def board(a):
 def memo(a):
     dot, agent = token("DOT", a.dot), token("agent", a.agent)
     mem = load_json(os.path.join(BASE, "memory", dot, f"{agent}.json"))
-    print(json.dumps(mem, ensure_ascii=False, indent=1) if mem else f"(no memory for {dot}/{agent})")
+    print(json.dumps(_redact_tree(mem), ensure_ascii=False, indent=1) if mem else f"(no memory for {dot}/{agent})")
     for ln in v1_lines(os.path.join(BASE, "live", dot, f"{agent}.jsonl"))[-3:]:
-        print(f"live {_clean_term(ln['t'])} {_clean_term(ln['state'])} host={_clean_term(ln['host'])} task={_clean_term(ln['task'])}")
-        print(f"    {_clean_term(ln['note'])}  [{_clean_term(ln['evidence'])}]")
+        print(
+            f"live {_clean_term(_redact_text(ln['t']))} {_clean_term(_redact_text(ln['state']))} "
+            f"host={_clean_term(_redact_text(ln['host']))} task={_clean_term(_redact_text(ln['task']))}"
+        )
+        print(f"    {_clean_term(_redact_text(ln['note']))}  [{_clean_term(_redact_text(ln['evidence']))}]")
 
 # ---------------------------------------------------------------- config, init
 
@@ -1094,10 +1326,15 @@ def mail_box(project, agent, create=False):
     return box
 
 def project_dirs():
-    return sorted(os.path.basename(os.path.dirname(d)) for d in base_glob("*", "mail") if os.path.isdir(d))
+    return sorted(
+        p for p in (os.path.basename(os.path.dirname(d)) for d in base_glob("*", "mail") if os.path.isdir(d))
+        if p not in RESERVED_OPS_DIRS
+    )
 
 def send(a):
     project, agent = token("project", a.project), token("agent", a.agent)
+    if project in RESERVED_OPS_DIRS:
+        die(f"project {project!r} is reserved for dotomation ops dirs")
     if a.kind not in TO_AGENT:
         die(f"kind must be one of {list(TO_AGENT)}")
     task = text("task", a.task)
@@ -1119,8 +1356,11 @@ def send(a):
     prune_markers(agent)
     live = listen_state(agent)
     if live:
-        print(f"LISTENING dot={live.get('dot', '-')} pid={live.get('pid')} since={live.get('since', '-')}"
-              f" host={live.get('host', '-')}", flush=True)
+        dot_s = _clean_oneline(live.get("dot", "-")) or "-"
+        pid_s = _clean_oneline(live.get("pid")) if live.get("pid") is not None else "None"
+        since_s = _clean_oneline(live.get("since", "-")) or "-"
+        host_s = _clean_oneline(live.get("host", "-")) or "-"
+        print(f"LISTENING dot={dot_s} pid={pid_s} since={since_s} host={host_s}", flush=True)
         return
     seen = last_tick(agent)
     print(f"NOT_LISTENING last_tick={age_label(None if seen is None else age_min(seen[0].isoformat()))}", flush=True)
@@ -1161,29 +1401,42 @@ def _safe_argv_placeholder(name, val):
         str(val).replace("\x00", "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
     )
     text_v = re.sub(r" +", " ", text_v).strip()
-    if name in ("task", "why"):
+    if name == "lanes":
+        text_v = re.sub(r"[^A-Za-z0-9._:,-]+", ",", text_v)
+        text_v = re.sub(r",+", ",", text_v).strip(",")
         if len(text_v) > 200:
-            text_v = text_v[:197] + "..."
-        if text_v in ("", "-"):
-            return "-"
+            text_v = text_v[:197].rstrip(",") + "..."
+        while text_v.startswith("-"):
+            text_v = text_v.lstrip("-,").strip()
+        return text_v or "-"
+    if name in ("task", "why"):
+        text_v = re.sub(r"[^A-Za-z0-9._:/@+,=\s-]+", "_", text_v)
+        text_v = re.sub(r"\s+", " ", text_v).strip()
         while text_v.startswith("-"):
             text_v = text_v.lstrip("-").strip()
+        if len(text_v) > 200:
+            text_v = text_v[:197].rstrip() + "..."
         return text_v or "-"
+    if name in ("age", "state"):
+        text_v = re.sub(r"[^A-Za-z0-9._:+-]+", "_", text_v).strip()
+        while text_v.startswith("-"):
+            text_v = text_v.lstrip("-").strip()
+        return text_v[:64] or "none"
     return text_v
 
 def argv_for(argv, values):
-    """Substitute {project} {agent} {id} {dot} {age} {task} {state} {why}; a placeholder with no value
+    """Substitute {project} {agent} {id} {dot} {age} {task} {state} {why} {lanes} {track}; a placeholder with no value
     is reported, never blanked."""
     argv = argv_list(argv)
     if not argv:
         return None, None
     for name in sorted(set(PLACEHOLDER.findall(" ".join(argv)))):
         v = values.get(name)
-        if v is None or (name == "dot" and not v):
+        if v is None or (name in ("dot", "track") and not v):
             return None, name
         sv = _safe_argv_placeholder(name, v)
-        if name in ("project", "agent", "dot", "id"):
-            if not sv or sv.startswith("-") or any(c.isspace() for c in sv):
+        if name in ("project", "agent", "dot", "id", "track"):
+            if not sv or not TOKEN.fullmatch(sv):
                 return None, name
     return [PLACEHOLDER.sub(lambda m: _safe_argv_placeholder(m.group(1), values[m.group(1)]), x) for x in argv], None
 
@@ -1191,7 +1444,8 @@ def wake_argv(cfg, project, agent, msg_id, dot):
     return argv_for(cfg.get("wake"), {"project": project, "agent": agent, "id": msg_id, "dot": dot or ""})
 
 def run_wake(argv):
-    print(f"WAKE ran {json.dumps(argv, ensure_ascii=False)}", flush=True)
+    safe_argv = [_clean_oneline(_redact_text(x)) for x in argv]
+    print(f"WAKE ran {json.dumps(safe_argv, ensure_ascii=False)}", flush=True)
     try:
         return subprocess.run(argv, stdin=subprocess.DEVNULL, timeout=WAKE_TIMEOUT).returncode
     except subprocess.TimeoutExpired:
@@ -1241,6 +1495,8 @@ def read(a):
 
 def reply(a):
     project, agent = token("project", a.project), token("agent", a.agent)
+    if project in RESERVED_OPS_DIRS:
+        die(f"project {project!r} is reserved for dotomation ops dirs")
     if a.kind not in TO_MAIN:
         die(f"kind must be one of {list(TO_MAIN)}")
     task = text("task", a.task)
@@ -1329,7 +1585,7 @@ def wait_loop(dot, agent, timeout, expect=None):
     if not os.path.isdir(os.path.join(BASE, "live", dot)):
         print(f"dots: no live/{dot} folder; waiting anyway", file=sys.stderr)
     listen_dir = os.path.join(BASE, "listen")
-    os.makedirs(listen_dir, exist_ok=True)
+    ensure_dir(listen_dir)
     path = os.path.join(listen_dir, f"{agent}.{os.getpid()}.json")
     until = iso_after(timeout)
     previous = {s: signal.getsignal(s) for s in SIGNALS}
@@ -1419,6 +1675,9 @@ def watch_settings(a, cfg):
             notify = argv
     idle = cli_argv(a.idle_cmd, "--idle-cmd") if a.idle_cmd is not None else None
     src["idle"] = "argv" if idle else "none"
+    fill_cmd_raw = getattr(a, "fill_cmd", None)
+    fill = cli_argv(fill_cmd_raw, "--fill-cmd") if fill_cmd_raw is not None else None
+    src["fill"] = "argv" if fill else "none"
     delays, dsrc = watch_cfg(cfg)
     for key in WATCH_DEFAULTS:
         v = getattr(a, key, None)
@@ -1438,7 +1697,23 @@ def watch_settings(a, cfg):
     src["fill_after_min"] = "default" if a.fill_after_min is None else "argv"
     src["keep_full_rewake_min"] = src["rewake_min"]
     delays["keep_full_rewake_min"] = 10 if src["rewake_min"] == "default" else delays["rewake_min"]
-    scan = types.SimpleNamespace(idle=idle, dots=list(a.dot or []), recovery=recovery_settings(a, src),
+    roster_fresh = getattr(a, "roster_fresh_min", None)
+    if roster_fresh is not None and roster_fresh < 0:
+        die("--roster-fresh-min takes minutes, 0 or more")
+    delays["roster_fresh_min"] = ROSTER_FRESH_MIN if roster_fresh is None else roster_fresh
+    src["roster_fresh_min"] = "default" if roster_fresh is None else "argv"
+    wake_retries = getattr(a, "wake_retries", None)
+    if wake_retries is not None and wake_retries < 1:
+        die("--wake-retries must be 1 or more")
+    delays["wake_retries"] = DEFAULT_WAKE_RETRIES if wake_retries is None else wake_retries
+    src["wake_retries"] = "default" if wake_retries is None else "argv"
+    idle_max_age = getattr(a, "idle_max_age_min", None)
+    if idle_max_age is not None and idle_max_age < 0:
+        die("--idle-max-age-min takes minutes, 0 or more")
+    delays["idle_max_age_min"] = idle_max_age
+    src["idle_max_age_min"] = "none" if idle_max_age is None else "argv"
+    scan = types.SimpleNamespace(idle=idle, fill=fill, dots=list(a.dot or []),
+                                 recovery=recovery_settings(a, src),
                                  keep_full=list(dict.fromkeys(a.keep_full or [])))
     return wake, notify, delays, path, src, scan
 
@@ -1472,11 +1747,70 @@ def load_state(path):
     later run ring again."""
     st = load_json(path) or {}
     out = {"v": 1}
-    for key in ("messages", "agents", "roster", "vm", "capacity"):
+    for key in ("messages", "agents", "roster", "vm", "capacity", "churn", "loops"):
         recs = st.get(key)
         out[key] = {k: v for k, v in (recs.items() if isinstance(recs, dict) else ())
                     if isinstance(k, str) and isinstance(v, dict)}
     return out
+
+
+@contextlib.contextmanager
+def watch_lock(st_path):
+    """Acquire non-blocking exclusive lock beside the watch state file; fail open with warning if unwritable."""
+    lock_path = st_path + ".lock"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    dfd = None
+    acquired = True
+    try:
+        try:
+            lock_dir = os.path.dirname(lock_path) or "."
+            _check_no_symlink_under(BASE, lock_dir)
+            with contextlib.suppress(OSError):
+                os.makedirs(lock_dir, exist_ok=True)
+            dfd = _open_parent_dir_nofollow(lock_dir)
+            lock_name = os.path.basename(lock_path)
+            _check_no_symlink_under(BASE, lock_path)
+            _check_no_symlink_under(lock_dir, lock_path)
+            skip_open = False
+            try:
+                pre = os.lstat(lock_name, dir_fd=dfd)
+                if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode) or pre.st_nlink > 1:
+                    print("WATCH_ERROR lock not_regular", flush=True)
+                    skip_open = True
+            except FileNotFoundError:
+                pass
+            if not skip_open:
+                fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | nofollow | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1 or fst.st_uid != os.geteuid():
+                    reason = "owner_mismatch" if fst.st_uid != os.geteuid() else "not_regular"
+                    print(f"WATCH_ERROR lock {reason}", flush=True)
+                    os.close(fd)
+                    fd = None
+                    acquired = True
+                else:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except BlockingIOError:
+                        acquired = False
+        except OSError as exc:
+            print(f"WATCH_ERROR lock {exc.__class__.__name__}", flush=True)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
+            acquired = True
+        finally:
+            if dfd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(dfd)
+        yield acquired
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 def heartbeat_path(st_path):
     return os.path.join(os.path.dirname(st_path), "heartbeat.json")
@@ -1505,7 +1839,7 @@ def save_state(path, st, warn=None):
     folder with no write permission — is reported once and never raised: a record that cannot be
     written can only make a later run ring again, which is the direction this ledger may fail in."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _ensure_dir_under(BASE, os.path.dirname(path))
         write_atomic(path, json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
     except OSError as exc:
         if warn is not None and path not in warn:
@@ -1564,21 +1898,33 @@ def roster_key(dot, error):
 def watch_board(scan, delays, st, st_path, cfg, warned):
     """The board half of the watchdog: wake an agent whose own files say it stopped (STALLED, or a
     CLAIM-STALE claim) every rewake_min, wake a blocked agent once per blocked line and report it once
-    when it stays blocked past blocked_after_min, report a stale roster once per report, and report
-    VM work no recovery ledger tracks. Reads files only; the one thing it runs is the owner's idle
-    argv. Like the mail half, a ledger record may only add a line: every ring or report it holds back
-    prints WATCH_SKIP."""
+    when it stays blocked past blocked_after_min, report consecutive start churn once per streak,
+    report a stale roster once per report, and report VM work no recovery ledger tracks."""
     dots = scan_dots(scan, cfg)
     rows, errors, _ = board_rows(dots)
     # forget a record only for a dot this run read; a folder missing for one run keeps its records
     read_ok = set(dots) - {e["dot"] for e in errors if e["error"] == "no live folder"}
     scope = lambda key: key.split("/", 1)[0] in read_ok
     seen = set()
+    churn_seen = set()
     for r in rows if scan.idle else ():
+        dot_s = _clean_oneline(r["dot"]) or "-"
+        agent_s = _clean_oneline(r["agent"]) or "-"
+        state_s = _clean_oneline(r["state"] or "-") or "-"
+        key = f"{r['dot']}/{r['agent']}"
+        task = json.dumps(_clean_oneline(_redact_text(r["task"] or "")), ensure_ascii=False)
+        if r.get("start_churn"):
+            churn_seen.add(key)
+            cmark = f"{r['task']}@{r['t']}"
+            crec = st["churn"].get(key)
+            if crec is None:
+                st["churn"][key] = {"mark": cmark, "t": now()}
+                save_state(st_path, st, warned)
+                detail_s = json.dumps(_clean_oneline(_redact_text(r["start_churn"])), ensure_ascii=False)
+                print(f"WATCH_START_CHURN {dot_s} {agent_s} task={task} detail={detail_s}", flush=True)
         flags = [f for f in r["flags"] if f in ("STALLED", "CLAIM-STALE", "BLOCKED")]
         if not flags:
             continue
-        key = f"{r['dot']}/{r['agent']}"
         seen.add(key)
         age = "-" if r["age_min"] is None else r["age_min"]   # a legacy-only line is STALLED with no v1 age
         mark = f"{r['task']}@{r['t']}"
@@ -1586,74 +1932,379 @@ def watch_board(scan, delays, st, st_path, cfg, warned):
         if rec is None or rec.get("mark") != mark:
             rec = st["agents"][key] = {"mark": mark}
         blocked = "BLOCKED" in flags
+        max_age = delays.get("idle_max_age_min")
+        too_old = (not blocked and max_age is not None and isinstance(r["age_min"], int) and r["age_min"] > max_age)
         since = age_min(rec.get("ring_t"))
         # a blocker waits on someone else, so a second wake cannot clear it; a quiet worker may need several
-        due = since is None or since < 0 or (not blocked and since >= delays["rewake_min"])
-        task = json.dumps(r["task"] or "", ensure_ascii=False)
+        due = (not too_old) and (since is None or since < 0 or (not blocked and since >= delays["rewake_min"]))
         why = ",".join(flags)
-        if due:
-            values = {"project": r.get("project") or "-", "agent": r["agent"], "dot": r["dot"],
-                      "age": age, "task": r["task"] or "-", "state": r["state"] or "-", "why": why}
+        if too_old:
+            print(f"WATCH_SKIP {dot_s} {agent_s} reason=idle_too_old age={r['age_min']}m max={max_age}m",
+                  flush=True)
+        elif due:
+            raw_proj = r.get("project")
+            valid_proj = raw_proj if isinstance(raw_proj, str) and TOKEN.fullmatch(raw_proj) else "none"
+            values = {"project": valid_proj, "agent": r["agent"], "dot": r["dot"], "id": "none",
+                      "age": age, "task": r["task"] or "-", "state": r["state"] or "-", "why": why,
+                      "lanes": r["agent"], "track": "none"}
             code, detail = ring(scan.idle, values)
-            if code is not None:
+            gave_up = False
+            gave_up_tries = 0
+            if code == 0:
                 rec["ring_t"] = now()
+                rec.pop("ring_fails", None)
                 save_state(st_path, st, warned)
-            print(f"WATCH_IDLE {r['dot']} {r['agent']} {why} age={age}{'' if age == '-' else 'm'} "
-                  f"state={r['state'] or '-'} "
-                  f"task={task} exit={detail or code}", flush=True)
+            elif code is not None or detail != "not_configured":
+                fails = _safe_int(rec.get("ring_fails"), 0, 0) + 1
+                rec["ring_fails"] = fails
+                if fails >= delays["wake_retries"]:
+                    rec["ring_t"] = now()
+                    rec["ring_fails"] = 0
+                    gave_up = True
+                    gave_up_tries = fails
+                save_state(st_path, st, warned)
+            print(f"WATCH_IDLE {dot_s} {agent_s} {why} age={age}{'' if age == '-' else 'm'} "
+                  f"state={state_s} "
+                  f"task={task} exit={_clean_oneline(detail or code)}", flush=True)
+            if gave_up:
+                print(f"WATCH_IDLE_GAVE_UP {dot_s} {agent_s} tries={gave_up_tries}", flush=True)
         else:
-            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=idle_already {why} ring_t={rec.get('ring_t')}",
+            rt_s = _clean_oneline(rec.get("ring_t")) if rec.get("ring_t") is not None else "None"
+            print(f"WATCH_SKIP {dot_s} {agent_s} reason=idle_already {why} ring_t={rt_s}",
                   flush=True)
         if not blocked or not isinstance(r["age_min"], int) or r["age_min"] < delays["blocked_after_min"]:
             continue
         if rec.get("open_t"):
-            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=blocked_open_already open_t={rec['open_t']}",
+            ot_s = _clean_oneline(rec["open_t"])
+            print(f"WATCH_SKIP {dot_s} {agent_s} reason=blocked_open_already open_t={ot_s}",
                   flush=True)
             continue
         rec["open_t"] = now()
         save_state(st_path, st, warned)
-        print(f"WATCH_BLOCKED_OPEN {r['dot']} {r['agent']} age={r['age_min']}m task={task} "
-              f"blockers={json.dumps(r['blockers'][:3], ensure_ascii=False)}", flush=True)
+        blockers_s = json.dumps([_clean_oneline(_redact_text(b)) for b in r["blockers"][:3]], ensure_ascii=False)
+        print(f"WATCH_BLOCKED_OPEN {dot_s} {agent_s} age={r['age_min']}m task={task} "
+              f"blockers={blockers_s}", flush=True)
     for key in [k for k in st["agents"] if scan.idle and scope(k) and k not in seen]:
         del st["agents"][key]
         save_state(st_path, st, warned)
+    for key in [k for k in st["churn"] if scan.idle and scope(k) and k not in churn_seen]:
+        del st["churn"][key]
+        save_state(st_path, st, warned)
     reported = set()
     for e in errors:
+        edot_s = _clean_oneline(_redact_text(e["dot"])) or "-"
+        eerr_s = _clean_oneline(_redact_text(e["error"])) or "-"
         if "slot states" not in e["error"]:
             # no live folder, a dropped slot: board shows it, so the watchdog does too
-            print(f"WATCH_ERROR board {e['dot']} {e['error']}", flush=True)
+            print(f"WATCH_ERROR board {edot_s} {eerr_s}", flush=True)
             continue
         if not scan.idle:
             continue
         key = roster_key(e["dot"], e["error"])
         reported.add(key)
         if key in st["roster"]:
-            print(f"WATCH_SKIP {e['dot']} - reason=roster_reported t={st['roster'][key].get('t')}", flush=True)
+            rt_s = _clean_oneline(st["roster"][key].get("t")) if st["roster"][key].get("t") is not None else "None"
+            print(f"WATCH_SKIP {edot_s} - reason=roster_reported t={rt_s}", flush=True)
             continue
         st["roster"][key] = {"t": now()}
         save_state(st_path, st, warned)
-        print(f"WATCH_ROSTER_STALE {e['dot']} {e['error']}", flush=True)
+        print(f"WATCH_ROSTER_STALE {edot_s} {eerr_s}", flush=True)
     for key in [k for k in st["roster"] if scan.idle and k.split("|", 1)[0] in read_ok and k not in reported]:
         del st["roster"][key]
         save_state(st_path, st, warned)
     if scan.recovery:
         watch_vm(scan.recovery, rows, st, st_path, warned, scope)
 
+def _commit_fill_ring(dot, fill_argv, values, delays, rec, st, st_path, warned, cmd_label="fill-cmd"):
+    code, detail = ring(fill_argv, values)
+    dot_s = _clean_oneline(dot) or "-"
+    if detail == "not_configured":
+        rec["ring_t"] = now()
+        rec.pop("fill_fails", None)
+        save_state(st_path, st, warned)
+        return
+    if code == 0:
+        rec["ring_t"] = now()
+        rec.pop("fill_fails", None)
+        save_state(st_path, st, warned)
+        return
+    print(f"WATCH_ERROR keep-full {dot_s} {cmd_label} exit={_clean_oneline(detail or code)}", flush=True)
+    fails = _safe_int(rec.get("fill_fails"), 0, 0) + 1
+    rec["fill_fails"] = fails
+    if fails >= delays["wake_retries"]:
+        rec["ring_t"] = now()
+        rec["fill_fails"] = 0
+        print(f"WATCH_ERROR keep-full {dot_s} {cmd_label} gave_up tries={fails}", flush=True)
+    save_state(st_path, st, warned)
+
+def watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label="fill-cmd"):
+    """Inspect self-driving loop tracks under <BASE>/loops/<dot>/ and ring on idle/stalled tracks."""
+    loops_dir = os.path.join(BASE, "loops", dot)
+    if not os.path.isdir(loops_dir):
+        for key in [k for k in st["loops"] if k.startswith(f"{dot}/")]:
+            del st["loops"][key]
+            save_state(st_path, st, warned)
+        return
+    try:
+        names = sorted(f for f in os.listdir(loops_dir) if f.endswith(".state.json"))
+    except OSError:
+        return
+    seen_tracks = set()
+    dot_s = _clean_oneline(dot) or "-"
+    for fname in names:
+        track = fname[:-len(".state.json")]
+        if not TOKEN.fullmatch(track):
+            continue
+        state_doc = load_json(os.path.join(loops_dir, fname))
+        contract_doc = load_json(os.path.join(loops_dir, f"{track}.contract.json"))
+        if not isinstance(state_doc, dict) or not isinstance(contract_doc, dict):
+            continue
+        state_doc = _loop_normalize_state(state_doc)
+        key = f"{dot}/{track}"
+        track_s = _clean_oneline(track) or "-"
+        seen_tracks.add(key)
+        if state_doc.get("paused") or state_doc.get("goal_complete"):
+            if key in st["loops"]:
+                del st["loops"][key]
+                save_state(st_path, st, warned)
+            continue
+        active = state_doc.get("active")
+        queue = state_doc.get("queue") or []
+        continuous = bool(contract_doc.get("continuous"))
+        max_blocks = _safe_int(contract_doc.get("max_consecutive_blocks"), 3, 1)
+        consec_blocks = _safe_int(state_doc.get("consecutive_blocks"), 0, 0)
+        if isinstance(active, dict):
+            c_raw = active.get("claimed_at")
+            a_raw = state_doc.get("last_activity_at")
+            c_age = age_min(c_raw)
+            a_age = age_min(a_raw)
+            bad_ts = ((c_raw is not None and (c_age is None or c_age < 0))
+                      or (a_raw is not None and (a_age is None or a_age < 0)))
+            valid_ages = [x for x in (c_age, a_age) if x is not None and x >= 0]
+            if bad_ts or not valid_ages:
+                print(f"WATCH_ERROR loop {dot_s} {track_s} unusable timestamp", flush=True)
+            stale_age = min(valid_ages) if valid_ages else None
+            if stale_age is not None and stale_age > STALL_MIN:
+                rec = st["loops"].setdefault(key, {})
+                s_ring = age_min(rec.get("stalled_ring_t"))
+                if s_ring is None or s_ring < 0 or s_ring >= delays["rewake_min"]:
+                    raw_claimed = active.get("claimed_by")
+                    valid_claimed = raw_claimed if isinstance(raw_claimed, str) and TOKEN.fullmatch(raw_claimed) else None
+                    valid_coord = coordinator if isinstance(coordinator, str) and TOKEN.fullmatch(coordinator) else None
+                    raw_iid = str(active.get("id") or "")
+                    item_token = raw_iid if TOKEN.fullmatch(raw_iid) else "none"
+                    item_s = _clean_oneline(_redact_text(raw_iid or "-")) or "-"
+                    agent_s = _clean_oneline(_redact_text(str(raw_claimed or valid_coord or "-"))) or "-"
+                    proj_raw = contract_doc.get("project")
+                    valid_proj = proj_raw if isinstance(proj_raw, str) and TOKEN.fullmatch(proj_raw) else "none"
+                    target_agent = valid_claimed or valid_coord
+                    print(f"WATCH_LOOP_STALLED {dot_s} {track_s} item={item_s} "
+                          f"agent={agent_s} age={int(stale_age)}m", flush=True)
+                    if fill_argv and target_agent is not None:
+                        code, detail = ring(fill_argv, {"dot": dot, "agent": target_agent, "id": item_token,
+                                                        "age": int(stale_age), "why": "LOOP_STALLED",
+                                                        "project": valid_proj, "task": f"loop:{track}",
+                                                        "state": "stalled", "lanes": track, "track": track})
+                        if code == 0 or detail == "not_configured":
+                            rec["stalled_ring_t"] = now()
+                            rec.pop("stalled_fails", None)
+                        else:
+                            print(f"WATCH_ERROR keep-full {dot_s} {cmd_label} exit={_clean_oneline(detail or code)}", flush=True)
+                            fails = _safe_int(rec.get("stalled_fails"), 0, 0) + 1
+                            rec["stalled_fails"] = fails
+                            if fails >= delays["wake_retries"]:
+                                rec["stalled_ring_t"] = now()
+                                rec["stalled_fails"] = 0
+                                print(f"WATCH_ERROR keep-full {dot_s} {cmd_label} gave_up tries={fails}", flush=True)
+                    else:
+                        rec["stalled_ring_t"] = now()
+                    save_state(st_path, st, warned)
+            elif key in st["loops"]:
+                del st["loops"][key]
+                save_state(st_path, st, warned)
+            continue
+        need_claim = bool(queue) or (continuous and consec_blocks < max_blocks)
+        if not need_claim:
+            if key in st["loops"]:
+                del st["loops"][key]
+                save_state(st_path, st, warned)
+            continue
+        idle_after = _safe_int(contract_doc.get("idle_after_min"), delays["fill_after_min"], 0)
+        last_raw = state_doc.get("last_activity_at")
+        idle_age = age_min(last_raw)
+        if last_raw is None or idle_age is None or idle_age < 0:
+            print(f"WATCH_ERROR loop {dot_s} {track_s} unusable last_activity_at", flush=True)
+            continue
+        if idle_age < idle_after:
+            continue
+        rec = st["loops"].setdefault(key, {})
+        since_ring = age_min(rec.get("ring_t"))
+        if since_ring is not None and 0 <= since_ring < delays["keep_full_rewake_min"]:
+            continue
+        raw_last = state_doc.get("last_agent")
+        valid_last = raw_last if isinstance(raw_last, str) and TOKEN.fullmatch(raw_last) else None
+        valid_coord = coordinator if isinstance(coordinator, str) and TOKEN.fullmatch(coordinator) else None
+        target_agent = valid_coord or valid_last or "none"
+        last_s = _clean_oneline(_redact_text(str(raw_last or "-"))) or "-"
+        proj_raw = contract_doc.get("project")
+        valid_proj = proj_raw if isinstance(proj_raw, str) and TOKEN.fullmatch(proj_raw) else "none"
+        print(f"WATCH_LOOP_IDLE {dot_s} {track_s} agent={last_s} "
+              f"ready={len(queue)} continuous={str(continuous).lower()} age={int(idle_age)}m", flush=True)
+        if fill_argv:
+            _commit_fill_ring(dot, fill_argv,
+                              {"dot": dot, "agent": target_agent, "id": "none", "age": int(idle_age),
+                               "why": "LOOP_IDLE", "project": valid_proj, "task": f"loop:{track}",
+                               "state": "idle", "lanes": track, "track": track},
+                              delays, rec, st, st_path, warned, cmd_label=cmd_label)
+        else:
+            rec["ring_t"] = now()
+            save_state(st_path, st, warned)
+    for key in [k for k in st["loops"] if k.startswith(f"{dot}/") and k not in seen_tracks]:
+        del st["loops"][key]
+        save_state(st_path, st, warned)
+
+def _cap_project_for(dot, roster):
+    if isinstance(roster, dict):
+        rp = roster.get("project")
+        if isinstance(rp, str) and TOKEN.fullmatch(rp) and rp not in RESERVED_OPS_DIRS:
+            return rp
+        for actor in roster.get("actors") if isinstance(roster.get("actors"), list) else ():
+            if isinstance(actor, dict):
+                ap = actor.get("project")
+                if isinstance(ap, str) and TOKEN.fullmatch(ap) and ap not in RESERVED_OPS_DIRS:
+                    return ap
+    for lpath in sorted(base_glob("loops", dot, "*.contract.json")):
+        cdoc = load_json(lpath)
+        if isinstance(cdoc, dict):
+            cp = cdoc.get("project")
+            if isinstance(cp, str) and TOKEN.fullmatch(cp) and cp not in RESERVED_OPS_DIRS:
+                return cp
+    projs = [p.get("id") for p in configured(config(), "projects") if isinstance(p.get("id"), str)]
+    if len(projs) == 1 and TOKEN.fullmatch(projs[0]) and projs[0] not in RESERVED_OPS_DIRS:
+        return projs[0]
+    return "none"
+
+
 def watch_capacity(scan, delays, st, st_path, warned):
-    """Track each explicitly named dot independently of board discovery, with a durable episode start."""
+    """Track each explicitly named dot independently of board discovery, using live records when roster is stale."""
+    fill_argv = scan.fill or scan.idle
+    cmd_label = "fill-cmd" if scan.fill else "idle-cmd"
     for dot in scan.keep_full:
         roster = load_json(os.path.join(BASE, "live", dot, "roster.json"))
+        cap_proj = _cap_project_for(dot, roster)
         summary = roster_slot_summary(roster)
+        coordinator = roster_coordinator(roster)
+        roster_age = age_min(roster.get("updated_at")) if isinstance(roster, dict) else None
+        has_upd = isinstance(roster, dict) and ("updated_at" in roster)
+        stale_roster = (roster is not None and (
+            (roster_age is not None and (roster_age >= delays["roster_fresh_min"] or roster_age < -5))
+            or (has_upd and roster_age is None)
+        ))
+        if stale_roster:
+            if coordinator is None:
+                print(f"WATCH_ERROR keep-full {dot} invalid coordinator", flush=True)
+                watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
+                continue
+            live = live_lane_summary(dot, coordinator=coordinator, fill_after_min=delays["fill_after_min"], roster_doc=roster)
+            roster_workers = set()
+            if isinstance(roster, dict) and isinstance(roster.get("actors"), list):
+                for actor in roster["actors"]:
+                    if not isinstance(actor, dict) or actor.get("occupies_slot") is not True:
+                        continue
+                    aname = actor.get("agent") or actor.get("agent_id") or actor.get("id")
+                    role_s = str(actor.get("role") or "").strip().lower()
+                    if isinstance(aname, str) and TOKEN.fullmatch(aname) and aname != coordinator and role_s != "coordinator":
+                        roster_workers.add(aname)
+            live_workers = set(live["empty"]) | set(live["parked"]) | set(live["stalled"]) | set(live["busy"])
+            extra_live = len(live_workers - roster_workers)
+            unassigned_raw = summary.get("unassigned")
+            unassigned_eff = max(0, unassigned_raw - extra_live) if isinstance(unassigned_raw, int) and unassigned_raw > 0 else 0
+            free_live = len(live["empty"]) + unassigned_eff
+            if summary["total"] is not None:
+                free_live = min(summary["total"], free_live)
+            roster_age_s = "unknown" if (roster_age is None or roster_age < 0) else f"{int(roster_age)}m"
+            if free_live == 0:
+                if dot in st["capacity"]:
+                    del st["capacity"][dot]
+                    save_state(st_path, st, warned)
+                print(f"WATCH_SKIP {dot} reason=live_busy roster_age={roster_age_s} "
+                      f"busy={len(live['busy'])} parked={','.join(live['parked']) or '-'}", flush=True)
+                watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
+                continue
+            rec = st["capacity"].get(dot)
+            age = age_min(rec.get("since")) if rec is not None else None
+            if age is None or age < 0:
+                rec = st["capacity"][dot] = {"since": now()}
+                save_state(st_path, st, warned)
+                age = 0
+            if age < delays["fill_after_min"]:
+                print(f"WATCH_SKIP {dot} reason=fill_grace age={int(age)}m", flush=True)
+                watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
+                continue
+            since_ring = age_min(rec.get("ring_t"))
+            if since_ring is not None and 0 <= since_ring < delays["keep_full_rewake_min"]:
+                print(f"WATCH_SKIP {dot} reason=fill_rewake ring_t={_clean_oneline(rec['ring_t'])}", flush=True)
+                watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
+                continue
+            parked_names = ",".join(live["parked"]) or "-"
+            empty_names = ",".join(live["empty"]) or "-"
+            fill_lanes = ",".join(live["empty"]) or "unassigned"
+            total_s = summary["total"] if summary["total"] is not None else "?"
+            stalled_s = f" stalled_lanes={','.join(live['stalled'])}" if live["stalled"] else ""
+            unassigned_s = f" unassigned={unassigned_eff}" if unassigned_eff > 0 else ""
+            print(f"WATCH_UNDERFILLED {dot} free={free_live} total={total_s} age={int(age)}m "
+                  f"coordinator={coordinator} parked={len(live['parked'])} parked_agents={parked_names} "
+                  f"source=live roster_age={roster_age_s} empty_lanes={empty_names}{unassigned_s}{stalled_s}",
+                  flush=True)
+            _commit_fill_ring(dot, fill_argv,
+                              {"dot": dot, "agent": coordinator, "id": "none", "age": int(age), "why": "UNDERFILLED",
+                               "project": cap_proj, "task": "keep-full", "state": "underfilled",
+                               "lanes": fill_lanes, "track": "none"},
+                              delays, rec, st, st_path, warned, cmd_label=cmd_label)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
+            continue
+
         free, total = summary["free"], summary["total"]
         if free is None:
             print(f"WATCH_ERROR keep-full {dot} unknown slot counts", flush=True)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
             continue  # an unreadable roster is not a recovery
+        live_empty = []
+        if isinstance(roster, dict):
+            upd = parse_t(roster.get("updated_at"))
+            actors = roster.get("actors")
+            parked_set = set(summary["parked_agents"])
+            if upd is not None and isinstance(actors, list):
+                coord_set = {coordinator} if coordinator else set()
+                seen_occ = set()
+                for actor in actors:
+                    if not isinstance(actor, dict) or actor.get("occupies_slot") is not True:
+                        continue
+                    aname = actor.get("agent") or actor.get("agent_id") or actor.get("id")
+                    if not isinstance(aname, str) or not TOKEN.fullmatch(aname):
+                        continue
+                    if aname in coord_set or aname in parked_set or aname in seen_occ:
+                        continue
+                    if str(actor.get("role") or "").strip().lower() == "coordinator":
+                        continue
+                    seen_occ.add(aname)
+                    lines = v1_lines(os.path.join(BASE, "live", dot, f"{aname}.jsonl"))
+                    last = lines[-1] if lines else None
+                    if not last or last["state"] != "done":
+                        continue
+                    lt = parse_t(last["t"])
+                    lage = age_min(last["t"])
+                    if lt is not None and lt > upd and lage is not None and lage >= delays["fill_after_min"]:
+                        live_empty.append(aname)
+                live_empty.sort()
+        free_eff = min(total, free + len(live_empty))
         rec = st["capacity"].get(dot)
-        if free == 0:
+        if free_eff == 0:
             if rec is not None:
                 del st["capacity"][dot]
                 save_state(st_path, st, warned)
                 print(f"WATCH_FILLED {dot}", flush=True)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
             continue
         age = age_min(rec.get("since")) if rec is not None else None
         if age is None or age < 0:
@@ -1662,25 +2313,29 @@ def watch_capacity(scan, delays, st, st_path, warned):
             age = 0
         if age < delays["fill_after_min"]:
             print(f"WATCH_SKIP {dot} reason=fill_grace age={int(age)}m", flush=True)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
             continue
-        coordinator = roster.get("coordinator")
-        if not isinstance(coordinator, str) or not TOKEN.fullmatch(coordinator):
+        if coordinator is None:
             print(f"WATCH_ERROR keep-full {dot} invalid coordinator", flush=True)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
             continue
         since_ring = age_min(rec.get("ring_t"))
         if since_ring is not None and 0 <= since_ring < delays["keep_full_rewake_min"]:
-            print(f"WATCH_SKIP {dot} reason=fill_rewake ring_t={rec['ring_t']}", flush=True)
+            print(f"WATCH_SKIP {dot} reason=fill_rewake ring_t={_clean_oneline(rec['ring_t'])}", flush=True)
+            watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
             continue
         names = ",".join(summary["parked_agents"]) or "-"
-        print(f"WATCH_UNDERFILLED {dot} free={free} total={total} age={int(age)}m coordinator={coordinator} "
-              f"parked={summary['parked']} parked_agents={names}",
+        eff_lanes = sorted(set(summary["parked_agents"]) | set(live_empty))
+        extra = f" empty_lanes={','.join(live_empty)}" if live_empty else ""
+        print(f"WATCH_UNDERFILLED {dot} free={free_eff} total={total} age={int(age)}m coordinator={coordinator} "
+              f"parked={summary['parked']} parked_agents={names}{extra}",
               flush=True)
-        code, detail = ring(scan.idle, {"dot": dot, "agent": coordinator, "age": int(age), "why": "UNDERFILLED",
-                                        "project": "-", "task": "keep-full", "state": "underfilled"})
-        if code != 0:
-            print(f"WATCH_ERROR keep-full {dot} idle-cmd exit={detail or code}", flush=True)
-        rec["ring_t"] = now()  # report again on the rewake interval, even in report-only mode
-        save_state(st_path, st, warned)
+        _commit_fill_ring(dot, fill_argv,
+                          {"dot": dot, "agent": coordinator, "id": "none", "age": int(age), "why": "UNDERFILLED",
+                           "project": cap_proj, "task": "keep-full", "state": "underfilled",
+                           "lanes": ",".join(eff_lanes) or ("unassigned" if free_eff > 0 else "-"), "track": "none"},
+                          delays, rec, st, st_path, warned, cmd_label=cmd_label)
+        watch_loops_for_dot(dot, fill_argv, coordinator, delays, st, st_path, warned, cmd_label=cmd_label)
 
 def load_recovery(rc):
     """Import the pinned recovery reader, or (None, why). The bytes hashed are the bytes run."""
@@ -1691,7 +2346,9 @@ def load_recovery(rc):
     if fd is None:
         return None, "script unreadable"
     with os.fdopen(fd, "rb") as fh:
-        raw = fh.read()
+        raw = fh.read(MAX_JSON_BYTES + 1)
+    if len(raw) > MAX_JSON_BYTES:
+        return None, f"script exceeds {MAX_JSON_BYTES} bytes"
     actual = hashlib.sha256(raw).hexdigest()
     if actual != rc["sha256"]:
         return None, f"sha256 mismatch expected={rc['sha256']} actual={actual}"
@@ -1713,51 +2370,58 @@ def watch_vm(rc, rows, st, st_path, warned, scope):
     for r in rows:
         if r["host"] != "vm" or r["state"] not in ("start", "step"):
             continue
+        dot_s = _clean_oneline(r["dot"]) or "-"
+        agent_s = _clean_oneline(r["agent"]) or "-"
         key = f"{r['dot']}/{r['agent']}"
         mark = f"{r['task']}@{r['t']}"
         seen.add(key)
         if st["vm"].get(key, {}).get("mark") == mark:
-            print(f"WATCH_SKIP {r['dot']} {r['agent']} reason=vm_reported t={st['vm'][key].get('t')}", flush=True)
+            vt_s = _clean_oneline(st["vm"][key].get("t")) if st["vm"][key].get("t") is not None else "None"
+            print(f"WATCH_SKIP {dot_s} {agent_s} reason=vm_reported t={vt_s}", flush=True)
             continue
         root = rc["ledgers"].get(r["dot"])
         if root is None:
-            print(f"WATCH_ERROR recovery {r['dot']} no --ledger for this dot", flush=True)
+            print(f"WATCH_ERROR recovery {dot_s} no --ledger for this dot", flush=True)
             continue
         if mod is None:
             mod, why = load_recovery(rc)
             if mod is None:
-                print(f"WATCH_ERROR recovery {rc['script']} {why}", flush=True)
+                print(f"WATCH_ERROR recovery {_clean_oneline(rc['script'])} {_clean_oneline(why)}", flush=True)
                 return   # nothing was read, so no record is pruned either
         try:
             jobs = mod.inspect(pathlib.Path(root))
         except Exception as exc:
-            print(f"WATCH_ERROR recovery {r['dot']} {exc.__class__.__name__}: {exc}", flush=True)
+            print(f"WATCH_ERROR recovery {dot_s} {exc.__class__.__name__}: {_clean_oneline(exc)}", flush=True)
             continue
         # inspect() returns {job: {..., "phase": "ACTIVE"|"PAUSED"|"COMPLETE"}}; any other shape is
         # reported, never read as an unfinished job that would hide the report
         if not (isinstance(jobs, dict) and all(isinstance(s, dict) and isinstance(s.get("phase"), str)
                                                for s in jobs.values())):
-            print(f"WATCH_ERROR recovery {r['dot']} unexpected ledger shape", flush=True)
+            print(f"WATCH_ERROR recovery {dot_s} unexpected ledger shape", flush=True)
             continue
         if any(s["phase"] != "COMPLETE" for s in jobs.values()):
             continue
         st["vm"][key] = {"mark": mark, "t": now()}
         save_state(st_path, st, warned)
-        print(f"WATCH_VM_UNREGISTERED {r['dot']} {r['agent']} t={r['t']} "
-              f"task={json.dumps(r['task'] or '', ensure_ascii=False)} ledger_jobs={len(jobs)}", flush=True)
+        task_s = json.dumps(_clean_oneline(_redact_text(r["task"] or "")), ensure_ascii=False)
+        print(f"WATCH_VM_UNREGISTERED {dot_s} {agent_s} t={_clean_oneline(r['t'])} "
+              f"task={task_s} ledger_jobs={len(jobs)}", flush=True)
     for key in [k for k in st["vm"] if scope(k) and k not in seen]:
         del st["vm"][key]
         save_state(st_path, st, warned)
 
 def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallback=None, ledger_warned=None):
     cfg = config()
-    board = scan.idle or scan.recovery
+    board = bool(scan.idle or scan.recovery)
+    dots_cfg = (f"dots={'argv' if scan.dots else 'found'}:{','.join(scan_dots(scan, cfg)) or 'none'}" if board
+                else (f"dots=keep_full:{','.join(scan.keep_full)}" if scan.keep_full else "dots=none"))
     print("WATCH_CONFIG " + " ".join(
-        [f"wake={src['wake']}:{json.dumps(wake, ensure_ascii=False)}" if wake
+        [f"wake={src['wake']}:{json.dumps([_clean_oneline(_redact_text(x)) for x in wake], ensure_ascii=False)}" if wake
          else ("wake=none(untrusted_dots_json)" if src["wake"] == "ignored" else "wake=none"),
-         f"notify={src['notify']}:{json.dumps(notify, ensure_ascii=False)}" if notify
+         f"notify={src['notify']}:{json.dumps([_clean_oneline(_redact_text(x)) for x in notify], ensure_ascii=False)}" if notify
          else ("notify=none(untrusted_dots_json)" if src["notify"] == "ignored" else "notify=none"),
-         f"idle={src['idle']}:{json.dumps(scan.idle, ensure_ascii=False)}" if scan.idle else "idle=none",
+         f"idle={src['idle']}:{json.dumps([_clean_oneline(_redact_text(x)) for x in scan.idle], ensure_ascii=False)}" if scan.idle else "idle=none",
+         f"fill={src['fill']}:{json.dumps([_clean_oneline(_redact_text(x)) for x in scan.fill], ensure_ascii=False)}" if scan.fill else "fill=none",
          f"after_min={src['after_min']}:{delays['after_min']}",
          f"notify_after_min={src['notify_after_min']}:{delays['notify_after_min']}",
          f"rewake_min={src['rewake_min']}:{delays['rewake_min']}",
@@ -1765,9 +2429,11 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallb
          f"keep_full={'argv:' + ','.join(scan.keep_full) if scan.keep_full else 'none'}",
          f"fill_after_min={src['fill_after_min']}:{delays['fill_after_min']}",
          f"keep_full_rewake_min={src['keep_full_rewake_min']}:{delays['keep_full_rewake_min']}",
+         f"roster_fresh_min={src['roster_fresh_min']}:{delays['roster_fresh_min']}",
+         f"wake_retries={src['wake_retries']}:{delays['wake_retries']}",
+         f"idle_max_age_min={src['idle_max_age_min']}:{delays['idle_max_age_min'] if delays['idle_max_age_min'] is not None else 'none'}",
          f"recovery={src['recovery']}" + (f":{scan.recovery['sha256'][:12]}" if scan.recovery else ""),
-         f"dots={'argv' if scan.dots else 'found'}:{','.join(scan_dots(scan, cfg)) or 'none'}" if board
-         else "dots=none",
+         dots_cfg,
          f"state={src['state']}:{st_path}"]), flush=True)
     if expected:
         path = os.path.abspath(__file__)
@@ -1783,131 +2449,155 @@ def watch_once(expected, wake, notify, delays, st_path, src, scan, loop=0, fallb
             print(f"WATCH_TOOL_CHANGED expected={expected} actual={actual or 'unreadable'} "
                   f"path={path}", flush=True)
     ledger_warned = set() if ledger_warned is None else ledger_warned
-    st = load_state(st_path) if fallback is None else fallback
-    seen = set()
-    dirty = fallback is not None   # retry persistence even when no new action is due
-    no_wake = no_notify = False
-    for project, agent, box, m in owed_mail():
-        mid = m.get("id")
-        if not isinstance(mid, str) or not TOKEN.match(mid):
-            # no id, no ledger record and no wake: say so rather than skip the line in silence,
-            # because board still counts this message as owed mail
-            print(f"WATCH_ERROR {project} {agent} {mid!r} unusable id", flush=True)
-            continue
-        seen.add(mid)
-        rec = st["messages"].setdefault(mid, {})
-        rec.setdefault("project", project)
-        rec.setdefault("agent", agent)
-        if not rec.get("seen_t"):
-            # the ledger remembers the first sight of an owed line, so one deleted before its first
-            # ring still ends as WATCH_RESOLVED instead of vanishing
-            rec["seen_t"] = now()
-            dirty = True
-        # an unparseable or future `t` must not hide a message: fall back to when it was first seen,
-        # and only a time in the past is an age — a future one cannot make a message old enough
-        ages = [a for a in (age_min(m.get("t")), age_min(rec.get("seen_t")))
-                if a is not None and a >= 0]
-        if not ages:
-            print(f"WATCH_ERROR {project} {agent} {mid} no usable time t={m.get('t')!r} "
-                  f"seen_t={rec.get('seen_t')!r}", flush=True)
-            continue
-        age = max(ages)
-        held = listen_state(agent)
-        dot = dot_for(agent, cfg)
-        values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age)}
-        if held and age >= delays["after_min"]:
-            # a marker holds the wake back. A real waiter prints and marks unread mail within POLL_S,
-            # so owed mail still unread past after_min contradicts it: say who holds it, every run.
-            print(f"WATCH_HELD {project} {agent} {mid} age={round(age)}m pid={held.get('pid')} "
-                  f"host={held.get('host') or '-'} until={held.get('until') or '-'} "
-                  f"read={'no' if unread_in(box, mid) else 'yes'}", flush=True)
-            if "held_t" not in rec:
-                # a marker the root can forge must not keep the owner from ever being told: the
-                # notify clock starts at the first WATCH_HELD as it would at a wake
-                rec["held_t"] = now()
-                save_state(st_path, st, ledger_warned)
-        wake_due = held is None and age >= delays["after_min"]
-        wake_skipped = wake_due and "wake_t" in rec
-        if wake_due and not wake_skipped:
-            code, detail = ring(wake, values)
-            if detail == "not_configured":
-                if not no_wake:
-                    print("WATCH_ERROR no wake command; an ended agent cannot be restarted", flush=True)
-                    no_wake = True
-            else:
-                if code is not None:
-                    rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
+    with watch_lock(st_path) as locked:
+        if not locked:
+            print(f"WATCH_SKIP watch - reason=watch_locked state={st_path}", flush=True)
+            return fallback
+        st = load_state(st_path) if fallback is None else fallback
+        seen = set()
+        dirty = fallback is not None   # retry persistence even when no new action is due
+        no_wake = no_notify = False
+        for project, agent, box, m in owed_mail():
+            mid = m.get("id")
+            if not isinstance(mid, str) or not TOKEN.match(mid):
+                # no id, no ledger record and no wake: say so rather than skip the line in silence,
+                # because board still counts this message as owed mail
+                print(f"WATCH_ERROR {project} {agent} {_clean_oneline(_redact_text(repr(mid)))} unusable id", flush=True)
+                continue
+            seen.add(mid)
+            rec = st["messages"].setdefault(mid, {})
+            rec.setdefault("project", project)
+            rec.setdefault("agent", agent)
+            if not rec.get("seen_t"):
+                # the ledger remembers the first sight of an owed line, so one deleted before its first
+                # ring still ends as WATCH_RESOLVED instead of vanishing
+                rec["seen_t"] = now()
+                dirty = True
+            # an unparseable or future `t` must not hide a message: fall back to when it was first seen,
+            # and only a time in the past is an age — a future one cannot make a message old enough
+            ages = [a for a in (age_min(m.get("t")), age_min(rec.get("seen_t")))
+                    if a is not None and a >= 0]
+            if not ages:
+                print(f"WATCH_ERROR {project} {agent} {mid} no usable time t={_clean_oneline(_redact_text(repr(m.get('t'))))} "
+                      f"seen_t={_clean_oneline(_redact_text(repr(rec.get('seen_t'))))}", flush=True)
+                continue
+            age = max(ages)
+            held = listen_state(agent)
+            dot = dot_for(agent, cfg)
+            values = {"project": project, "agent": agent, "id": mid, "dot": dot or "", "age": round(age),
+                      "lanes": agent, "track": "none"}
+            if held and age >= delays["after_min"]:
+                # a marker holds the wake back. A real waiter prints and marks unread mail within POLL_S,
+                # so owed mail still unread past after_min contradicts it: say who holds it, every run.
+                pid_s = _clean_oneline(held.get("pid")) if held.get("pid") is not None else "None"
+                host_s = _clean_oneline(held.get("host") or "-") or "-"
+                until_s = _clean_oneline(held.get("until") or "-") or "-"
+                print(f"WATCH_HELD {project} {agent} {mid} age={round(age)}m pid={pid_s} "
+                      f"host={host_s} until={until_s} "
+                      f"read={'no' if unread_in(box, mid) else 'yes'}", flush=True)
+                if "held_t" not in rec:
+                    # a marker the root can forge must not keep the owner from ever being told: the
+                    # notify clock starts at the first WATCH_HELD as it would at a wake
+                    rec["held_t"] = now()
                     save_state(st_path, st, ledger_warned)
-                print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
-                      f"exit={detail or code}", flush=True)
-        starts = [(k, rec[k]) for k in ("wake_t", "held_t") if k in rec]
-        if not starts:
-            continue
-        current = datetime.datetime.now(datetime.timezone.utc)
-        clocks = {k: rfc_time(v) for k, v in starts}
-        ages_since = {k: (current - t).total_seconds() / 60 if t is not None else None
-                      for k, t in clocks.items()}
-        bad = {k: "invalid" if a is None else "future" for k, a in ages_since.items()
-               if a is None or a < 0}
-        wake_time = bad.get("wake_t", rec.get("wake_t", "-"))
-        if wake_skipped:
-            # The ledger suppresses a second wake. Show only a validated timestamp or its status.
-            print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={wake_time} "
-                  f"wake_age_min={rec.get('wake_age_min', '-')}", flush=True)
-        if bad:
-            # the ledger may not hold the notify back with a time that is no age: say so, and treat
-            # the notify as due, the rule the idle half applies to its own ring time
-            for k, reason in bad.items():
-                print(f"WATCH_ERROR {project} {agent} {mid} unusable {k}={reason}; notify is due", flush=True)
-        elif st_path in ledger_warned and not loop:
-            # A one-shot watch cannot keep its clock until the next invocation.
-            print(f"WATCH_ERROR {project} {agent} {mid} ledger not saved; notify is due", flush=True)
-        elif max(ages_since.values()) < delays["notify_after_min"]:
-            # the earlier of the wake and the first WATCH_HELD starts the clock
-            continue
-        since = ages_since.get("wake_t")
-        # A message is owed until it is answered, read or not. A read marker lives in the same folder
-        # as the mail, so it can add a visible event here, never silence this one.
-        if not unread_in(box, mid) and not rec.get("stuck_t"):
-            rec["stuck_t"] = now()
+            wake_due = held is None and age >= delays["after_min"]
+            wake_skipped = wake_due and "wake_t" in rec
+            if wake_due and not wake_skipped:
+                code, detail = ring(wake, values)
+                if detail == "not_configured":
+                    if not no_wake:
+                        print("WATCH_ERROR no wake command; an ended agent cannot be restarted", flush=True)
+                        no_wake = True
+                else:
+                    gave_up = False
+                    if code == 0:
+                        rec.update({"wake_t": now(), "wake_age_min": round(age), "dot": dot or None})
+                        rec.pop("wake_fails", None)
+                        save_state(st_path, st, ledger_warned)
+                    elif code is not None:
+                        fails = _safe_int(rec.get("wake_fails"), 0, 0) + 1
+                        rec["wake_fails"] = fails
+                        rec.setdefault("wake_fail_since", now())
+                        rec["dot"] = dot or None
+                        if fails >= delays["wake_retries"]:
+                            rec.update({"wake_t": now(), "wake_age_min": round(age)})
+                            gave_up = True
+                        save_state(st_path, st, ledger_warned)
+                    print(f"WATCH_WAKE {project} {agent} {mid} age={round(age)}m dot={dot or '-'} "
+                          f"exit={_clean_oneline(detail or code)}", flush=True)
+                    if gave_up:
+                        print(f"WATCH_WAKE_GAVE_UP {project} {agent} {mid} tries={rec['wake_fails']}", flush=True)
+            starts = [(k, rec[k]) for k in ("wake_t", "held_t", "wake_fail_since") if k in rec]
+            if not starts:
+                continue
+            current = datetime.datetime.now(datetime.timezone.utc)
+            clocks = {k: rfc_time(v) for k, v in starts}
+            ages_since = {k: (current - t).total_seconds() / 60 if t is not None else None
+                          for k, t in clocks.items()}
+            bad = {k: "invalid" if a is None else "future" for k, a in ages_since.items()
+                   if a is None or a < 0}
+            wake_time = bad.get("wake_t", rec.get("wake_t", "-"))
+            if wake_skipped:
+                # The ledger suppresses a second wake. Show only a validated timestamp or its status.
+                print(f"WATCH_SKIP {project} {agent} {mid} reason=wake_already wake_t={_clean_oneline(wake_time)} "
+                      f"wake_age_min={_clean_oneline(rec.get('wake_age_min', '-'))}", flush=True)
+            if bad:
+                # the ledger may not hold the notify back with a time that is no age: say so, and treat
+                # the notify as due, the rule the idle half applies to its own ring time
+                for k, reason in bad.items():
+                    print(f"WATCH_ERROR {project} {agent} {mid} unusable {k}={reason}; notify is due", flush=True)
+            elif st_path in ledger_warned and not loop:
+                # A one-shot watch cannot keep its clock until the next invocation.
+                print(f"WATCH_ERROR {project} {agent} {mid} ledger not saved; notify is due", flush=True)
+            elif max(ages_since.values()) < delays["notify_after_min"]:
+                # the earlier of the wake and the first WATCH_HELD starts the clock
+                continue
+            since = ages_since.get("wake_t")
+            # A message is owed until it is answered, read or not. A read marker lives in the same folder
+            # as the mail, so it can add a visible event here, never silence this one.
+            if not unread_in(box, mid) and not rec.get("stuck_t"):
+                rec["stuck_t"] = now()
+                save_state(st_path, st, ledger_warned)
+                print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
+                      f"wake_t={_clean_oneline(wake_time)}", flush=True)
+            if rec.get("notify_t"):
+                print(f"WATCH_SKIP {project} {agent} {mid} reason=notify_already notify_t={_clean_oneline(rec['notify_t'])}",
+                      flush=True)
+                continue
+            code, detail = ring(notify, values)
+            if detail == "not_configured":
+                if not no_notify:
+                    print("WATCH_ERROR no notify command; the owner is never told", flush=True)
+                    no_notify = True
+                continue
+            if code is not None:
+                rec["notify_t"] = now()
+                save_state(st_path, st, ledger_warned)
+            after_wake = "-" if since is None or since < 0 else round(since)
+            print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={after_wake}m "
+                  f"read={'no' if unread_in(box, mid) else 'yes'} held={'yes' if held else 'no'} "
+                  f"exit={_clean_oneline(detail or code)}", flush=True)
+        if dirty:
+            save_state(st_path, st, ledger_warned)   # first sight is a ledger write: a vanished line must resolve, not vanish
+        for mid, rec in sorted(st["messages"].items()):
+            if mid in seen:
+                continue
+            del st["messages"][mid]
             save_state(st_path, st, ledger_warned)
-            print(f"WATCH_STUCK {project} {agent} {mid} age={round(age)}m read=yes unanswered=yes "
-                  f"wake_t={wake_time}", flush=True)
-        if rec.get("notify_t"):
-            print(f"WATCH_SKIP {project} {agent} {mid} reason=notify_already notify_t={rec['notify_t']}",
-                  flush=True)
-            continue
-        code, detail = ring(notify, values)
-        if detail == "not_configured":
-            if not no_notify:
-                print("WATCH_ERROR no notify command; the owner is never told", flush=True)
-                no_notify = True
-            continue
-        if code is not None:
-            rec["notify_t"] = now()
-            save_state(st_path, st, ledger_warned)
-        after_wake = "-" if since is None or since < 0 else round(since)
-        print(f"WATCH_NOTIFY {project} {agent} {mid} age={round(age)}m after_wake={after_wake}m "
-              f"read={'no' if unread_in(box, mid) else 'yes'} held={'yes' if held else 'no'} "
-              f"exit={detail or code}", flush=True)
-    if dirty:
-        save_state(st_path, st, ledger_warned)   # first sight is a ledger write: a vanished line must resolve, not vanish
-    for mid, rec in sorted(st["messages"].items()):
-        if mid in seen:
-            continue
-        del st["messages"][mid]
-        save_state(st_path, st, ledger_warned)
-        print(f"WATCH_RESOLVED {rec.get('project') or '-'} {rec.get('agent') or '-'} {mid}", flush=True)
-    if scan.idle or scan.recovery:
-        watch_board(scan, delays, st, st_path, cfg, ledger_warned)
-    if scan.keep_full:
-        watch_capacity(scan, delays, st, st_path, ledger_warned)
-    try:
-        os.makedirs(os.path.dirname(st_path), exist_ok=True)
-        write_atomic(heartbeat_path(st_path), json.dumps({"t": now(), "pid": os.getpid(), "loop": loop}) + "\n")
-    except OSError as exc:
-        print(f"WATCH_ERROR heartbeat {exc.__class__.__name__}", flush=True)
-    return st if st_path in ledger_warned else None
+            rproj_s = _clean_oneline(rec.get("project") or "-") or "-"
+            ragent_s = _clean_oneline(rec.get("agent") or "-") or "-"
+            rmid_s = _clean_oneline(mid) or "-"
+            print(f"WATCH_RESOLVED {rproj_s} {ragent_s} {rmid_s}", flush=True)
+        if scan.idle or scan.recovery:
+            watch_board(scan, delays, st, st_path, cfg, ledger_warned)
+        if scan.keep_full:
+            watch_capacity(scan, delays, st, st_path, ledger_warned)
+        try:
+            _ensure_dir_under(BASE, os.path.dirname(st_path))
+            write_atomic(heartbeat_path(st_path), json.dumps({"t": now(), "pid": os.getpid(), "loop": loop}) + "\n")
+        except OSError as exc:
+            print(f"WATCH_ERROR heartbeat {exc.__class__.__name__}", flush=True)
+        return st if st_path in ledger_warned else None
 
 def stop_quiet(signum, frame):
     raise SystemExit(0)
@@ -2059,6 +2749,8 @@ def init(a):
     projects, by_id = cfg["projects"], {p.get("id"): p for p in cfg["projects"] if isinstance(p, dict)}
     for pid, main in pairs(project_specs, "project"):
         pid, main = token("project", pid), token("main", main)
+        if pid in RESERVED_OPS_DIRS:
+            die(f"project {pid!r} is reserved for dotomation ops dirs")
         if pid in by_id:
             if by_id[pid].get("main") != main:
                 report.append(f"INIT project {pid} main={by_id[pid].get('main')} (kept; given main={main} not applied)")
@@ -2096,18 +2788,23 @@ def init(a):
             token("dot", d["id"])
     for p in projects:
         if isinstance(p, dict) and p.get("id") is not None:
-            token("project", p["id"])
+            pid = token("project", p["id"])
+            if pid in RESERVED_OPS_DIRS:
+                die(f"project {pid!r} is reserved for dotomation ops dirs")
         if isinstance(p, dict) and p.get("main") is not None:
             token("main", p["main"])
 
-    os.makedirs(base, exist_ok=True)   # only once the input is accepted
-    for d in dots:
-        if isinstance(d, dict) and isinstance(d.get("id"), str):
-            os.makedirs(os.path.join(base, "live", d["id"]), exist_ok=True)
-            os.makedirs(os.path.join(base, "memory", d["id"]), exist_ok=True)
-    for p in projects:
-        if isinstance(p, dict) and isinstance(p.get("id"), str):
-            os.makedirs(os.path.join(base, p["id"], "mail"), exist_ok=True)
+    try:
+        os.makedirs(base, exist_ok=True)   # only once the input is accepted
+        for d in dots:
+            if isinstance(d, dict) and isinstance(d.get("id"), str):
+                _ensure_dir_under(base, os.path.join(base, "live", d["id"]))
+                _ensure_dir_under(base, os.path.join(base, "memory", d["id"]))
+        for p in projects:
+            if isinstance(p, dict) and isinstance(p.get("id"), str):
+                _ensure_dir_under(base, os.path.join(base, p["id"], "mail"))
+    except OSError as exc:
+        die(f"cannot create ops directory under {base} ({exc.__class__.__name__})")
 
     path = os.path.join(base, "dots.json")
     data = json.dumps(cfg, ensure_ascii=False, indent=1) + "\n"
@@ -2228,6 +2925,11 @@ def brief(base, dots, projects, cfg, script):
         print("# Dots-Only Execution Context")
         print("- Quota boundary: Dots quota only (zero local session quota). Do not install or run subdots.py or direct-mail polling.")
         print("- Model & Effort: GPT-6.2 Astra (`ultra` for coordinator, `xhigh` for workers/reviewers). Never use Codex on any host.")
+        print("# Self-Driving Track Loop Harness (Zero Root Intervention)")
+        print(f"- Helper: python3 {script} loop <init|enqueue|claim|progress|complete|block|status>")
+        print(f"- Worker loop: claim -> do reversible local work -> progress -> complete (auto-handoff to downstream tracks) -> claim next without stopping.")
+        print("- Anti-churn & skip-blocked: NEVER start a new task while one is active; on single-item genuine block (e.g. missing input), block that 1 item (`loop block`) and immediately claim/seed the next unblocked item.")
+        print("- Standing Goal Contract: all reversible in-scope analysis/edits/tests/local rev/* commits inside allowed paths are pre-authorized; ask ONLY on true hard stops.")
         return
 
     if mode == "sub-dots":
@@ -2281,6 +2983,856 @@ def brief(base, dots, projects, cfg, script):
         print("Notify command: configured (watch runs it when a woken agent has still not answered)")
     else:
         print("Notify command: none (watch prints WATCH_ERROR when a notify is due and no command is set)")
+
+# ---------------------------------------------------------------- loop
+
+_LOOP_TRIVIAL_EVIDENCE = {
+    "done", "ok", "okay", "none", "n/a", "na", "-", "worked", "it worked", "pass", "passed", "yes", "true", "complete", "completed",
+}
+_LOOP_HARD_STOP_RE = re.compile(
+    r"(?is)("
+    r"\bgit\s+push\b(?!\s+\S*rev-out)"
+    r"|\bpull\s+requests?\b|\b(?:create|open|submit|merge)(?:s|d|ing)?\s+(?:a\s+)?pr\b|\bgithub\s+pr\b"
+    r"|\bmerg(?:e|es|ed|ing)\s+(?:into|to|with)\s+main\b"
+    r"|\bprod(?:uction)?\s+deploy(?:ment|s|ed|ing)?\b|\bdeploy(?:s|ed|ing|ment)?\s+(?:to\s+)?prod(?:uction)?\b|\bpublish(?:es|ed|ing)?\s+releases?\b"
+    r"|\brm\s+-rf?\b|destructive\s+wip(?:e|es|ed|ing)?|\bwip(?:e|es|ed|ing)\s+(?:data|disk|repo|branch|db)\b|\.git/"
+    r"|원격\s*(?:푸시|push)|(?:PR|풀\s*리퀘스트)\s*(?:생성|오픈|병합)|main\s*(?:브랜치\s*)?병합|프로덕션\s*배포|운영\s*배포|릴리즈\s*배포"
+    r"|파괴적\s*(?:삭제|초기화)|디스크\s*삭제"
+    r"|\bcodex\b|코덱스|\b401\b|\b403\b|\bunauthorized\b|\bforbidden\b"
+    r"|\b(?:credential|password|secret|token|api[_-]?key|billing|spend|spending|purchas(?:e|es|ed|ing)|payment)s?\b"
+    r"|과금|결제|유료\s*결제|비밀키|토큰\s*(?:만료|누락|필요|없음)|인증\s*(?:실패|만료|오류)"
+    r"|outside\s+allowed_paths|out\s+of\s+scope|allowed_paths\s*밖|허용\s*경로\s*밖"
+    r"|owner\s+(?:pause|stop)|on\s+hold|오너\s*(?:중단|정지|보류)"
+    r"|\bmissing\s+(?:file|video|source|input|data|credentials?|tokens?|access|permissions?|pdfs?|audio|transcripts?)s?\b"
+    r"|\bfiles?\s+(?:not\s+found|missing|unavailable|inaccessible)\b|\bunavailable\b|\bnot\s+accessible\b|\binaccessible\b|\bpermission\s+denied\b"
+    r"|(?:판서\s*기록|원본\s*(?:파일|영상|문항|데이터|자료)|강의\s*영상|음성\s*파일|접근\s*권한|자격\s*증명|외부\s*소스|파일)\s*(?:이\s*)?(?:없음|누락|찾을\s*수\s*없|접근\s*불가|열\s*수\s*없)"
+    r"|범위\s*밖"
+    r")"
+)
+_LOOP_FALSE_REFUSAL_RE = re.compile(
+    r"(?is)("
+    r"not\s+explicitly\s+(?:specified|authorized|instructed|permitted)"
+    r"|not\s+(?:expressly|directly)\s+authorized"
+    r"|need(?:s|ed)?\s+(?:owner|user|root)\s+(?:approval|confirmation|permission)"
+    r"|(?:waiting|awaiting)\s+(?:for|on)\s+(?:owner|root|user)"
+    r"|no\s+further\s+(?:instruction|action)"
+    r"|명시되지\s*않|직접\s*지시.{0,12}없|재승인|승인\s*미확인|허락.{0,8}필요"
+    r"|오너\s*(?:승인|허락|확인).{0,10}대기|루트\s*(?:지시|승인).{0,10}대기|후속\s*지시.{0,8}없"
+    r")"
+)
+_DEFAULT_LOOP_PREAUTHORIZED = (
+    "read/analyze authorized workspace and inputs",
+    "edit in-scope files, adjacent helpers, configs, ontology/specs, and tests",
+    "run local tests, linters, builds, benchmarks, and diagnostics",
+    "commit local rev/* or task branches",
+    "seed next non-duplicate in-scope research/algorithm/implementation iteration",
+)
+_DEFAULT_LOOP_HARD_STOPS = (
+    "remote git push outside approved rev-out",
+    "GitHub PR or merge to main",
+    "production deploy or release publish",
+    "destructive wipe or rm -rf",
+    "paid spending or external outreach",
+    "Codex usage on any host",
+    "edits outside allowed_paths",
+)
+
+
+def _loop_item_id():
+    return f"l-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
+
+
+def _loop_key(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _loop_dir(dot):
+    return os.path.join(BASE, "loops", dot)
+
+
+def _loop_contract_path(dot, track, override=None):
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(_loop_dir(dot), f"{track}.contract.json")
+
+
+def _loop_state_path(dot, track):
+    return os.path.join(_loop_dir(dot), f"{track}.state.json")
+
+
+def _loop_events_path(dot, track):
+    return os.path.join(_loop_dir(dot), f"{track}.events.jsonl")
+
+
+def _loop_load_contract(dot, track, override=None, expect_sha=None):
+    path = _loop_contract_path(dot, track, override)
+    if not regular(path):
+        die(f"contract {path} is not a regular file")
+    fd = open_raw(path)
+    if fd is None:
+        die(f"missing loop contract {path}; run dots.py loop init {dot} {track} first")
+    try:
+        with os.fdopen(fd, "rb") as raw:
+            blob = raw.read(MAX_JSON_BYTES + 1)
+    except OSError as exc:
+        die(f"cannot read contract {path} ({exc.__class__.__name__})")
+    if len(blob) > MAX_JSON_BYTES:
+        die(f"contract {path} exceeds {MAX_JSON_BYTES} bytes")
+    actual_sha = hashlib.sha256(blob).hexdigest()
+    if expect_sha is not None:
+        sha = str(expect_sha).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            die("--contract-sha256 must be 64 hex characters")
+        if actual_sha != sha:
+            die(f"contract sha256 mismatch expected={sha} actual={actual_sha}")
+    try:
+        doc = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        die(f"invalid contract JSON {path}: {exc}")
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        die(f"invalid contract format in {path}")
+    if doc.get("dot") != dot or doc.get("track") != track:
+        die(f"contract dot/track mismatch in {path}: expected {dot}/{track}")
+    proj = doc.get("project")
+    if not isinstance(proj, str) or not TOKEN.fullmatch(proj) or proj in RESERVED_OPS_DIRS:
+        die(f"contract {path} missing valid non-reserved project token")
+    for field in ("feeds_to", "required_gates"):
+        val = doc.get(field)
+        if val is not None and (not isinstance(val, list) or any(not isinstance(x, str) or not TOKEN.fullmatch(x) for x in val)):
+            die(f"contract {path} has invalid {field}")
+    return doc, path, actual_sha
+
+
+def _loop_valid_item(it):
+    if not isinstance(it, dict):
+        return False
+    iid = it.get("id")
+    return isinstance(iid, str) and bool(TOKEN.fullmatch(iid))
+
+
+def _loop_normalize_state(doc):
+    st = doc if isinstance(doc, dict) else {}
+    raw_active = st.get("active")
+    return {
+        "v": 1,
+        "paused": bool(st.get("paused", False)),
+        "pause_reason": st.get("pause_reason") if isinstance(st.get("pause_reason"), str) else None,
+        "goal_complete": bool(st.get("goal_complete", False)),
+        "active": raw_active if _loop_valid_item(raw_active) else None,
+        "queue": [x for x in (st.get("queue") or []) if _loop_valid_item(x)] if isinstance(st.get("queue"), list) else [],
+        "done": [x for x in (st.get("done") or []) if _loop_valid_item(x)] if isinstance(st.get("done"), list) else [],
+        "blocked": [x for x in (st.get("blocked") or []) if _loop_valid_item(x)] if isinstance(st.get("blocked"), list) else [],
+        "consecutive_blocks": _safe_int(st.get("consecutive_blocks"), 0, 0),
+        "false_refusal_counts": {k: _safe_int(v, 0, 0) for k, v in (st.get("false_refusal_counts") or {}).items()
+                                 if isinstance(k, str) and TOKEN.fullmatch(k) and _safe_int(v, -1, 0) >= 0}
+        if isinstance(st.get("false_refusal_counts"), dict) else {},
+        "last_activity_at": st.get("last_activity_at") if isinstance(st.get("last_activity_at"), str) else None,
+        "last_agent": st.get("last_agent") if isinstance(st.get("last_agent"), str) else None,
+    }
+
+
+def _loop_load_state(dot, track):
+    return _loop_normalize_state(load_json(_loop_state_path(dot, track)))
+
+
+def _loop_save_state(dot, track, st):
+    write_atomic(_loop_state_path(dot, track), json.dumps(st, ensure_ascii=False, indent=1) + "\n")
+
+
+def _loop_emit_event(dot, track, kind, payload):
+    append_line(_loop_events_path(dot, track), {"v": 1, "t": now(), "dot": dot, "track": track, "event": kind, "payload": payload})
+
+
+def _loop_sync_live(dot, agent, state, task, note, evidence, goal, doing, next_step, contract, blocker_text=None):
+    live_dir = os.path.join(BASE, "live", dot)
+    if not os.path.isdir(live_dir):
+        return
+    mem_dir = os.path.join(BASE, "memory", dot)
+    live_path = os.path.join(live_dir, f"{agent}.jsonl")
+    mem_path = os.path.join(mem_dir, f"{agent}.json")
+    with dot_lock(live_dir):
+        prev_line = (v1_lines(live_path) or [None])[-1] or {}
+        prev_mem = load_json(mem_path) or {}
+        ts = now()
+        role_raw = contract.get("role") or prev_line.get("role") or "worker"
+        model_raw = contract.get("model") or prev_line.get("model") or "requested gpt-6.2-astra xhigh; runtime does not display effective"
+        proj_raw = contract.get("project") or prev_line.get("project") or "default"
+        host_raw = contract.get("host") or prev_line.get("host") or socket.gethostname()
+        line = {
+            "t": ts,
+            "agent": agent,
+            "role": _clean_oneline(role_raw)[:200] or "worker",
+            "model": _clean_oneline(model_raw)[:200] or "requested",
+            "project": proj_raw if isinstance(proj_raw, str) and TOKEN.fullmatch(proj_raw) else "default",
+            "task": text("task", _clean_oneline(task))[:MAX_TEXT],
+            "state": state,
+            "host": _clean_oneline(host_raw)[:128] or "local",
+            "note": text("note", _clean_oneline(note))[:MAX_TEXT],
+            "evidence": text("evidence", _clean_oneline(evidence))[:MAX_TEXT],
+        }
+        same_task = prev_mem.get("task") == line["task"] and prev_mem.get("agent") == agent
+        prior = prev_mem.get("decisions") if same_task else None
+        decisions = [d for d in prior if isinstance(d, dict) and set(d) == {"t", "text"}
+                     and rfc_time(d["t"]) is not None and one_line(d["text"], MAX_ITEM)
+                     ] if isinstance(prior, list) else []
+        blockers = [] if state == "done" or not same_task else [b for b in str_list(prev_mem.get("blockers")) if one_line(b, MAX_ITEM)]
+        if state == "blocked" and blocker_text:
+            bclean = _clean_oneline(blocker_text)[:MAX_ITEM]
+            if bclean and bclean not in blockers:
+                blockers = (blockers + [bclean])[-MAX_BLOCKERS:]
+        mem = {
+            "v": 1,
+            "t": ts,
+            "dot": dot,
+            "agent": agent,
+            "project": line["project"],
+            "task": line["task"],
+            "state": state,
+            "host": line["host"],
+            "goal": _clean_oneline(goal or "-")[:MAX_TEXT] or "-",
+            "doing": _clean_oneline(doing or "-")[:MAX_TEXT] or "-",
+            "next": _clean_oneline(next_step or "-")[:MAX_TEXT] or "-",
+            "decisions": decisions[-MAX_DECISIONS:],
+            "blockers": blockers,
+        }
+        ensure_dir(mem_dir)
+        append_line(live_path, line)
+        write_atomic(mem_path, json.dumps(mem, ensure_ascii=False, indent=1) + "\n")
+
+
+def _loop_print_goal_header(contract, st):
+    allowed = _clean_oneline(_redact_text(", ".join(contract.get("allowed_paths") or ["*"]))) or "*"
+    preauth = _clean_oneline(_redact_text("; ".join(contract.get("preauthorized_actions") or [])))
+    stops = _clean_oneline(_redact_text("; ".join(contract.get("hard_stops") or [])))
+    gates = _clean_oneline(", ".join(contract.get("required_gates") or [])) or "none"
+    feeds = _clean_oneline(", ".join(contract.get("feeds_to") or [])) or "none"
+    obj_s = _clean_oneline(_redact_text(contract.get("objective", "")))
+    print(f"[STANDING_GOAL] dot={contract['dot']} track={contract['track']} project={contract['project']} "
+          f"continuous={str(bool(contract.get('continuous'))).lower()} feeds_to={feeds} gates={gates}", flush=True)
+    print(f"  objective: {obj_s}", flush=True)
+    print(f"[PREAUTHORIZED_AUTONOMY] scope=[{allowed}] | execute directly: {preauth} | "
+          f"HARD_STOPS ONLY: {stops}. NEVER stop or ask root/owner for reversible local steps inside scope.",
+          flush=True)
+    if st.get("blocked"):
+        print(f"  skipped_blocked={len(st['blocked'])} (already isolated; do not stall other items)", flush=True)
+
+
+def _loop_sort_queue(queue):
+    queue.sort(key=lambda it: (-_safe_int(it.get("priority"), 5), str(it.get("created_at") or "")))
+
+
+def _loop_find_duplicate(st, key_norm):
+    active = st.get("active")
+    if isinstance(active, dict) and _loop_key(active.get("key")) == key_norm:
+        return active.get("id")
+    for seq in (st.get("queue") or (), st.get("done") or ()):
+        for it in seq:
+            if _loop_key(it.get("key")) == key_norm:
+                return it.get("id")
+    return None
+
+
+def _loop_enqueue_item(dot, track, contract, st, title, brief_text, key_val, refs, priority, from_track=None, raise_on_full=True):
+    key_norm = _loop_key(key_val or title)
+    dup_id = _loop_find_duplicate(st, key_norm)
+    if dup_id is not None:
+        return None, dup_id
+    max_items = _safe_int(contract.get("max_items"), 0, 0)
+    total_count = len(st["done"]) + len(st["queue"]) + (1 if st.get("active") else 0)
+    if max_items > 0 and total_count >= max_items:
+        if raise_on_full:
+            die(f"max_items ({max_items}) reached for {dot}/{track}")
+        return None, "max_items"
+    item_id = _loop_item_id()
+    existing_ids = {it.get("id") for it in ([st["active"]] if st.get("active") else []) + st["queue"] + st["done"] + st["blocked"]}
+    while item_id in existing_ids:
+        item_id = _loop_item_id()
+    prio_v = _safe_int(priority, 5)
+    item = {
+        "id": item_id,
+        "key": key_norm,
+        "title": title,
+        "brief": brief_text or title,
+        "refs": list(refs),
+        "priority": prio_v,
+        "from_track": from_track,
+        "created_at": now(),
+        "progress": [],
+    }
+    st["queue"].append(item)
+    _loop_sort_queue(st["queue"])
+    st["last_activity_at"] = now()
+    _loop_save_state(dot, track, st)
+    _loop_emit_event(dot, track, "enqueue", {"item_id": item_id, "key": key_norm, "priority": prio_v, "from_track": from_track})
+    return item, None
+
+
+def loop_init(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    project = token("project", a.project)
+    if project in RESERVED_OPS_DIRS:
+        die(f"project {project!r} is reserved for dotomation ops dirs")
+    objective = block("objective", a.objective)
+    if SECRET.search(objective):
+        die("--objective looks like it contains a secret; leave it out")
+    role = text("role", a.role) if a.role else "worker"
+    model = text("model", a.model) if a.model else "requested gpt-6.2-astra xhigh; runtime does not display effective"
+    host = text("host", a.host) if a.host else "local"
+    feeds_to = []
+    for t_name in a.feeds_to:
+        tgt = token("feeds-to", t_name)
+        if tgt == track:
+            die("--feeds-to cannot name the track itself")
+        if tgt not in feeds_to:
+            feeds_to.append(tgt)
+    allowed_paths = [text("allowed-path", p) for p in a.allowed_path] if a.allowed_path else ["*"]
+    preauth = [text("preauthorized", p) for p in a.preauthorized] if a.preauthorized else list(_DEFAULT_LOOP_PREAUTHORIZED)
+    hard_stops = [text("hard-stop", p) for p in a.hard_stop] if a.hard_stop else list(_DEFAULT_LOOP_HARD_STOPS)
+    gates = [token("gate", g) for g in a.gate]
+    if a.max_items < 0 or a.max_consecutive_blocks < 1 or a.idle_after_min < 0:
+        die("invalid negative bound for loop thresholds")
+    cpath = _loop_contract_path(dot, track, getattr(a, "contract", None))
+    if os.path.lexists(cpath) and not regular(cpath):
+        die(f"{cpath} is not a regular file")
+    prev_contract = load_json(cpath) if os.path.lexists(cpath) and not a.force else None
+    ts = now()
+    contract = {
+        "v": 1,
+        "dot": dot,
+        "track": track,
+        "project": project,
+        "role": role,
+        "model": model,
+        "host": host,
+        "objective": objective,
+        "continuous": bool(a.continuous),
+        "allowed_paths": allowed_paths,
+        "preauthorized_actions": preauth,
+        "hard_stops": hard_stops,
+        "feeds_to": feeds_to,
+        "required_gates": gates,
+        "max_items": int(a.max_items),
+        "max_consecutive_blocks": int(a.max_consecutive_blocks),
+        "idle_after_min": int(a.idle_after_min),
+        "created_at": (prev_contract or {}).get("created_at") if isinstance(prev_contract, dict) and prev_contract.get("created_at") else ts,
+        "updated_at": ts,
+    }
+    loops_dir = _loop_dir(dot)
+    ensure_dir(loops_dir)
+    ensure_dir(os.path.dirname(cpath))
+    ensure_dir(os.path.join(BASE, "live", dot))
+    ensure_dir(os.path.join(BASE, "memory", dot))
+    raw_bytes = (json.dumps(contract, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
+    sha = hashlib.sha256(raw_bytes).hexdigest()
+    with dot_lock(loops_dir):
+        kept = os.path.lexists(cpath) and not a.force
+        if kept:
+            kept_doc, _, sha = _loop_load_contract(dot, track, getattr(a, "contract", None), None)
+            ev_payload = {
+                "project": kept_doc["project"],
+                "continuous": bool(kept_doc.get("continuous")),
+                "feeds_to": list(kept_doc.get("feeds_to") or []),
+                "contract_sha256": sha,
+                "kept": True,
+            }
+        else:
+            if os.path.lexists(cpath) and not regular(cpath):
+                die(f"{cpath} is not a regular file")
+            write_atomic(cpath, raw_bytes.decode("utf-8"))
+            ev_payload = {
+                "project": project,
+                "continuous": bool(a.continuous),
+                "feeds_to": feeds_to,
+                "contract_sha256": sha,
+                "kept": False,
+            }
+        spath = _loop_state_path(dot, track)
+        if os.path.lexists(spath) and not regular(spath):
+            die(f"{spath} is not a regular file")
+        if not os.path.lexists(spath) or a.force:
+            init_st = _loop_normalize_state({"last_activity_at": ts})
+            _loop_save_state(dot, track, init_st)
+        _loop_emit_event(dot, track, "init", ev_payload)
+    print(f"LOOP_INIT dot={dot} track={track} contract={cpath} sha256={sha}")
+    script = os.path.abspath(__file__)
+    print(f"Track Brief: export DOTS_OPS_BASE={shlex.quote(BASE)} && python3 {script} loop claim {dot} {track} --agent <agentId>")
+    return 0
+
+
+def loop_enqueue(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    title = text("title", a.title, MAX_TEXT)
+    brief_text = block("brief", a.brief) if a.brief is not None else title
+    if SECRET.search(brief_text):
+        die("--brief looks like it contains a secret; leave it out")
+    refs = refs_of(a.ref)
+    from_track = token("from-track", a.from_track) if a.from_track else None
+    key_val = text("key", a.key, MAX_TEXT) if a.key else title
+    loops_dir = _loop_dir(dot)
+    if not os.path.isdir(loops_dir):
+        die(f"no loops/{dot} folder; run dots.py loop init first")
+    contract, _, _ = _loop_load_contract(dot, track, getattr(a, "contract", None), getattr(a, "contract_sha256", None))
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        item, dup_id = _loop_enqueue_item(dot, track, contract, st, title, brief_text, key_val, refs, a.priority, from_track=from_track)
+        qlen = len(st["queue"])
+    if item is None:
+        print(f"LOOP_DEDUP dot={dot} track={track} key={_clean_oneline(_redact_text(_loop_key(key_val)))} existing={_clean_oneline(dup_id)}")
+        return 0
+    print(f"LOOP_ENQUEUED {item['id']} dot={dot} track={track} queue_len={qlen}")
+    return 0
+
+
+def _loop_try_claim_once(dot, track, agent, contract):
+    """Attempt under dot_lock to inspect/claim queue item; returns (code, lines, sync_args, contract, st)."""
+    loops_dir = _loop_dir(dot)
+    lines = []
+    sync_args = None
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        if st["paused"]:
+            pr_s = _clean_oneline(_redact_text(st["pause_reason"] or "paused_by_owner")) or "paused_by_owner"
+            lines.append(f"LOOP_PAUSED dot={dot} track={track} reason={pr_s}")
+            return 4, lines, None, contract, st
+        active = st.get("active")
+        if isinstance(active, dict):
+            aid_s = _clean_oneline(str(active.get("id") or ""))
+            atitle_s = _clean_oneline(_redact_text(str(active.get("title") or "")))
+            lines.append(f"LOOP_ACTIVE_ENFORCED {aid_s} dot={dot} track={track} title={json.dumps(atitle_s, ensure_ascii=False)}")
+            lines.append("  Finish or explicitly block this active item before claiming or starting another.")
+            return 0, lines, None, contract, st
+        if st["queue"]:
+            item = st["queue"].pop(0)
+            item["claimed_by"] = agent
+            item["claimed_at"] = now()
+            st["active"] = item
+            st["last_activity_at"] = item["claimed_at"]
+            st["last_agent"] = agent
+            _loop_save_state(dot, track, st)
+            _loop_emit_event(dot, track, "claim", {"item_id": item["id"], "agent": agent, "title": item.get("title", "")})
+            ctitle_s = _clean_oneline(_redact_text(str(item.get("title") or "")))
+            cprio = _safe_int(item.get("priority"), 5)
+            lines.append(f"LOOP_CLAIMED {item['id']} dot={dot} track={track} priority={cprio} title={json.dumps(ctitle_s, ensure_ascii=False)}")
+            sync_args = ("start", item["id"], f"Claimed {track} item: {ctitle_s}", f"loop:{track}/{item['id']}",
+                         contract.get("objective") or ctitle_s, ctitle_s, f"Complete or progress {item['id']}")
+            return 0, lines, sync_args, contract, st
+        max_items = _safe_int(contract.get("max_items"), 0, 0)
+        if contract.get("continuous") and not st.get("goal_complete"):
+            if max_items > 0 and len(st["done"]) >= max_items:
+                st["goal_complete"] = True
+                _loop_save_state(dot, track, st)
+                _loop_emit_event(dot, track, "goal_complete", {"reason": "max_items_reached", "done": len(st["done"])})
+                lines.append(f"LOOP_GOAL_COMPLETE dot={dot} track={track} done={len(st['done'])} reason=max_items_reached")
+                return 0, lines, None, contract, st
+            max_blocks = _safe_int(contract.get("max_consecutive_blocks"), 3, 1)
+            if st["consecutive_blocks"] >= max_blocks:
+                lines.append(f"LOOP_CIRCUIT_OPEN dot={dot} track={track} consecutive_blocks={st['consecutive_blocks']} (review blocked items before seeding more)")
+                return 5, lines, None, contract, st
+            lines.append(f"LOOP_SEED_REQUIRED dot={dot} track={track} done={len(st['done'])} blocked={len(st['blocked'])}")
+            return 10, lines, None, contract, st
+        lines.append(f"LOOP_EMPTY dot={dot} track={track} done={len(st['done'])} blocked={len(st['blocked'])}")
+        return 3, lines, None, contract, st
+
+
+def loop_claim(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    agent = token("agent", a.agent)
+    loops_dir = _loop_dir(dot)
+    if not os.path.isdir(loops_dir):
+        die(f"no loops/{dot} folder; run dots.py loop init first")
+    contract, cpath, _ = _loop_load_contract(dot, track, getattr(a, "contract", None), getattr(a, "contract_sha256", None))
+    wait_s = int(a.wait or 0)
+    if wait_s < 0 or wait_s > LISTEN_MAX_S:
+        die(f"--wait must be between 0 and {LISTEN_MAX_S} seconds")
+
+    def _emit_claim_outcome(code, lines, sync_args, st_obj):
+        for ln in lines:
+            print(ln, flush=True)
+        script = os.path.abspath(__file__)
+        if code == 5:
+            code = 3
+        if code == 0 and st_obj.get("active"):
+            _loop_print_goal_header(contract, st_obj)
+            it = st_obj["active"]
+            iid_s = _clean_oneline(str(it.get("id") or ""))
+            if not TOKEN.fullmatch(iid_s):
+                die("active item has invalid id")
+            from_s = _clean_oneline(str(it.get("from_track") or "-")) or "-"
+            refs_s = _clean_oneline(_redact_text(",".join(str(r) for r in (it.get("refs") or [])))) or "-"
+            brief_s = _clean_oneline(_redact_text(str(it.get("brief", ""))))
+            print(f"  item_id={iid_s} from_track={from_s} refs={refs_s}", flush=True)
+            print(f"  brief: {brief_s}", flush=True)
+            print(f"  commands: progress=`python3 {script} loop progress {dot} {track} --agent {agent} --item {iid_s} --note ... --evidence ...` | "
+                  f"complete=`python3 {script} loop complete {dot} {track} --agent {agent} --item {iid_s} --summary ... --evidence ...` | "
+                  f"block=`python3 {script} loop block {dot} {track} --agent {agent} --item {iid_s} --reason ...`", flush=True)
+        elif code == 10:
+            _loop_print_goal_header(contract, st_obj)
+            recent_done = [_clean_oneline(_redact_text(str(d_it.get("key", "")))) for d_it in st_obj.get("done", [])[-10:]]
+            if recent_done:
+                print(f"  recent_done_keys={json.dumps(recent_done, ensure_ascii=False)} (do not duplicate)", flush=True)
+            print(f"  seed_now: python3 {script} loop enqueue {dot} {track} --title '<next unit>' --brief '<what to analyze/build>' && "
+                  f"python3 {script} loop claim {dot} {track} --agent {agent}", flush=True)
+            code = 0
+        if sync_args and not a.no_live:
+            _loop_sync_live(dot, agent, *sync_args, contract)
+        return code
+
+    code, lines, sync_args, contract, st_obj = _loop_try_claim_once(dot, track, agent, contract)
+    if code != 3 or wait_s == 0:
+        return _emit_claim_outcome(code, lines, sync_args, st_obj)
+
+    # Waiting on empty upstream queue (--wait SECONDS)
+    previous = {s: signal.getsignal(s) for s in SIGNALS}
+    for s in SIGNALS:
+        signal.signal(s, stop_now)
+    deadline = time.monotonic() + wait_s
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(min(POLL_S, max(0.05, deadline - time.monotonic())))
+            code, lines, sync_args, contract, st_obj = _loop_try_claim_once(dot, track, agent, contract)
+            if code != 3:
+                return _emit_claim_outcome(code, lines, sync_args, st_obj)
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+    print(f"LOOP_WAIT_TIMEOUT dot={dot} track={track} agent={agent} after={wait_s}s", flush=True)
+    return 3
+
+
+def loop_progress(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    agent = token("agent", a.agent)
+    item_id = token("item", a.item)
+    note = text("note", a.note)
+    one_note = _clean_oneline(note)[:MAX_TEXT]
+    if not one_note:
+        die("--note has no printable text")
+    evidence = text("evidence", a.evidence)
+    if not _clean_oneline(evidence):
+        die("--evidence has no printable text")
+    findings = [text("finding", f, MAX_ITEM) for f in a.finding]
+    loops_dir = _loop_dir(dot)
+    contract, _, _ = _loop_load_contract(dot, track, getattr(a, "contract", None), getattr(a, "contract_sha256", None))
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        active = st.get("active")
+        if not isinstance(active, dict) or active.get("id") != item_id:
+            die(f"{dot}/{track} has no active item {item_id}")
+        ts = now()
+        entry = {"t": ts, "agent": agent, "note": note, "evidence": evidence, "findings": findings}
+        prog = active.setdefault("progress", [])
+        if not isinstance(prog, list):
+            prog = active["progress"] = []
+        prog.append(entry)
+        st["last_activity_at"] = ts
+        st["last_agent"] = agent
+        _loop_save_state(dot, track, st)
+        _loop_emit_event(dot, track, "progress", {"item_id": item_id, "agent": agent, "note": note, "evidence": evidence, "steps": len(prog)})
+        steps = len(prog)
+        title = active.get("title") or item_id
+    if not a.no_live:
+        _loop_sync_live(dot, agent, "step", item_id, note, evidence,
+                        contract.get("objective") or title, note, f"Finish {item_id}", contract)
+    print(f"LOOP_PROGRESS {item_id} dot={dot} track={track} steps={steps} t={ts}")
+    return 0
+
+
+def loop_complete(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    agent = token("agent", a.agent)
+    item_id = token("item", a.item)
+    summary = block("summary", a.summary)
+    if SECRET.search(summary):
+        die("--summary looks like it contains a secret; leave it out")
+    one_sum = _clean_oneline(summary)[:MAX_TEXT]
+    if not one_sum:
+        die("--summary has no printable text")
+    evidence = text("evidence", a.evidence)
+    if not _clean_oneline(evidence):
+        die("--evidence has no printable text")
+    if evidence.strip().lower() in _LOOP_TRIVIAL_EVIDENCE or len(evidence.strip()) < 3:
+        die("--evidence cannot be a trivial label like 'done'/'ok'; name an artifact path, SHA, test result, or receipt")
+    artifacts = [text("artifact", r) for r in a.artifact]
+    gates = [token("gate", g) for g in a.gate]
+    handoff_title = text("handoff-title", a.handoff_title, MAX_TEXT) if a.handoff_title else None
+    handoff_brief = block("handoff-brief", a.handoff_brief) if a.handoff_brief else None
+    if handoff_brief and SECRET.search(handoff_brief):
+        die("--handoff-brief looks like it contains a secret; leave it out")
+    handoff_targets = [token("handoff-to", t_name) for t_name in a.handoff_to]
+    if track in handoff_targets:
+        die("--handoff-to cannot target the source track itself")
+
+    loops_dir = _loop_dir(dot)
+    contract, _, _ = _loop_load_contract(dot, track, getattr(a, "contract", None), getattr(a, "contract_sha256", None))
+    req_gates = list(contract.get("required_gates") or [])
+    missing_gates = [g for g in req_gates if g not in gates]
+    if missing_gates:
+        die(f"completion refused: missing required gate(s): {', '.join(missing_gates)}")
+
+    handoffs = []
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        active = st.get("active")
+        if not isinstance(active, dict) or active.get("id") != item_id:
+            die(f"{dot}/{track} has no active item {item_id}")
+        completed = dict(active)
+        completed["completed_by"] = agent
+        completed["completed_at"] = now()
+        completed["summary"] = summary
+        completed["evidence"] = evidence
+        completed["artifacts"] = artifacts
+        completed["gates"] = gates
+        st["done"].append(completed)
+        st["active"] = None
+        st["consecutive_blocks"] = 0
+        st["false_refusal_counts"].pop(item_id, None)
+        st["last_activity_at"] = completed["completed_at"]
+        st["last_agent"] = agent
+        max_items = _safe_int(contract.get("max_items"), 0, 0)
+        if a.goal_complete or (max_items > 0 and len(st["done"]) >= max_items):
+            st["goal_complete"] = True
+        _loop_save_state(dot, track, st)
+        _loop_emit_event(dot, track, "complete", {"item_id": item_id, "agent": agent, "evidence": evidence, "gates": gates})
+
+        # Automatic pipeline handoff inside the same dot under the shared dot_lock
+        targets = handoff_targets or list(contract.get("feeds_to") or [])
+        for tgt in targets:
+            if not isinstance(tgt, str) or not TOKEN.fullmatch(tgt) or tgt == track:
+                continue
+            tgt_state_path = _loop_state_path(dot, tgt)
+            tgt_contract_path = _loop_contract_path(dot, tgt)
+            if not os.path.lexists(tgt_state_path):
+                if handoff_targets or handoff_title or handoff_brief:
+                    print(f"LOOP_HANDOFF_SKIP {track} -> {tgt} reason=target_not_initialized", flush=True)
+                continue
+            if not regular(tgt_state_path) or (os.path.lexists(tgt_contract_path) and not regular(tgt_contract_path)):
+                print(f"LOOP_HANDOFF_SKIP {track} -> {tgt} reason=invalid_target_file", flush=True)
+                continue
+            loaded_tgt_contract = load_json(tgt_contract_path)
+            tgt_contract = loaded_tgt_contract if isinstance(loaded_tgt_contract, dict) else {"dot": dot, "track": tgt, "max_items": 0}
+            tgt_st = _loop_load_state(dot, tgt)
+            h_key = f"from:{track}:{item_id}"
+            h_title = handoff_title or f"[{track}] {completed.get('title', item_id)}"
+            h_brief = handoff_brief or summary
+            h_refs = [f"loop:{track}/{item_id}", evidence] + [r for r in artifacts if r not in (evidence,)]
+            new_item, dup = _loop_enqueue_item(dot, tgt, tgt_contract, tgt_st, h_title, h_brief, h_key, h_refs,
+                                               _safe_int(completed.get("priority"), 5), from_track=track, raise_on_full=False)
+            if new_item is not None:
+                _loop_emit_event(dot, track, "handoff", {"item_id": item_id, "to_track": tgt, "handoff_id": new_item["id"]})
+                handoffs.append((tgt, new_item["id"]))
+            elif dup == "max_items":
+                print(f"LOOP_HANDOFF_SKIP {track} -> {tgt} reason=max_items_reached", flush=True)
+            else:
+                handoffs.append((tgt, f"dup:{dup}"))
+        done_n = len(st["done"])
+        q_len = len(st["queue"])
+        next_q = st["queue"][0].get("id") if st["queue"] and isinstance(st["queue"][0], dict) else None
+        goal_done = bool(st["goal_complete"])
+        cont = bool(contract.get("continuous"))
+
+    if not a.no_live:
+        _loop_sync_live(dot, agent, "done", item_id, one_sum, evidence,
+                        contract.get("objective") or completed.get("title") or item_id, one_sum,
+                        "Claim next ready item" if (q_len or cont) and not goal_done else "Goal satisfied", contract)
+
+    print(f"LOOP_COMPLETED {item_id} dot={dot} track={track} done={done_n} queue={q_len}")
+    for tgt, hid in handoffs:
+        print(f"LOOP_HANDOFF {track} -> {tgt} {hid}")
+    if goal_done:
+        print(f"LOOP_NEXT GOAL_SATISFIED dot={dot} track={track}")
+    elif next_q:
+        print(f"LOOP_NEXT CLAIM_NOW next_id={_clean_oneline(next_q)} (run loop claim immediately; do NOT stop or ask root)")
+    elif cont:
+        print(f"LOOP_NEXT SEED_AND_CLAIM (standing goal active; derive next non-duplicate in-scope unit, enqueue, and claim immediately)")
+    else:
+        print(f"LOOP_NEXT QUEUE_EMPTY dot={dot} track={track}")
+    return 0
+
+
+def loop_block(a):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    agent = token("agent", a.agent)
+    item_id = token("item", a.item)
+    reason = block("reason", a.reason)
+    if SECRET.search(reason):
+        die("--reason looks like it contains a secret; leave it out")
+    one_r = _clean_oneline(reason)[:MAX_ITEM]
+    if not one_r:
+        die("--reason has no printable text")
+    loops_dir = _loop_dir(dot)
+    contract, _, _ = _loop_load_contract(dot, track, getattr(a, "contract", None), getattr(a, "contract_sha256", None))
+
+    is_hard = bool(a.hard_stop) or bool(_LOOP_HARD_STOP_RE.search(reason))
+    is_false_refusal = (not is_hard) and (not a.force) and bool(_LOOP_FALSE_REFUSAL_RE.search(reason))
+
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        active = st.get("active")
+        if not isinstance(active, dict) or active.get("id") != item_id:
+            die(f"{dot}/{track} has no active item {item_id}")
+        if is_false_refusal:
+            cnt = _safe_int(st["false_refusal_counts"].get(item_id), 0, 0) + 1
+            st["false_refusal_counts"][item_id] = cnt
+            st["last_activity_at"] = now()
+            _loop_save_state(dot, track, st)
+            _loop_emit_event(dot, track, "autonomy_override", {"item_id": item_id, "agent": agent, "attempt": cnt, "reason": reason[:300]})
+            if cnt == 1:
+                print(f"LOOP_AUTONOMY_OVERRIDE {item_id} dot={dot} track={track} attempt=1 — "
+                      f"standing owner Goal Contract pre-authorizes reversible local iterations inside allowed scope. "
+                      f"Execute directly or try up to 3 alternative approaches instead of asking the root/owner; "
+                      f"pass --hard-stop only for a true hard stop.")
+                return 0
+        parked = dict(active)
+        parked["blocked_by"] = agent
+        parked["blocked_at"] = now()
+        parked["reason"] = reason
+        parked["hard_stop"] = is_hard
+        st["blocked"].append(parked)
+        st["active"] = None
+        st["consecutive_blocks"] += 1
+        st["false_refusal_counts"].pop(item_id, None)
+        st["last_activity_at"] = parked["blocked_at"]
+        st["last_agent"] = agent
+        _loop_save_state(dot, track, st)
+        _loop_emit_event(dot, track, "block", {"item_id": item_id, "agent": agent, "hard_stop": is_hard, "reason": reason[:300]})
+        blocked_n = len(st["blocked"])
+        q_len = len(st["queue"])
+        consec = st["consecutive_blocks"]
+        max_blocks = _safe_int(contract.get("max_consecutive_blocks"), 3, 1)
+        cont = bool(contract.get("continuous"))
+
+    if not a.no_live:
+        _loop_sync_live(dot, agent, "blocked", item_id, one_r, f"loop:{track}/{item_id}",
+                        contract.get("objective") or parked.get("title") or item_id, one_r,
+                        "Skip blocked item and claim/seed next unblocked item", contract, blocker_text=one_r)
+
+    print(f"LOOP_BLOCKED {item_id} dot={dot} track={track} blocked={blocked_n} consecutive_blocks={consec}")
+    if q_len > 0:
+        print(f"LOOP_NEXT SKIP_BLOCKED_CLAIM_NOW ready={q_len} (1 item parked; claim next unblocked item immediately!)")
+    elif cont and consec < max_blocks:
+        print(f"LOOP_NEXT SKIP_BLOCKED_SEED (1 item parked; seed next independent unblocked in-scope item!)")
+    else:
+        print(f"LOOP_NEXT TRACK_BLOCKED consecutive_blocks={consec} (owner attention needed)")
+    return 0
+
+
+def _loop_pause_resume(a, pause_val):
+    dot = token("DOT", a.dot)
+    track = token("track", a.track)
+    loops_dir = _loop_dir(dot)
+    _loop_load_contract(dot, track, getattr(a, "contract", None), None)
+    reason = text("reason", a.reason) if pause_val and getattr(a, "reason", None) else ("paused_by_owner" if pause_val else None)
+    with dot_lock(loops_dir):
+        st = _loop_load_state(dot, track)
+        st["paused"] = pause_val
+        st["pause_reason"] = reason
+        st["last_activity_at"] = now()
+        if not pause_val:
+            st["consecutive_blocks"] = 0
+        _loop_save_state(dot, track, st)
+        _loop_emit_event(dot, track, "pause" if pause_val else "resume", {"reason": reason})
+    print(f"LOOP_{'PAUSED' if pause_val else 'RESUMED'} dot={dot} track={track}" + (f" reason={_clean_oneline(_redact_text(reason))}" if reason else ""))
+    return 0
+
+
+def loop_pause(a):
+    return _loop_pause_resume(a, True)
+
+
+def loop_resume(a):
+    return _loop_pause_resume(a, False)
+
+
+def loop_status(a):
+    loops_root = os.path.join(BASE, "loops")
+    dots = [token("DOT", a.dot)] if a.dot else (
+        sorted(d for d in os.listdir(loops_root) if os.path.isdir(os.path.join(loops_root, d)) and TOKEN.fullmatch(d))
+        if os.path.isdir(loops_root) else []
+    )
+    items = []
+    for dot in dots:
+        ldir = os.path.join(loops_root, dot)
+        if not os.path.isdir(ldir):
+            continue
+        if a.track:
+            tlist = [token("track", a.track)]
+        else:
+            tlist = sorted(f[:-len(".contract.json")] for f in os.listdir(ldir)
+                           if f.endswith(".contract.json") and TOKEN.fullmatch(f[:-len(".contract.json")]))
+        for track in tlist:
+            cpath = os.path.join(ldir, f"{track}.contract.json")
+            cdoc = load_json(cpath)
+            sdoc = _loop_load_state(dot, track)
+            if not isinstance(cdoc, dict):
+                continue
+            idle_m = age_min(sdoc.get("last_activity_at"))
+            act = sdoc.get("active")
+            items.append({
+                "dot": dot,
+                "track": track,
+                "project": cdoc.get("project"),
+                "continuous": bool(cdoc.get("continuous")),
+                "feeds_to": cdoc.get("feeds_to") or [],
+                "paused": bool(sdoc.get("paused")),
+                "pause_reason": sdoc.get("pause_reason"),
+                "goal_complete": bool(sdoc.get("goal_complete")),
+                "active": {"id": act.get("id"), "title": act.get("title"), "claimed_by": act.get("claimed_by"),
+                           "age_min": None if age_min(act.get("claimed_at")) is None else round(age_min(act.get("claimed_at")))} if act else None,
+                "queued": len(sdoc["queue"]),
+                "done": len(sdoc["done"]),
+                "blocked": len(sdoc["blocked"]),
+                "consecutive_blocks": sdoc["consecutive_blocks"],
+                "last_agent": sdoc.get("last_agent"),
+                "idle_min": None if idle_m is None else round(idle_m),
+            })
+    if a.json:
+        print(json.dumps(_redact_tree({"t": now(), "tracks": items}), ensure_ascii=False, indent=1))
+        return 0
+    if not items:
+        print("LOOPS none")
+        return 0
+    for it in items:
+        if it["active"]:
+            act_id = _clean_oneline(str(it["active"].get("id") or "-")) or "-"
+            act_by = _clean_oneline(_redact_text(str(it["active"].get("claimed_by") or "-"))) or "-"
+            act_age = it["active"]["age_min"] if it["active"]["age_min"] is not None else "?"
+            act_s = f"{act_id}({act_by},{act_age}m)"
+        else:
+            act_s = "-"
+        flags = []
+        if it["paused"]:
+            flags.append("PAUSED")
+        if it["goal_complete"]:
+            flags.append("COMPLETE")
+        flag_s = f" [{','.join(flags)}]" if flags else ""
+        proj_s = _clean_oneline(_redact_text(str(it["project"] or "-"))) or "-"
+        feeds_s = _clean_oneline(",".join(str(x) for x in (it["feeds_to"] or []))) or "-"
+        dot_s = _clean_oneline(str(it["dot"])) or "-"
+        track_s = _clean_oneline(str(it["track"])) or "-"
+        print(f"{dot_s} {track_s} project={proj_s} continuous={str(it['continuous']).lower()} "
+              f"active={act_s} queued={it['queued']} done={it['done']} blocked={it['blocked']} "
+              f"idle={it['idle_min'] if it['idle_min'] is not None else '-'}m feeds={feeds_s}{flag_s}")
+    return 0
+
+
+def loop_command(a):
+    return {
+        "init": loop_init,
+        "enqueue": loop_enqueue,
+        "claim": loop_claim,
+        "progress": loop_progress,
+        "complete": loop_complete,
+        "block": loop_block,
+        "pause": loop_pause,
+        "resume": loop_resume,
+        "status": loop_status,
+    }[a.loop_cmd](a)
 
 # ---------------------------------------------------------------- updates
 
@@ -2637,7 +4189,7 @@ def main(argv):
     c.add_argument("--state", help="ledger path; keep it outside the shared folder (default <base>/watch/state.json)")
     c.add_argument("--idle-cmd", dest="idle_cmd",
                    help='argv list as JSON run for a STALLED, CLAIM-STALE or BLOCKED board row; placeholders '
-                        '{dot} {agent} {project} {task} {state} {age} {why}; command line only, never dots.json')
+                        '{dot} {agent} {project} {id} {task} {state} {age} {why} {lanes} {track}; command line only, never dots.json')
     c.add_argument("--rewake-min", dest="rewake_min", type=int,
                    help="minutes between repeats (wins over dots.json; default 10 for keep-full, 120 otherwise)")
     c.add_argument("--blocked-after-min", dest="blocked_after_min", type=int,
@@ -2645,20 +4197,120 @@ def main(argv):
     c.add_argument("--dot", action="append", default=[],
                    help="dot the board scan reads; repeatable (default: dots.json dots, else every live/ folder)")
     c.add_argument("--keep-full", action="append", metavar="DOT",
-                   help="report free slots and ring the roster coordinator via --idle-cmd; repeatable, CLI only")
+                   help="report free slots and ring the roster coordinator via --fill-cmd or --idle-cmd; repeatable, CLI only")
+    c.add_argument("--fill-cmd", dest="fill_cmd",
+                   help='argv list as JSON run for keep-full UNDERFILLED/LOOP_IDLE coordinator rings; defaults to --idle-cmd; CLI only')
     c.add_argument("--fill-after-min", type=int,
                    help="minutes of observed free slots before WATCH_UNDERFILLED; CLI only (default 10)")
+    c.add_argument("--roster-fresh-min", dest="roster_fresh_min", type=int,
+                   help="minutes after which keep-full falls back from stale roster.json to live records; CLI only (default 120)")
+    c.add_argument("--wake-retries", dest="wake_retries", type=int,
+                   help="consecutive failed wake/idle/fill attempts before giving up until rewake; CLI only (default 3)")
+    c.add_argument("--idle-max-age-min", dest="idle_max_age_min", type=int,
+                   help="skip ringing --idle-cmd for STALLED/CLAIM-STALE rows older than this many minutes; CLI only")
     c.add_argument("--recovery-script", dest="recovery_script",
                    help="recovery ledger reader with inspect(root); loaded only when its sha256 matches")
     c.add_argument("--recovery-sha256", dest="recovery_sha256", help="sha256 of --recovery-script")
     c.add_argument("--ledger", action="append", default=[],
                    help="DOT=DIR recovery ledger folder for that dot's VM work; repeatable")
+    lp = sub.add_parser("loop", help="mode 1 self-driving multi-track loop harness (zero external session)")
+    lsub = lp.add_subparsers(dest="loop_cmd", required=True, metavar="action")
+    li = lsub.add_parser("init", help="create or update a standing Goal Contract and track state")
+    li.add_argument("dot")
+    li.add_argument("track")
+    li.add_argument("--project", required=True)
+    li.add_argument("--objective", required=True)
+    li.add_argument("--role")
+    li.add_argument("--model")
+    li.add_argument("--host")
+    li.add_argument("--continuous", action="store_true")
+    li.add_argument("--feeds-to", dest="feeds_to", action="append", default=[])
+    li.add_argument("--allowed-path", dest="allowed_path", action="append", default=[])
+    li.add_argument("--preauthorized", action="append", default=[])
+    li.add_argument("--hard-stop", dest="hard_stop", action="append", default=[])
+    li.add_argument("--gate", action="append", default=[])
+    li.add_argument("--max-items", dest="max_items", type=int, default=50)
+    li.add_argument("--max-consecutive-blocks", dest="max_consecutive_blocks", type=int, default=3)
+    li.add_argument("--idle-after-min", dest="idle_after_min", type=int, default=15)
+    li.add_argument("--contract", help="optional custom contract file path")
+    li.add_argument("--force", action="store_true")
+    le = lsub.add_parser("enqueue", help="enqueue a work item with automatic key deduplication")
+    le.add_argument("dot")
+    le.add_argument("track")
+    le.add_argument("--title", required=True)
+    le.add_argument("--brief")
+    le.add_argument("--key")
+    le.add_argument("--ref", action="append", default=[])
+    le.add_argument("--priority", type=int, default=5)
+    le.add_argument("--from-track", dest="from_track")
+    le.add_argument("--contract")
+    le.add_argument("--contract-sha256", dest="contract_sha256")
+    lc = lsub.add_parser("claim", help="claim the next ready item or resume active item with standing autonomy")
+    lc.add_argument("dot")
+    lc.add_argument("track")
+    lc.add_argument("--agent", required=True)
+    lc.add_argument("--wait", type=int, default=0, help="seconds to wait for upstream queue items")
+    lc.add_argument("--no-live", action="store_true")
+    lc.add_argument("--contract")
+    lc.add_argument("--contract-sha256", dest="contract_sha256")
+    lpr = lsub.add_parser("progress", help="record progress on the active item without leaving it open to churn")
+    lpr.add_argument("dot")
+    lpr.add_argument("track")
+    lpr.add_argument("--agent", required=True)
+    lpr.add_argument("--item", required=True)
+    lpr.add_argument("--note", required=True)
+    lpr.add_argument("--evidence", required=True)
+    lpr.add_argument("--finding", action="append", default=[])
+    lpr.add_argument("--no-live", action="store_true")
+    lpr.add_argument("--contract")
+    lpr.add_argument("--contract-sha256", dest="contract_sha256")
+    lco = lsub.add_parser("complete", help="complete active item with evidence, gates, and auto-handoff")
+    lco.add_argument("dot")
+    lco.add_argument("track")
+    lco.add_argument("--agent", required=True)
+    lco.add_argument("--item", required=True)
+    lco.add_argument("--summary", required=True)
+    lco.add_argument("--evidence", required=True)
+    lco.add_argument("--artifact", action="append", default=[])
+    lco.add_argument("--gate", action="append", default=[])
+    lco.add_argument("--handoff-title", dest="handoff_title")
+    lco.add_argument("--handoff-brief", dest="handoff_brief")
+    lco.add_argument("--handoff-to", dest="handoff_to", action="append", default=[])
+    lco.add_argument("--goal-complete", dest="goal_complete", action="store_true")
+    lco.add_argument("--no-live", action="store_true")
+    lco.add_argument("--contract")
+    lco.add_argument("--contract-sha256", dest="contract_sha256")
+    lb = lsub.add_parser("block", help="park only one blocked item and continue with the next item")
+    lb.add_argument("dot")
+    lb.add_argument("track")
+    lb.add_argument("--agent", required=True)
+    lb.add_argument("--item", required=True)
+    lb.add_argument("--reason", required=True)
+    lb.add_argument("--hard-stop", dest="hard_stop", action="store_true")
+    lb.add_argument("--force", action="store_true")
+    lb.add_argument("--no-live", action="store_true")
+    lb.add_argument("--contract")
+    lb.add_argument("--contract-sha256", dest="contract_sha256")
+    lpa = lsub.add_parser("pause", help="persistently pause a track")
+    lpa.add_argument("dot")
+    lpa.add_argument("track")
+    lpa.add_argument("--reason")
+    lpa.add_argument("--contract")
+    lre = lsub.add_parser("resume", help="explicitly resume a paused track")
+    lre.add_argument("dot")
+    lre.add_argument("track")
+    lre.add_argument("--contract")
+    lst = lsub.add_parser("status", help="read-only summary of self-driving loop tracks")
+    lst.add_argument("dot", nargs="?")
+    lst.add_argument("track", nargs="?")
+    lst.add_argument("--json", action="store_true")
     u = sub.add_parser("update", help="check for or install the latest release now")
     u.add_argument("--check", action="store_true", help="report availability without installing")
     a = p.parse_args(argv)
     announce_rules(a)
     code = {"tick": tick, "board": board, "memo": memo, "send": send, "inbox": inbox, "read": read,
-            "reply": reply, "wait": wait, "init": init, "watch": watch, "update": update_command}[a.cmd](a)
+            "reply": reply, "wait": wait, "init": init, "watch": watch, "loop": loop_command,
+            "update": update_command}[a.cmd](a)
     if a.cmd not in ("watch", "update"):
         try:
             auto_update(pathlib.Path(a.base if a.cmd == "init" else BASE))

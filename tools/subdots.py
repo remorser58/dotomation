@@ -16,7 +16,7 @@ Architecture (Python 3.9+ standard library only):
        EVERY sub-agent call, plus priority interrupt propagation.
      - Epoch/session_token fencing against zombie workers.
      - Active lease + connection watchdog (`stalled` -> `dead`, wake backoff, notify escalation).
-     - Deterministic spin detector (`SPIN_COMMAND_LOOP`, `SPIN_NO_PROGRESS`, `SPIN_POLL_THRASH`)
+     - Deterministic spin detector (`SPIN_COMMAND_LOOP`, `SPIN_NO_PROGRESS`, `SPIN_START_CHURN`, `SPIN_POLL_THRASH`)
        that injects high-priority `HARNESS_INTERVENTION` steering and triggers notify hooks.
      - Optional `.dots-ops/` mirror (`mail-v1`, `live-record-v1`, `memory-v1`) using non-blocking
        regular-file checks so `dots.py board` and `dots_monitor.py` stay compatible.
@@ -133,6 +133,9 @@ ACTIONABLE_EVENT_TYPES = (
     "agent_dead",
     "delivery_unacked",
     "rollover_ready",
+    "rollover_stalled",
+    "slot_underfilled",
+    "wake_failed",
     "agent_blocked",
     "scope_violation",
 )
@@ -150,7 +153,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "spin_window_s": 600.0,
     "spin_cmd_repeats": 3,
     "spin_step_repeats": 4,
+    "spin_start_churn_repeats": 3,
     "spin_poll_burst": 12,
+    "idle_slot_after_s": 0.0,
     "strict_steering": False,
     "enable_tool_proxy": False,
     "capsule_every_n": 8,
@@ -167,6 +172,11 @@ _ASSIGN_SECRET_RE = re.compile(
 _CLI_SECRET_FLAG_RE = re.compile(
     r"""(?i)(--(?:session[-_]?token|api[-_]?key|auth[-_]?token|token|secret|password|passwd))([ \t]+)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s,;\"']+))"""
 )
+_SPLIT_SECRET_FLAGS = {
+    "--token", "--api-key", "--api_key", "--auth-token", "--auth_token", "--access-token", "--access_token",
+    "--session-token", "--secret", "--password", "--passwd", "--bearer", "--credential",
+    "--webhook-url", "--webhook_url", "-k", "-p",
+}
 _JSON_SECRET_RE = re.compile(
     r"""(?i)"([A-Za-z0-9_-]{1,96})"([ \t]*:[ \t]*)"((?:\\.|[^"\\\r\n])+)" """.strip()
 )
@@ -1269,7 +1279,7 @@ class HubError(Exception):
 # ---------------------------------------------------------------------------
 
 
-_RESERVED_OPS_NAMES = ("live", "memory", "listen", "watch")
+_RESERVED_OPS_NAMES = ("live", "memory", "listen", "watch", "loops")
 
 
 class OpsMirror:
@@ -2105,6 +2115,20 @@ class HubCore:
                 out = out.replace(tok, "[REDACTED]")
         return out
 
+    def _scrub_hook_argv(self, parts: Sequence[str]) -> List[str]:
+        out: List[str] = []
+        mask_next = False
+        for raw in parts:
+            s = str(raw)
+            if mask_next:
+                out.append("[REDACTED]")
+                mask_next = False
+                continue
+            out.append(self._scrub_hook_text(s))
+            if s.lower() in _SPLIT_SECRET_FLAGS:
+                mask_next = True
+        return out
+
     def _spawn_cmd_hook(self, argv: List[str], values: Dict[str, Any], event_type: str, agent_id: str) -> None:
         if self.wake_hub.stop_event.is_set():
             return
@@ -2116,7 +2140,7 @@ class HubCore:
                         conn,
                         agent_id,
                         f"{event_type}_skipped",
-                        {"reason": "missing_placeholder", "argv": [self._scrub_hook_text(a) for a in argv]},
+                        {"reason": "missing_placeholder", "argv": self._scrub_hook_argv(argv)},
                     )
                 self.wake_hub.wake_events()
             return
@@ -2127,7 +2151,7 @@ class HubCore:
                         conn,
                         agent_id,
                         f"{event_type}_skipped",
-                        {"reason": "hook_concurrency_limit", "argv": [self._scrub_hook_text(a) for a in rendered]},
+                        {"reason": "hook_concurrency_limit", "argv": self._scrub_hook_argv(rendered)},
                     )
                 self.wake_hub.wake_events()
             return
@@ -2158,16 +2182,26 @@ class HubCore:
                     err = str(exc)
                 if not self.wake_hub.stop_event.is_set():
                     with contextlib.suppress(sqlite3.Error, ValueError, RuntimeError):
-                        safe_argv = [self._scrub_hook_text(p) for p in rendered]
+                        safe_argv = self._scrub_hook_argv(rendered)
+                        payload = (
+                            {"argv": safe_argv, "exit": rc, "error": self._scrub_hook_text(err)}
+                            if err
+                            else {"argv": safe_argv, "exit": rc}
+                        )
                         with self.ledger.tx() as conn:
                             self.ledger.emit_event_locked(
                                 conn,
                                 agent_id,
                                 event_type,
-                                {"argv": safe_argv, "exit": rc, "error": self._scrub_hook_text(err)}
-                                if err
-                                else {"argv": safe_argv, "exit": rc},
+                                payload,
                             )
+                            if event_type == "wake_triggered" and rc != 0:
+                                self.ledger.emit_event_locked(
+                                    conn,
+                                    agent_id,
+                                    "wake_failed",
+                                    payload,
+                                )
                         self.wake_hub.wake_events()
             finally:
                 self._action_sem.release()
@@ -3771,7 +3805,14 @@ class HubCore:
                                 normalize_text_sig(evidence),
                             ]
                         )
-                        recent_steps.append({"t": now_ts, "sig": sig})
+                        recent_steps.append(
+                            {
+                                "t": now_ts,
+                                "sig": sig,
+                                "state": state,
+                                "task": normalize_text_sig(task),
+                            }
+                        )
                         recent_steps = recent_steps[-20:]
                         repeats = int(self.settings["spin_step_repeats"])
                         if len(recent_steps) >= repeats and all(s["sig"] == sig for s in recent_steps[-repeats:]):
@@ -3784,7 +3825,29 @@ class HubCore:
                             )
                             recent_steps = []
                             hub_state = "spinning"
-                            spin_trigger = (agent, iv_msg, strikes)
+                            spin_trigger = (agent, iv_msg, strikes, "SPIN_NO_PROGRESS")
+                        elif state == "start":
+                            churn_repeats = max(2, int(self.settings.get("spin_start_churn_repeats", 3)))
+                            start_streak = 0
+                            start_tasks: Set[str] = set()
+                            for s in reversed(recent_steps):
+                                if s.get("state") != "start":
+                                    break
+                                start_streak += 1
+                                t_norm = str(s.get("task") or "").strip()
+                                if t_norm:
+                                    start_tasks.add(t_norm)
+                            if start_streak >= churn_repeats and (len(start_tasks) >= 2 or start_streak >= churn_repeats + 1):
+                                iv_msg, strikes = self._trigger_intervention_locked(
+                                    conn,
+                                    agent,
+                                    "SPIN_START_CHURN",
+                                    f"{start_streak} consecutive start-only steps across {len(start_tasks)} task(s) without step/done; finish or block the current task before starting another",
+                                    now_ts,
+                                )
+                                recent_steps = []
+                                hub_state = "spinning"
+                                spin_trigger = (agent, iv_msg, strikes, "SPIN_START_CHURN")
 
                     ttl = float(agent["lease_ttl_s"])
                     conn.execute(
@@ -3879,7 +3942,7 @@ class HubCore:
                     self.ledger.emit_event_locked(conn, agent_id, "mirror_error", {"detail": m_err})
 
         if spin_trigger is not None:
-            ag, iv_msg, strikes = spin_trigger
+            ag, iv_msg, strikes, spin_kind = spin_trigger
             if self.notify_cmd and iv_msg is not None and iv_msg.get("is_new", True):
                 self._spawn_cmd_hook(
                     self.notify_cmd,
@@ -3890,7 +3953,7 @@ class HubCore:
                         "dot": ag.get("dot") or "-",
                         "task": task or "-",
                         "state": "spinning",
-                        "why": f"SPIN_NO_PROGRESS(strike={strikes})",
+                        "why": f"{spin_kind}(strike={strikes})",
                         "age": "0",
                         "hub_url": self.http_url,
                     },
@@ -4541,11 +4604,23 @@ class HubCore:
             is_rollover = ready_for_rollover or (agent.get("rollover_requested_at") is not None)
             ttl = float(agent["lease_ttl_s"])
             if is_rollover:
+                init_wakes = 1 if self.wake_cmd else 0
+                init_wake_t = now_ts if self.wake_cmd else None
                 conn.execute(
                     "UPDATE agents SET state = 'rollover_ready', active_poll_count = 0, "
-                    "doing = ?, next_step = ?, last_seen_at = ?, last_activity_at = ?, lease_expires_at = ?, updated_at = ? "
-                    "WHERE agent_id = ?",
-                    (phase_val or agent.get("doing") or "", next_val or agent.get("next_step") or "", now_ts, now_ts, now_ts + ttl, now_ts, agent_id),
+                    "doing = ?, next_step = ?, last_seen_at = ?, last_activity_at = ?, lease_expires_at = ?, "
+                    "wake_count = ?, last_wake_at = ?, notified_dead_at = NULL, updated_at = ? WHERE agent_id = ?",
+                    (
+                        phase_val or agent.get("doing") or "",
+                        next_val or agent.get("next_step") or "",
+                        now_ts,
+                        now_ts,
+                        now_ts + ttl,
+                        init_wakes,
+                        init_wake_t,
+                        now_ts,
+                        agent_id,
+                    ),
                 )
                 self.ledger.emit_event_locked(
                     conn,
@@ -5190,7 +5265,7 @@ class HubCore:
                         "UPDATE exec_runs SET status = 'failed', exit_code = 127, output_tail = ?, ended_at = ? WHERE exec_id = ?",
                         (self._scrub_hook_text(str(exc))[-2000:], fin_err_ts, exec_id),
                     )
-                raise HubError("EXEC_FAILED", f"failed to spawn command: {exc}", status=500) from exc
+                raise HubError("EXEC_FAILED", f"failed to spawn command: {self._scrub_hook_text(str(exc))}", status=500) from exc
 
             out_buf = bytearray()
             truncated = False
@@ -5679,6 +5754,29 @@ class HubCore:
             cur_seq = max(after_seq, int(max_row["s"] or 0))
         return {"triggered": False, "reason": "timeout", "last_seq": cur_seq, "unread_messages": [], "alarms": [], "events": []}
 
+    def _fleet_summary(self, rows: Sequence[Any]) -> Dict[str, Any]:
+        counts = {
+            "total": len(rows),
+            "working": 0,
+            "waiting": 0,
+            "idle_completed": 0,
+            "rollover_ready": 0,
+            "blocked": 0,
+            "stalled": 0,
+            "dead": 0,
+            "spinning": 0,
+            "hibernating": 0,
+            "paused": 0,
+            "registered": 0,
+        }
+        for raw in rows:
+            st = str(raw["state"] or "")
+            if st == "completed":
+                counts["idle_completed"] += 1
+            elif st in counts:
+                counts[st] += 1
+        return counts
+
     def local_brief(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         agent_id = validate_token("agent_id", params["agent_id"]) if params and params.get("agent_id") else None
         with self.ledger._lock:
@@ -5695,13 +5793,20 @@ class HubCore:
             unacked = self.ledger._conn.execute(
                 "SELECT id, agent_id, kind, task, delivery_state FROM messages WHERE direction = 'to_agent' AND delivery_state = 'unacked_failed' ORDER BY created_at ASC LIMIT 20"
             ).fetchall()
+            fleet = self._fleet_summary(rows)
             items: List[Dict[str, Any]] = []
             for raw in rows:
                 ag = self._format_agent_row(dict(raw))
                 c = self._get_contract_locked(self.ledger._conn, ag["agent_id"])
                 chk = self._get_checkpoint_locked(self.ledger._conn, ag["agent_id"])
                 items.append({"agent": ag, "contract": c, "checkpoint": chk})
-        lines: List[str] = [f"SUBDOTS BRIEF ({iso_utc()}) agents={len(items)} unread_inbox={len(unread)} unacked_failed={len(unacked)}"]
+        lines: List[str] = [
+            f"SUBDOTS BRIEF ({iso_utc()}) agents={len(items)} unread_inbox={len(unread)} unacked_failed={len(unacked)}",
+            f"fleet: total={fleet['total']} working={fleet['working']} waiting={fleet['waiting']} "
+            f"idle_completed={fleet['idle_completed']} rollover={fleet['rollover_ready']} "
+            f"blocked={fleet['blocked']} stalled={fleet['stalled']} dead={fleet['dead']} spinning={fleet['spinning']} "
+            f"hibernating={fleet['hibernating']} paused={fleet['paused']} registered={fleet['registered']}",
+        ]
         for it in items:
             ag = it["agent"]
             c = it["contract"]
@@ -5728,6 +5833,7 @@ class HubCore:
             )
         return {
             "t": iso_utc(),
+            "fleet": fleet,
             "agents": items,
             "unread_inbox": [dict(r) for r in unread],
             "unacked_failed": [dict(r) for r in unacked],
@@ -5823,9 +5929,11 @@ class HubCore:
                         conn.execute(
                             "UPDATE agents SET state = 'working', lease_expires_at = MAX(lease_expires_at, ?), "
                             "stalled_since = NULL, notified_dead_at = NULL, hibernated_at = NULL, "
-                            "rollover_requested_at = NULL, wake_count = 0, updated_at = ? WHERE agent_id = ?",
+                            "rollover_requested_at = NULL, wake_count = 0, last_wake_at = NULL, updated_at = ? WHERE agent_id = ?",
                             (now_ts + rearm_ttl, now_ts, agent_id),
                         )
+                        ag["wake_count"] = 0
+                        ag["last_wake_at"] = None
                     elif kind == "release":
                         conn.execute(
                             "UPDATE agents SET state = 'completed', updated_at = ? WHERE agent_id = ?",
@@ -5840,10 +5948,12 @@ class HubCore:
                         # Human steering clears spinning lockout so agent can continue under new direction.
                         conn.execute(
                             "UPDATE agents SET state = 'working', lease_expires_at = MAX(lease_expires_at, ?), "
-                            "stalled_since = NULL, notified_dead_at = NULL, wake_count = 0, updated_at = ? "
+                            "stalled_since = NULL, notified_dead_at = NULL, wake_count = 0, last_wake_at = NULL, updated_at = ? "
                             "WHERE agent_id = ?",
                             (now_ts + rearm_ttl, now_ts, agent_id),
                         )
+                        ag["wake_count"] = 0
+                        ag["last_wake_at"] = None
                     elif ag["state"] == "registered" and kind in (
                         "task",
                         "steer",
@@ -5871,16 +5981,20 @@ class HubCore:
                         conn.execute(
                             "UPDATE agents SET state = 'working', lease_expires_at = MAX(lease_expires_at, ?), "
                             "stalled_since = NULL, notified_dead_at = NULL, hibernated_at = NULL, "
-                            "rollover_requested_at = NULL, wake_count = 0, updated_at = ? WHERE agent_id = ?",
+                            "rollover_requested_at = NULL, wake_count = 0, last_wake_at = NULL, updated_at = ? WHERE agent_id = ?",
                             (now_ts + rearm_ttl, now_ts, agent_id),
                         )
+                        ag["wake_count"] = 0
+                        ag["last_wake_at"] = None
                     elif ag["state"] in ("stalled", "dead", "disconnected") and kind != "pause":
                         conn.execute(
                             "UPDATE agents SET lease_expires_at = MAX(lease_expires_at, ?), "
-                            "stalled_since = NULL, notified_dead_at = NULL, wake_count = 0, updated_at = ? "
+                            "stalled_since = NULL, notified_dead_at = NULL, wake_count = 0, last_wake_at = NULL, updated_at = ? "
                             "WHERE agent_id = ?",
                             (now_ts + rearm_ttl, now_ts, agent_id),
                         )
+                        ag["wake_count"] = 0
+                        ag["last_wake_at"] = None
                     if (
                         self.wake_cmd is not None
                         and kind not in ("pause", "release", "hibernate")
@@ -6121,6 +6235,59 @@ class HubCore:
 
     # ---------------- Background Anti-Death Watchdog ----------------
 
+    def _maybe_emit_slot_underfilled_locked(
+        self,
+        conn: sqlite3.Connection,
+        ag: Dict[str, Any],
+        state: str,
+        last_act: float,
+        now_ts: float,
+        wake_backoff_s: float,
+        max_wakes: int,
+        wakes_to_run: List[Tuple[Dict[str, Any], str]],
+    ) -> bool:
+        """Emit slot_underfilled and queue SLOT_UNDERFILLED wake using per-episode wake events (isolated from wake_count)."""
+        agent_id = ag["agent_id"]
+        idle_slot_after_s = float(self.settings.get("idle_slot_after_s") or 0.0)
+        if idle_slot_after_s <= 0.0 or (now_ts - last_act) < idle_slot_after_s:
+            return False
+        emitted = False
+        seen_slot = conn.execute(
+            "SELECT 1 FROM events WHERE agent_id = ? AND event_type = 'slot_underfilled' "
+            "AND ts >= ? LIMIT 1",
+            (agent_id, last_act),
+        ).fetchone()
+        if seen_slot is None:
+            self.ledger.emit_event_locked(
+                conn,
+                agent_id,
+                "slot_underfilled",
+                {"state": state, "idle_s": round(now_ts - last_act, 1)},
+                now_ts,
+            )
+            emitted = True
+        wake_rows = conn.execute(
+            "SELECT ts FROM events WHERE agent_id = ? AND event_type = 'slot_underfilled_wake' "
+            "AND ts >= ? ORDER BY ts DESC",
+            (agent_id, last_act),
+        ).fetchall()
+        slot_wakes = len(wake_rows)
+        last_slot_wake = float(wake_rows[0]["ts"]) if wake_rows else None
+        due_wait = wake_backoff_s * (2 ** min(slot_wakes, 30))
+        if self.wake_cmd and slot_wakes < max_wakes and (
+            last_slot_wake is None or (now_ts - last_slot_wake) >= due_wait
+        ):
+            self.ledger.emit_event_locked(
+                conn,
+                agent_id,
+                "slot_underfilled_wake",
+                {"state": state, "attempt": slot_wakes + 1, "idle_s": round(now_ts - last_act, 1)},
+                now_ts,
+            )
+            emitted = True
+            wakes_to_run.append((ag, "SLOT_UNDERFILLED"))
+        return emitted
+
     def watchdog_tick(self) -> None:
         now_ts = utc_now_ts()
         dead_grace_s = float(self.settings["dead_grace_s"])
@@ -6164,14 +6331,48 @@ class HubCore:
                 if state == "paused" and resume_cancel == 0:
                     final_states.append(state)
                     continue
-                if state in ("completed", "hibernating", "rollover_ready") and pending == 0:
+                if state == "rollover_ready":
+                    wait_s = max(
+                        0.0,
+                        now_ts - float(ag.get("last_activity_at") or ag.get("last_seen_at") or ag.get("updated_at") or now_ts),
+                    )
+                    wake_count = int(ag["wake_count"])
+                    last_wake = float(ag["last_wake_at"] or 0.0)
+                    due_wake_wait = wake_backoff_s * (2 ** min(wake_count, 30))
+                    if self.wake_cmd and wake_count < max_wakes and (
+                        ag["last_wake_at"] is None or now_ts - last_wake >= due_wake_wait
+                    ):
+                        conn.execute(
+                            "UPDATE agents SET wake_count = ?, last_wake_at = ?, updated_at = ? WHERE agent_id = ?",
+                            (wake_count + 1, now_ts, now_ts, agent_id),
+                        )
+                        wakes_to_run.append((ag, "PHOENIX_ROLLOVER_RETRY"))
+                    if ag["notified_dead_at"] is None and wait_s >= notify_after_s:
+                        conn.execute(
+                            "UPDATE agents SET notified_dead_at = ?, updated_at = ? WHERE agent_id = ?",
+                            (now_ts, now_ts, agent_id),
+                        )
+                        self.ledger.emit_event_locked(
+                            conn,
+                            agent_id,
+                            "rollover_stalled",
+                            {"epoch": int(ag["epoch"]), "wait_s": round(wait_s, 1)},
+                            now_ts,
+                        )
+                        events_emitted = True
+                        if self.notify_cmd:
+                            notifies_to_run.append((ag, "ROLLOVER_STALLED"))
+                    final_states.append(state)
+                    continue
+                if state in ("completed", "hibernating") and pending == 0:
+                    auto_hib_queued = False
+                    last_act = float(ag.get("last_activity_at") or ag.get("created_at") or now_ts)
                     if (
                         self.settings.get("auto_policy", True)
                         and state == "completed"
                     ):
                         c_row = self._get_contract_locked(conn, agent_id)
                         idle_hib_s = float((c_row or {}).get("idle_hibernate_s") or 0.0)
-                        last_act = float(ag.get("last_activity_at") or ag.get("created_at") or now_ts)
                         if idle_hib_s > 0.0 and (now_ts - last_act) >= idle_hib_s:
                             has_hib = conn.execute(
                                 "SELECT 1 FROM messages WHERE agent_id = ? AND direction = 'to_agent' "
@@ -6179,6 +6380,7 @@ class HubCore:
                                 "AND created_at >= ?",
                                 (agent_id, last_act),
                             ).fetchone()
+                            auto_hib_queued = True
                             if has_hib is None:
                                 body = (
                                     f"[HIBERNATE_GRANTED] Agent {agent_id} idle for {round(now_ts - last_act, 1)}s. "
@@ -6206,14 +6408,15 @@ class HubCore:
                                 events_emitted = True
                                 if self.wake_cmd:
                                     wakes_to_run.append((ag, "AUTO_HIBERNATE"))
+                    if state == "completed" and not auto_hib_queued:
+                        if self._maybe_emit_slot_underfilled_locked(
+                            conn, ag, state, last_act, now_ts, wake_backoff_s, max_wakes, wakes_to_run
+                        ):
+                            events_emitted = True
                     final_states.append(state)
                     continue
                 if int(ag["active_poll_count"]) > 0:
-                    if (
-                        self.settings.get("auto_policy", True)
-                        and state == "waiting"
-                        and pending == 0
-                    ):
+                    if state == "waiting" and pending == 0:
                         awaiting_human = conn.execute(
                             "SELECT 1 FROM messages WHERE agent_id = ? AND direction = 'to_local' "
                             "AND kind IN ('question', 'block') AND delivery_state = 'delivered' LIMIT 1",
@@ -6222,13 +6425,20 @@ class HubCore:
                         c_row = self._get_contract_locked(conn, agent_id)
                         idle_hib_s = float((c_row or {}).get("idle_hibernate_s") or 0.0)
                         last_act = float(ag.get("last_activity_at") or ag.get("created_at") or now_ts)
-                        if awaiting_human is None and idle_hib_s > 0.0 and (now_ts - last_act) >= idle_hib_s:
+                        hib_queued = False
+                        if (
+                            self.settings.get("auto_policy", True)
+                            and awaiting_human is None
+                            and idle_hib_s > 0.0
+                            and (now_ts - last_act) >= idle_hib_s
+                        ):
                             has_hib = conn.execute(
                                 "SELECT 1 FROM messages WHERE agent_id = ? AND direction = 'to_agent' "
                                 "AND kind = 'hibernate' AND delivery_state IN ('queued', 'offered', 'acked') "
                                 "AND created_at >= ?",
                                 (agent_id, last_act),
                             ).fetchone()
+                            hib_queued = True
                             if has_hib is None:
                                 body = (
                                     f"[HIBERNATE_GRANTED] Agent {agent_id} idle for {round(now_ts - last_act, 1)}s. "
@@ -6255,6 +6465,11 @@ class HubCore:
                                 )
                                 events_emitted = True
                                 self.wake_hub.wake_agent(agent_id)
+                        if awaiting_human is None and not hib_queued:
+                            if self._maybe_emit_slot_underfilled_locked(
+                                conn, ag, state, last_act, now_ts, wake_backoff_s, max_wakes, wakes_to_run
+                            ):
+                                events_emitted = True
                     final_states.append(state)
                     continue
 
@@ -6264,8 +6479,8 @@ class HubCore:
                     final_states.append(state)
                     continue
 
-                # Lease expired while no poll is open (or new Task queued for completed/hibernating/rollover_ready agent).
-                if overdue and state in ("registered", "working", "waiting", "blocked", "paused", "spinning", "completed", "hibernating", "rollover_ready"):
+                # Lease expired while no poll is open (or new Task queued for completed/hibernating agent).
+                if overdue and state in ("registered", "working", "waiting", "blocked", "paused", "spinning", "completed", "hibernating"):
                     stalled_since = ag["stalled_since"] or now_ts
                     conn.execute(
                         "UPDATE agents SET state = 'stalled', stalled_since = ?, updated_at = ? WHERE agent_id = ?",
@@ -6314,7 +6529,7 @@ class HubCore:
 
                 wake_count = int(ag["wake_count"])
                 last_wake = float(ag["last_wake_at"] or 0.0)
-                due_wake_wait = wake_backoff_s * (2 ** wake_count)
+                due_wake_wait = wake_backoff_s * (2 ** min(wake_count, 30))
                 if self.wake_cmd and wake_count < max_wakes and (ag["last_wake_at"] is None or now_ts - last_wake >= due_wake_wait):
                     conn.execute(
                         "UPDATE agents SET wake_count = ?, last_wake_at = ?, updated_at = ? WHERE agent_id = ?",
@@ -7765,6 +7980,9 @@ class ControlSocketHandler(socketserver.StreamRequestHandler):
     def _dispatch(self, method: Any, params: Dict[str, Any]) -> Any:
         core: HubCore = self.server.core
         if method == "hub.status":
+            with core.ledger._lock:
+                agent_rows = core.ledger._conn.execute("SELECT state FROM agents").fetchall()
+            fleet = core._fleet_summary(agent_rows)
             return {
                 "ok": True,
                 "version": VERSION,
@@ -7776,7 +7994,8 @@ class ControlSocketHandler(socketserver.StreamRequestHandler):
                 "ops_base": core.mirror.ops_base,
                 "require_provision": core.require_provision,
                 "settings": core.settings,
-                "agents_count": len(core.local_list_agents()["agents"]),
+                "agents_count": fleet["total"],
+                "fleet": fleet,
             }
         if method == "hub.stop":
             threading.Thread(target=self.server.stop_cb, daemon=True).start()
@@ -8054,12 +8273,19 @@ def run_hub_foreground(a: argparse.Namespace) -> int:
         "reoffer_s": validate_finite_float("reoffer-s", float(a.reoffer_s), minimum=0.1, maximum=86400.0),
         "max_offers": max(1, int(a.max_offers)),
         "wake_backoff_s": validate_finite_float("wake-backoff", float(a.wake_backoff), minimum=0.0, maximum=86400.0),
-        "max_wakes": max(0, int(a.max_wakes)),
+        "max_wakes": min(32, max(0, int(a.max_wakes))),
         "notify_after_s": validate_finite_float("notify-after", float(a.notify_after), minimum=0.0, maximum=86400.0),
         "spin_window_s": validate_finite_float("spin-window", float(a.spin_window), minimum=1.0, maximum=86400.0),
         "spin_cmd_repeats": max(1, int(a.spin_cmd_repeats)),
         "spin_step_repeats": max(1, int(a.spin_step_repeats)),
+        "spin_start_churn_repeats": min(20, max(2, int(getattr(a, "spin_start_churn_repeats", DEFAULT_SETTINGS["spin_start_churn_repeats"])))),
         "spin_poll_burst": max(1, int(a.spin_poll_burst)),
+        "idle_slot_after_s": validate_finite_float(
+            "idle-slot-after-s",
+            float(getattr(a, "idle_slot_after_s", DEFAULT_SETTINGS["idle_slot_after_s"])),
+            minimum=0.0,
+            maximum=86400.0,
+        ),
         "strict_steering": bool(getattr(a, "strict_steering", False)),
         "enable_tool_proxy": bool(getattr(a, "enable_tool_proxy", False)),
         "capsule_every_n": max(0, int(getattr(a, "capsule_every_n", 8))),
@@ -8242,7 +8468,9 @@ def cmd_hub_start(a: argparse.Namespace) -> int:
         ("--spin-window", a.spin_window),
         ("--spin-cmd-repeats", a.spin_cmd_repeats),
         ("--spin-step-repeats", a.spin_step_repeats),
+        ("--spin-start-churn-repeats", getattr(a, "spin_start_churn_repeats", DEFAULT_SETTINGS["spin_start_churn_repeats"])),
         ("--spin-poll-burst", a.spin_poll_burst),
+        ("--idle-slot-after-s", getattr(a, "idle_slot_after_s", DEFAULT_SETTINGS["idle_slot_after_s"])),
     ):
         cmd += [flag, str(val)]
 
@@ -8681,30 +8909,28 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
                 args = raw_args or {}
                 try:
                     if name == "subdots_list_agents":
-                        out = control_rpc(state_dir, "agent.list", cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "agent.list")
                     elif name == "subdots_agent_status":
-                        out = control_rpc(state_dir, "agent.status", {"agent_id": args.get("agent_id", "")}, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "agent.status", {"agent_id": args.get("agent_id", "")})
                     elif name == "subdots_inbox":
                         out = control_rpc(
                             state_dir,
                             "message.inbox",
                             {"agent_id": args.get("agent_id"), "include_read": bool(args.get("include_read", False))},
-                            cancel_tracker=cancel_tracker,
                         )
                     elif name == "subdots_mark_read":
                         out = control_rpc(
                             state_dir,
                             "message.mark_read",
                             {"agent_id": args.get("agent_id", ""), "id": args.get("id", "")},
-                            cancel_tracker=cancel_tracker,
                         )
                     elif name == "subdots_send":
-                        out = control_rpc(state_dir, "message.send", args, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "message.send", args)
                     elif name == "subdots_steer":
                         p = dict(args)
                         p["kind"] = "interrupt" if p.get("interrupt") else "steer"
                         p.setdefault("task", "steer")
-                        out = control_rpc(state_dir, "message.send", p, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "message.send", p)
                     elif name == "subdots_await_reply":
                         raw_tout = args.get("timeout_s")
                         tout = validate_finite_float(
@@ -8715,7 +8941,7 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
                         )
                         out = control_rpc(state_dir, "message.await", args, timeout=tout + 10.0, cancel_tracker=cancel_tracker)
                     elif name == "subdots_events":
-                        out = control_rpc(state_dir, "events.list", args, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "events.list", args)
                     elif name == "subdots_control":
                         action = args.get("action")
                         if action not in ("pause", "resume", "cancel", "release", "wake"):
@@ -8724,16 +8950,15 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
                             state_dir,
                             f"control.{action}",
                             {"agent_id": args.get("agent_id"), "text": args.get("text") or action},
-                            cancel_tracker=cancel_tracker,
                         )
                     elif name == "subdots_set_contract":
-                        out = control_rpc(state_dir, "contract.set", args, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "contract.set", args)
                     elif name == "subdots_get_contract":
-                        out = control_rpc(state_dir, "contract.get", {"agent_id": args.get("agent_id", "")}, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "contract.get", {"agent_id": args.get("agent_id", "")})
                     elif name == "subdots_clear_contract":
-                        out = control_rpc(state_dir, "contract.clear", {"agent_id": args.get("agent_id", "")}, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "contract.clear", {"agent_id": args.get("agent_id", "")})
                     elif name == "subdots_brief":
-                        out = control_rpc(state_dir, "hub.brief", args, cancel_tracker=cancel_tracker)
+                        out = control_rpc(state_dir, "hub.brief", args)
                     elif name == "subdots_await_any":
                         raw_tout = args.get("timeout_s")
                         tout = validate_finite_float(
@@ -8802,11 +9027,21 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
             if closing.is_set():
                 sem.release()
                 break
+            is_blocking = (
+                req.get("method") == "tools/call"
+                and isinstance(req.get("params"), dict)
+                and req["params"].get("name") in ("subdots_await_reply", "subdots_await_any")
+            )
             th = threading.Thread(target=_handle_req, args=(req,), daemon=True)
             with flight_lock:
-                in_flight = [t for t in in_flight if t.is_alive()]
-                in_flight.append(th)
+                in_flight = [(t, blk) for t, blk in in_flight if t.is_alive()]
+                in_flight.append((th, is_blocking))
             th.start()
+        if not closing.is_set():
+            with flight_lock:
+                fast_pending = [t for t, blk in in_flight if not blk]
+            for th in fast_pending:
+                th.join(timeout=5.0)
     finally:
         closing.set()
         with sock_lock:
@@ -8817,7 +9052,7 @@ def cmd_mcp_stdio(a: argparse.Namespace) -> int:
             with contextlib.suppress(OSError):
                 sock.close()
         with flight_lock:
-            pending = list(in_flight)
+            pending = [t for t, _ in in_flight]
         for th in pending:
             th.join(timeout=1.0)
     return 0
@@ -10456,6 +10691,8 @@ def _hook_read_snapshot(state_dir: str) -> Dict[str, Any]:
         db_exists = (
             not stat.S_ISLNK(st_db.st_mode)
             and stat.S_ISREG(st_db.st_mode)
+            and st_db.st_nlink == 1
+            and (stat.S_IMODE(st_db.st_mode) & 0o077) == 0
             and (not hasattr(os, "geteuid") or st_db.st_uid == os.geteuid())
         )
     except OSError:
@@ -10730,7 +10967,12 @@ def build_parser() -> argparse.ArgumentParser:
     hs.add_argument("--spin-window", type=float, default=DEFAULT_SETTINGS["spin_window_s"])
     hs.add_argument("--spin-cmd-repeats", type=int, default=DEFAULT_SETTINGS["spin_cmd_repeats"])
     hs.add_argument("--spin-step-repeats", type=int, default=DEFAULT_SETTINGS["spin_step_repeats"])
+    hs.add_argument("--spin-start-churn-repeats", dest="spin_start_churn_repeats", type=int,
+                    default=DEFAULT_SETTINGS["spin_start_churn_repeats"])
     hs.add_argument("--spin-poll-burst", type=int, default=DEFAULT_SETTINGS["spin_poll_burst"])
+    hs.add_argument("--idle-slot-after-s", dest="idle_slot_after_s", type=float,
+                    default=DEFAULT_SETTINGS["idle_slot_after_s"],
+                    help="seconds an idle completed/waiting agent stays empty before emitting slot_underfilled / waking (0=disabled)")
     hs.add_argument("--strict-steering", action="store_true", help="enforce hard ACK/readback/policy gates on worker actions")
     hs.add_argument("--enable-tool-proxy", action="store_true", help="enable Reverse MCP gated read/patch/exec/git_status proxy")
     hs.add_argument("--capsule-every", dest="capsule_every_n", type=int, default=DEFAULT_SETTINGS["capsule_every_n"])

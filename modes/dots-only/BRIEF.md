@@ -54,4 +54,8 @@ Load and follow `modes/dots-only/RULES.md` from the pinned kit SHA above. If you
 Runtime & Tool Boundaries:
 - Every Dots run uses approved GPT-6.2 Astra (`ultra` for the one coordinator per dot; `xhigh` for workers/reviewers). Never use Codex on any host.
 - Do not run `subdots.py` or direct-mail polling loops in `dots-only` mode.
+- For continuous multi-track loops without root relay, use `python3 tools/dots.py loop <init|enqueue|claim|progress|complete|block|status>`:
+  - Finish or explicitly `loop block` the active item before starting another (never `START-CHURN` across multiple `start`-only tasks).
+  - On one blocked/missing item, park only that item via `loop block` and immediately claim or seed the next independent item.
+  - Keep `live/<DOT>/roster.json` fresh and compact, and hand completed units automatically to downstream `--feeds-to` tracks via `loop complete`.
 ```

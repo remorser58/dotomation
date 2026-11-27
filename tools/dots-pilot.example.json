@@ -1,0 +1,65 @@
+{
+  "_comment": "Template: initialize via `python3 tools/dots_pilot.py init --config ...` or keep your private config inside ~/.dotomation-pilot/config.json (mode 0600). Contains zero AI tokens or secrets.",
+  "v": 1,
+  "ops_base": "~/.dots-ops",
+  "dot": "DOT-A",
+  "project": "example-proj",
+  "preset": "research-3track",
+  "keep_full": true,
+  "interval_sec": 180,
+  "cooldown_min": 10,
+  "dots_sha256": null,
+  "monitor_config": null,
+  "tracks": [
+    {
+      "track": "research",
+      "role": "researcher",
+      "objective": "Analyze sources sequentially, verify claims against evidence, and record atomic insight units.",
+      "feeds_to": ["ontology"],
+      "continuous": true,
+      "gates": [],
+      "allowed_paths": ["research/", "notes/", "data/"]
+    },
+    {
+      "track": "ontology",
+      "role": "ontologist",
+      "objective": "Organize verified insight units into explicit ontology schemas and transformation rules.",
+      "feeds_to": ["authoring"],
+      "continuous": true,
+      "gates": [],
+      "allowed_paths": ["ontology/", "specs/", "schemas/"]
+    },
+    {
+      "track": "authoring",
+      "role": "implementer",
+      "objective": "Implement algorithms from ontology rules and verify with local tests on rev/* branches.",
+      "feeds_to": [],
+      "continuous": true,
+      "gates": ["UNIT_TESTS"],
+      "allowed_paths": ["src/", "tests/", "scripts/"]
+    }
+  ],
+  "chat": {
+    "transport": "stdout",
+    "target_url": "https://chatgpt.com/dots/example",
+    "cdp_url": "http://127.0.0.1:9222",
+    "command": null,
+    "board_heartbeat_min": 30
+  },
+  "daemon_health": {
+    "enabled": true,
+    "heal": false,
+    "unit_label": null,
+    "heal_cmd": null,
+    "heal_cooldown_min": 15,
+    "sessions_dir": "~/.local/state/web-gpt-agent/sessions",
+    "activity_paths": [
+      "~/.local/state/web-gpt-agent/app.log"
+    ]
+  },
+  "notify": {
+    "mode": "stdout",
+    "webhook_url_env": "DOTS_PILOT_WEBHOOK_URL",
+    "command": null
+  }
+}

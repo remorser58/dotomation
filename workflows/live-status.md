@@ -48,7 +48,7 @@ Lines already in the folder may use `timestamp` instead of `t`, miss a field, or
 - `blocked` when the agent cannot proceed: missing input, denied route, owner pause, or a suspected VM reset (see below).
 - `done` when the assigned output is submitted or nothing further can be done. `done` does not close the task; only the coordinator closes, under the handoff rules. A later `review` that reopens the work is answered with a new `step`; on [direct mail](direct-mail.md) an accepting `answer` gets one more `done`.
 
-A working agent with no new line for 30 minutes is **stalled**. The coordinator checks that agent directly — alive, waiting on a peer, host gone — and reassigns the slot. A stall is not evidence of a VM reset, and a reset suspicion is not a stall.
+A working agent with no new line for 30 minutes is **stalled** (extended to **65 minutes** when holding an active `dots.py wait` marker so a normal 55-minute wait cycle never false-stalls). Three or more consecutive `start`-only lines across multiple tasks (or four `start`s on the same task) within 60 minutes without an intervening `step` or `done` is flagged as **`START-CHURN`**: finish, `step`, or explicitly `blocked` the current task before starting another. The coordinator checks stalled/churning slots and keeps `roster.json` fresh and compact. A stall is not evidence of a VM reset, and a reset suspicion is not a stall.
 
 ## Roster
 

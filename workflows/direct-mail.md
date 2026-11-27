@@ -221,9 +221,10 @@ from the files alone:
   outside this run's set, or whose `live/` folder was missing this run, are kept, so runs over
   different dots can share one ledger one after another; runs sharing a `--state` must not overlap,
   because each replaces the whole file:
-  - a `STALLED` or `CLAIM-STALE` row runs the idle argv, and again every `rewake_min` minutes while
-    the same live line stays newest; a newer line ends the record. A row with only legacy lines
-    (`NO-LIVE STALLED`) is woken too, with `age=-`; an empty `{project}`, `{task}` or `{state}` is `-`;
+  - a `STALLED`, `CLAIM-STALE` or `BLOCKED` row runs `--idle-cmd` (`--idle-max-age-min N` skips ancient historical stalls); a live `wait` marker extends the stall threshold to `WAIT_STALL_MIN=65` minutes so a default 55-minute waiter does not false-stall mid-wait. `START-CHURN` (3+ consecutive `start` records on >=2 tasks or 4+ `start`s in 60m without `step`/`done`) is printed once per streak as `WATCH_START_CHURN` without spending a worker wake.
+  - `--keep-full DOT` checks `--fill-cmd` (or `--idle-cmd`) on `UNDERFILLED` / `LOOP_IDLE` / `LOOP_STALLED` rings. When `roster.json` is fresh (`< --roster-fresh-min`, default 120m), newer `done` live records (`>= fill_after_min`) are reconciled into `empty_lanes`; when `roster.json` is stale (`>= roster_fresh_min` or corrupt `updated_at`), `watch` derives occupancy from live `.jsonl` records plus positive unassigned slots (`WATCH_UNDERFILLED ... source=live empty_lanes=...` or `WATCH_SKIP ... reason=live_busy`) and never emits false `WATCH_FILLED`. Placeholders `{id}`, `{lanes}`, and `{track}` are allowlist-sanitized; top-level `coordinator` falls back to the unique occupying `role=coordinator` actor only when omitted.
+  - Failed non-zero/timed-out `wake`, `idle`, and `fill` commands are retried up to `--wake-retries` (default 3) before recording completion / emitting `WATCH_WAKE_GAVE_UP` or `WATCH_IDLE_GAVE_UP` (while `wake_fail_since` still advances `notify` escalation). Concurrent `watch` processes coordinate on `<state>.lock` and skip cleanly with `WATCH_SKIP watch - reason=watch_locked`.
+  - Under `--keep-full DOT`, active self-driving loop tracks (`<BASE>/loops/<DOT>/*.state.json`) emit `WATCH_LOOP_IDLE` / `WATCH_LOOP_STALLED` when ready work sits unclaimed or claimed past `STALL_MIN` (and emit `WATCH_ERROR loop` if loop timestamps are missing, invalid, or in the future).
   - a `BLOCKED` row runs it once per blocked line, because a second wake cannot clear a blocker
     someone else owns, and prints one `WATCH_BLOCKED_OPEN {dot} {agent} age=… task=… blockers=…` once
     the line is `blocked_after_min` old, so the owner sees the blocker instead of the agent being
