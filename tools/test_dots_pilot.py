@@ -571,9 +571,25 @@ class DotsPilotTests(unittest.TestCase):
             self.assertIn("loop_status_error=", st_err_txt.stdout)
             self.assertNotIn("sk-secret1234567890", st_err_txt.stdout)
 
-            # Version alignment, ANSI-obfuscated redaction, non-dict JSON `loop status`, and `config.json == null`
-            self.assertEqual(dp.VERSION, "1.2.0")
+            # Version alignment, ANSI/quoted/PGP redaction, systemd escaping & injection block,
+            # non-dict/corrupt JSON guards, and read-only status
+            self.assertEqual(dp.VERSION, "1.2.1")
             self.assertEqual(dp._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
+            self.assertEqual(dp._redact_text('API_KEY="tok part2 secret"'), "[REDACTED]")
+            self.assertEqual(
+                dp._redact_text("-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n-----END PGP PRIVATE KEY BLOCK-----"),
+                "[REDACTED]",
+            )
+            self.assertEqual(dp._systemd_quote("/tmp/x$HOME"), '"/tmp/x$$HOME"')
+            bad_sysd = run_pilot(["render-service", "--target", "systemd"], "/tmp/bad\nExecStartPost=/bin/sh -c id")
+            self.assertEqual(bad_sysd.returncode, 2)
+            self.assertNotIn("ExecStartPost=", bad_sysd.stdout)
+
+            missing_pilot = os.path.join(self.tmp, "missing_status_pilot")
+            miss_st = run_pilot(["status", "--json"], missing_pilot)
+            self.assertEqual(miss_st.returncode, 0, miss_st.stderr)
+            self.assertFalse(json.loads(miss_st.stdout)["initialized"])
+            self.assertFalse(os.path.exists(missing_pilot))
 
             badjson_dots = os.path.join(self.tmp, "dots_badjson.py")
             badjson_src = "import sys\nprint('[]')\nsys.exit(0)\n"
@@ -592,9 +608,59 @@ class DotsPilotTests(unittest.TestCase):
             self.assertIsNotNone(st_badjson_doc["loop_status_error"])
 
             pathlib.Path(p3_cfg_path).write_text("null\n", encoding="utf-8")
+            pathlib.Path(os.path.join(p3, "ledger.json")).write_text("[]\n", encoding="utf-8")
+            pathlib.Path(os.path.join(p3, "heartbeat.json")).write_text("[]\n", encoding="utf-8")
             null_cfg_init = run_pilot(["init", "--ops-base", ops3], p3)
             self.assertEqual(null_cfg_init.returncode, 2)
             self.assertIn("not a JSON object", null_cfg_init.stderr)
+            null_status = run_pilot(["status", "--json"], p3)
+            self.assertEqual(null_status.returncode, 0, null_status.stderr)
+            null_doc = json.loads(null_status.stdout)
+            self.assertFalse(null_doc["initialized"])
+            self.assertIsNone(null_doc["heartbeat"])
+            null_launchd = run_pilot(["render-service", "--target", "launchd"], p3)
+            self.assertEqual(null_launchd.returncode, 0, null_launchd.stderr)
+            self.assertIn("<plist", null_launchd.stdout)
+            pathlib.Path(p3_cfg_path).write_text("[1]\n", encoding="utf-8")
+            list_status = run_pilot(["status", "--json"], p3)
+            self.assertEqual(list_status.returncode, 0, list_status.stderr)
+            self.assertFalse(json.loads(list_status.stdout)["initialized"])
+            list_systemd = run_pilot(["render-service", "--target", "systemd"], p3)
+            self.assertEqual(list_systemd.returncode, 0, list_systemd.stderr)
+            self.assertIn("[Service]", list_systemd.stdout)
+
+            for raw_bad in ("123\n", "{bad\n"):
+                pathlib.Path(p3_cfg_path).write_text(raw_bad, encoding="utf-8")
+                bad_st = run_pilot(["status", "--json"], p3)
+                self.assertEqual(bad_st.returncode, 0, bad_st.stderr)
+                bad_doc = json.loads(bad_st.stdout)
+                self.assertFalse(bad_doc["initialized"])
+                self.assertIsNone(bad_doc["heartbeat"])
+                bad_rs = run_pilot(["render-service", "--target", "systemd"], p3)
+                self.assertEqual(bad_rs.returncode, 0, bad_rs.stderr)
+
+            pathlib.Path(p3_cfg_path).write_text('{"dot": 123}\n', encoding="utf-8")
+            num_dot_st = run_pilot(["status", "--json"], p3)
+            self.assertEqual(num_dot_st.returncode, 0, num_dot_st.stderr)
+            self.assertIsNone(json.loads(num_dot_st.stdout)["loop_status_error"])
+            num_dot_rs = run_pilot(["render-service", "--target", "systemd"], p3)
+            self.assertEqual(num_dot_rs.returncode, 0, num_dot_rs.stderr)
+            self.assertIn("DOT-A", num_dot_rs.stdout)
+
+            pathlib.Path(p3_cfg_path).write_text('{"dot": "\\u001b[31m \\u001b[0m"}\n', encoding="utf-8")
+            ansi_dot_rs = run_pilot(["render-service", "--target", "launchd"], p3)
+            self.assertEqual(ansi_dot_rs.returncode, 0, ansi_dot_rs.stderr)
+            self.assertIn("com.dotomation.pilot.dot-a", ansi_dot_rs.stdout)
+
+            _write_json(p3_cfg_path, {
+                "dot": "REM17",
+                "ops_base": 123,
+                "dots_py": badjson_dots,
+                "dots_sha256": hashlib.sha256(badjson_src.encode("utf-8")).hexdigest(),
+            })
+            bad_ops_st = run_pilot(["status", "--json"], p3)
+            self.assertEqual(bad_ops_st.returncode, 0, bad_ops_st.stderr)
+            self.assertTrue(json.loads(bad_ops_st.stdout)["dots_pin_ok"])
 
             # 8) CDP tab exact/prefix disambiguation (/dots/1 must not match /dots/10) + IPv6 [::1] Host bracket check
             fake_tabs = [{"type": "page", "url": "https://chatgpt.com/dots/10", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/10"}]

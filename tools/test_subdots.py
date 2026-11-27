@@ -20,6 +20,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
@@ -2676,6 +2677,7 @@ class TestLocalAutonomyReactorAndHooks(HubTestBase):
                 "--workspace", ws,
                 "--allow-path", "src/**",
                 "--forbid-path", "src/secret.py",
+                "--forbid-path", "src/missing_secret.py",
                 "--require-check", f"{sys.executable} -B -c pass",
                 "--enable-tools",
                 "--state-dir", self.state_dir,
@@ -2683,8 +2685,63 @@ class TestLocalAutonomyReactorAndHooks(HubTestBase):
             self.state_dir,
         )
 
-        # Case-variant forbidden read/patch & .git read/patch must return 403 SCOPE_VIOLATION
-        for bad_read in (".git/config", ".GIT/config", "src/SECRET.PY"):
+        # Linux _is_case_insensitive_fs regressions (digit-ending ws_root, empty digit dir, symlink sibling)
+        ws1 = os.path.join(self._tmp.name, "repo-1")
+        os.makedirs(os.path.join(ws1, "src"), exist_ok=True)
+        empty_digits = os.path.join(self._tmp.name, "1234")
+        os.makedirs(empty_digits, exist_ok=True)
+        symws = os.path.join(self._tmp.name, "sym_1")
+        os.makedirs(os.path.join(symws, "real_dir"), exist_ok=True)
+        real_lstat = os.lstat
+
+        def cs_lstat(p, *args, **kwargs):
+            ap = os.path.abspath(p)
+            parent, leaf = os.path.split(ap)
+            if leaf and os.path.isdir(parent) and leaf not in os.listdir(parent):
+                raise FileNotFoundError(p)
+            return real_lstat(p, *args, **kwargs)
+
+        def sym_lstat(p, *args, **kwargs):
+            ap = os.path.abspath(p)
+            parent, leaf = os.path.split(ap)
+            if leaf == "REAL_DIR":
+                st = real_lstat(os.path.join(parent, "real_dir"))
+                vals = list(st)
+                vals[0] = (vals[0] & ~0o170000) | stat.S_IFLNK
+                return os.stat_result(vals)
+            return cs_lstat(p, *args, **kwargs)
+
+        hlws = os.path.join(self._tmp.name, "hl_1")
+        os.makedirs(hlws, exist_ok=True)
+        pathlib.Path(os.path.join(hlws, "hardfile")).write_text("x\n", encoding="utf-8")
+
+        def hl_lstat(p, *args, **kwargs):
+            ap = os.path.abspath(p)
+            parent, leaf = os.path.split(ap)
+            if leaf in ("hardfile", "HARDFILE"):
+                st = real_lstat(os.path.join(parent, "hardfile"))
+                vals = list(st)
+                vals[3] = 2  # st_nlink == 2
+                return os.stat_result(vals)
+            return cs_lstat(p, *args, **kwargs)
+
+        with mock.patch.object(sd.sys, "platform", "linux"), mock.patch.object(sd.os, "name", "posix"):
+            with mock.patch.object(sd.os, "lstat", side_effect=cs_lstat):
+                self.assertFalse(sd._is_case_insensitive_fs(ws1))
+                self.assertIn(
+                    "outside allowed_paths",
+                    sd.check_path_policy("SRC/evil.py", {"workspace_root": ws1, "allowed_paths": ["src/**"]}, write=True) or "",
+                )
+                self.assertFalse(sd._is_case_insensitive_fs(empty_digits))
+            with mock.patch.object(sd.os, "lstat", side_effect=sym_lstat):
+                self.assertFalse(sd._is_case_insensitive_fs(symws))
+            with mock.patch.object(sd.os, "lstat", side_effect=hl_lstat):
+                self.assertFalse(sd._is_case_insensitive_fs(hlws))
+
+        # Case-variant forbidden read/patch, non-existent forbidden/outside path (existence-oracle / Linux ext4),
+        # non-directory forbidden intermediate paths (403 not 400), and .git read/patch must return 403 SCOPE_VIOLATION,
+        # while allowed missing files return 404 PATH_NOT_FOUND
+        for bad_read in (".git/config", ".GIT/config", "src/SECRET.PY", "src/MISSING_SECRET.PY", "src/secret.py/sub"):
             rc_c, rc_b = http_raw(
                 f"{rt['http_url']}/agent/tool/read",
                 method="POST",
@@ -2692,6 +2749,68 @@ class TestLocalAutonomyReactorAndHooks(HubTestBase):
             )
             self.assertEqual(rc_c, 403, (bad_read, rc_c, rc_b))
             self.assertEqual(json.loads(rc_b)["code"], "SCOPE_VIOLATION")
+        for bad_patch in ("src/MISSING_SECRET.PY", "outside/missing.py", "src/secret.py/sub", "outside/missing.py/sub", "../escape.py"):
+            wp_c, wp_b = http_raw(
+                f"{rt['http_url']}/agent/tool/patch",
+                method="POST",
+                body={
+                    "agent_id": "sec-w",
+                    "epoch": ep,
+                    "session_token": tok,
+                    "path": bad_patch,
+                    "create": False,
+                    "target": "x",
+                    "replacement": "y",
+                },
+            )
+            self.assertEqual(wp_c, 403, (bad_patch, wp_c, wp_b))
+            self.assertEqual(json.loads(wp_b)["code"], "SCOPE_VIOLATION")
+        r_nondir_c, r_nondir_b = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/app.py/sub"},
+        )
+        self.assertEqual(r_nondir_c, 400, r_nondir_b)
+        self.assertEqual(json.loads(r_nondir_b)["code"], "INVALID_INPUT")
+        r_miss_c, r_miss_b = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/nonexistent_ok.py"},
+        )
+        self.assertEqual(r_miss_c, 404, r_miss_b)
+        self.assertEqual(json.loads(r_miss_b)["code"], "PATH_NOT_FOUND")
+        p_miss_c, p_miss_b = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={
+                "agent_id": "sec-w",
+                "epoch": ep,
+                "session_token": tok,
+                "path": "src/nonexistent_ok.py",
+                "create": False,
+                "target": "x",
+                "replacement": "y",
+            },
+        )
+        self.assertEqual(p_miss_c, 404, p_miss_b)
+        self.assertEqual(json.loads(p_miss_b)["code"], "PATH_NOT_FOUND")
+        # create=True with non-empty target on missing dir/file must fail 404 WITHOUT creating parent dirs
+        p_nocreate_c, p_nocreate_b = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={
+                "agent_id": "sec-w",
+                "epoch": ep,
+                "session_token": tok,
+                "path": "src/no_create_dir/file.py",
+                "create": True,
+                "target": "missing",
+                "replacement": "y",
+            },
+        )
+        self.assertEqual(p_nocreate_c, 404, p_nocreate_b)
+        self.assertEqual(json.loads(p_nocreate_b)["code"], "PATH_NOT_FOUND")
+        self.assertFalse(os.path.exists(os.path.join(ws, "src", "no_create_dir")))
         wc_git, wb_git = http_raw(
             f"{rt['http_url']}/agent/tool/patch",
             method="POST",
@@ -2699,6 +2818,70 @@ class TestLocalAutonomyReactorAndHooks(HubTestBase):
         )
         self.assertEqual(wc_git, 403, wb_git)
         self.assertEqual(json.loads(wb_git)["code"], "SCOPE_VIOLATION")
+
+        # Verify scope_violation ledger events logged even for resolve_workspace_path rejections (.GIT/config, ../escape.py),
+        # AND steering acks supplied on a 403 tool_read are NOT rolled back
+        sv_evs = [
+            e for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "sec-w"})["events"]
+            if e["event_type"] == "scope_violation"
+        ]
+        sv_paths = [e["payload"].get("path") for e in sv_evs]
+        self.assertTrue(any(p in sv_paths for p in (".GIT/config", ".git/config")), sv_paths)
+        self.assertIn("../escape.py", sv_paths)
+
+        # /agent/gate-check & /agent/tool/exec block absolute .git/config, workspace symlinks, and sym/.. traversal without dereferencing
+        outside_dir = os.path.join(self._tmp.name, "outside_sym_target")
+        os.makedirs(os.path.join(outside_dir, "src"), exist_ok=True)
+        pathlib.Path(os.path.join(outside_dir, "app.py")).write_text("x = 1\n", encoding="utf-8")
+        os.makedirs(os.path.join(ws, "secrets"), exist_ok=True)
+        os.symlink(os.path.join(ws, "src", "app.py"), os.path.join(ws, "secrets", "link"))
+        sym_in_src = os.path.join(ws, "src", "sym")
+        os.symlink(outside_dir, sym_in_src)
+        try:
+            for g_act, g_path in (
+                ("tool_write", os.path.join(ws, ".git", "config")),
+                ("tool_read", os.path.join(ws, ".git", "config")),
+                ("tool_write", os.path.join(ws, "secrets", "link")),
+                ("tool_read", os.path.join(ws, "secrets", "link")),
+                ("tool_write", os.path.join(ws, "src", "sym", "..", "app.py")),
+                ("tool_read", os.path.join(ws, "src", "sym", "..", "app.py")),
+                ("tool_write", os.path.join(ws, ".git", "..", "src", "app.py")),
+                ("tool_read", os.path.join(ws, ".git", "..", "src", "app.py")),
+            ):
+                gc_c, gc_b = http_raw(
+                    f"{rt['http_url']}/agent/gate-check",
+                    method="POST",
+                    body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "action": g_act, "paths": [g_path]},
+                )
+                self.assertEqual(gc_c, 403, (g_act, g_path, gc_c, gc_b))
+                self.assertEqual(json.loads(gc_b)["code"], "SCOPE_VIOLATION")
+
+            gc_ok_c, gc_ok_b = http_raw(
+                f"{rt['http_url']}/agent/gate-check",
+                method="POST",
+                body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "action": "tool_write", "paths": [os.path.join(ws, "src", "app.py")]},
+            )
+            self.assertEqual(gc_ok_c, 200, gc_ok_b)
+            self.assertTrue(json.loads(gc_ok_b)["allowed"])
+
+            ex_sym_c, ex_sym_b = http_raw(
+                f"{rt['http_url']}/agent/tool/exec",
+                method="POST",
+                body={
+                    "agent_id": "sec-w",
+                    "epoch": ep,
+                    "session_token": tok,
+                    "argv": [sys.executable, "-B", "-c", "pass"],
+                    "cwd": os.path.join(ws, "src", "sym", "..", "src"),
+                },
+            )
+            self.assertEqual(ex_sym_c, 403, ex_sym_b)
+            self.assertEqual(json.loads(ex_sym_b)["code"], "CWD_OUTSIDE_WORKSPACE")
+        finally:
+            if os.path.islink(sym_in_src):
+                os.unlink(sym_in_src)
+            shutil.rmtree(os.path.join(ws, "secrets"), ignore_errors=True)
+            shutil.rmtree(outside_dir, ignore_errors=True)
 
         # Line-sliced PEM read (start_line=2, end_line=3 skips header/footer) must STILL redact base64 key
         c_pem, b_pem = http_raw(
@@ -2792,6 +2975,40 @@ class TestLocalAutonomyReactorAndHooks(HubTestBase):
         cm_flag = subprocess.run(["git", "-C", ws, "commit", "--no-gpg-sign", "-m", "bypass"], env=hook_env, capture_output=True, text=True)
         self.assertNotEqual(cm_flag.returncode, 0)
         self.assertIn("invalid agent id", cm_flag.stderr)
+
+        # Steering acks supplied on a 403 tool_read (resolve_workspace_path rejection) must NOT roll back
+        steer_res = cli_run(
+            ["send", "sec-w", "steer", "T-SEC", "--text", "Keep working cleanly", "--require-readback", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(steer_res.returncode, 0, steer_res.stderr)
+        mid_s = json.loads(steer_res.stdout)["message"]["id"]
+        pre_ack_c, pre_ack_b = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/app.py"},
+        )
+        self.assertEqual(pre_ack_c, 409, pre_ack_b)
+        self.assertEqual(json.loads(pre_ack_b)["code"], "STEERING_ACK_REQUIRED")
+        ack_on_403_c, ack_on_403_b = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={
+                "agent_id": "sec-w",
+                "epoch": ep,
+                "session_token": tok,
+                "path": ".GIT/config",
+                "ack_ids": [mid_s],
+                "readback": "Understood steering cleanly",
+            },
+        )
+        self.assertEqual(ack_on_403_c, 403, ack_on_403_b)
+        after_ack_c, after_ack_b = http_raw(
+            f"{rt['http_url']}/agent/tool/read",
+            method="POST",
+            body={"agent_id": "sec-w", "epoch": ep, "session_token": tok, "path": "src/app.py"},
+        )
+        self.assertEqual(after_ack_c, 200, after_ack_b)
 
         # 5) Mid-exec --require-readback interrupt closes exec_runs without leaving status='running'
         cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
