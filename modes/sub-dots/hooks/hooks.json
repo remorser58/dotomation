@@ -1,0 +1,29 @@
+{
+  "subdots-session": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh session-start",
+        "timeout": 10
+      }
+    ]
+  },
+  "subdots-invocation": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh pre-invocation",
+        "timeout": 10
+      }
+    ]
+  },
+  "subdots-continuation": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
