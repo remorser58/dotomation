@@ -1081,12 +1081,12 @@ class TestAuditRegressionsAndHardening(HubTestBase):
         self.assertEqual(st_pr, "paused")
 
         # 3) Recovering dead agent via exec_start resets state to working
-        self.register_agent("rec-w", lease_ttl=0.15)
+        self.register_agent("rec-w", lease_ttl=0.8)
         cli_run(["send", "rec-w", "task", "T-REC", "--text", "go", "--state-dir", self.state_dir], self.state_dir)
-        self.assertTrue(wait_until(lambda: json.loads(cli_run(["status", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"] == "dead", timeout=3.0))
+        self.assertTrue(wait_until(lambda: sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "rec-w"})["agent"]["state"] == "dead", timeout=3.0))
         ex_rec = cli_run(["agent", "exec", "rec-w", "--state-dir", self.state_dir, "--", sys.executable, "-c", "print('ok')"], self.state_dir)
         self.assertEqual(ex_rec.returncode, 0, ex_rec.stderr)
-        self.assertEqual(json.loads(cli_run(["status", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]["state"], "working")
+        self.assertEqual(sd.control_rpc(self.state_dir, "agent.status", {"agent_id": "rec-w"})["agent"]["state"], "working")
 
         # 4) exec_start --ack <cancel_id> unblocks exec cleanly
         c_mid = json.loads(cli_run(["cancel", "rec-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["message"]["id"]
@@ -1406,9 +1406,9 @@ class TestRound2RegressionAndHardening(HubTestBase):
 
         # B) Completed agent (with Task-1 answered) polling empty for review stays completed & watchdog-exempt past TTL,
         #    and Task-2 send still re-arms working + fresh lease.
-        reg_t2 = self.register_agent("t2-w", lease_ttl=0.25)
+        reg_t2 = self.register_agent("t2-w", lease_ttl=0.6)
         rt_wd = sd.read_runtime(self.state_dir)
-        t1_res = json.loads(cli_run(["send", "t2-w", "task", "T1", "--text", "first", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        t1_res = sd.control_rpc(self.state_dir, "message.send", {"agent_id": "t2-w", "kind": "task", "task": "T1", "text": "first"})
         t1_mid = t1_res["message"]["id"]
         rep_t1 = cli_run(
             ["agent", "reply", "t2-w", "result", "T1", "--re", t1_mid, "--text", "done t1", "--no-wait", "--state-dir", self.state_dir],
@@ -1427,7 +1427,7 @@ class TestRound2RegressionAndHardening(HubTestBase):
             body={"agent_id": "t2-w", "epoch": reg_t2["epoch"], "session_token": reg_t2["session_token"], "hold_s": 0.05},
         )
         self.assertEqual(p_code, 200)
-        time.sleep(0.55)
+        time.sleep(0.9)
         st_comp = json.loads(cli_run(["status", "t2-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]
         self.assertEqual(st_comp["state"], "completed")
         wtext_t2 = pathlib.Path(wake_log).read_text() if os.path.exists(wake_log) else ""
@@ -3279,6 +3279,303 @@ class TestDelegatedAutonomyAndAntiFalseRefusal(HubTestBase):
             self.assertNotIn("false_refusal_detected", r_rep)
         finally:
             core.close()
+
+
+class TestMode2AutonomyAndWatchdogV12(HubTestBase):
+    def test_rollover_ready_retries_and_escalates_rollover_stalled(self):
+        wake_log = os.path.join(self._tmp.name, "r_wake.log")
+        notify_log = os.path.join(self._tmp.name, "r_notify.log")
+        wake_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({wake_log!r}); p.open('a').write('|'.join(sys.argv[1:]) + '\\n')",
+            "{agent}", "{why}",
+        ])
+        notify_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({notify_log!r}); p.open('a').write('|'.join(sys.argv[1:]) + '\\n')",
+            "{agent}", "{why}",
+        ])
+        self.start_hub([
+            "--lease-ttl", "0.2",
+            "--dead-grace", "0.2",
+            "--watchdog-interval", "0.06",
+            "--wake-backoff", "0.08",
+            "--max-wakes", "3",
+            "--notify-after", "0.28",
+            "--wake-cmd", wake_cmd,
+            "--notify-cmd", notify_cmd,
+        ])
+        reg = self.register_agent("r-w", lease_ttl=0.2)
+        rt = sd.read_runtime(self.state_dir)
+        c_chk, b_chk = http_raw(
+            f"{rt['http_url']}/agent/checkpoint",
+            method="POST",
+            body={
+                "agent_id": "r-w", "epoch": reg["epoch"], "session_token": reg["session_token"],
+                "task": "T-ROLL", "phase": "handoff", "next_action": "resume",
+                "ready_for_rollover": True,
+            },
+        )
+        self.assertEqual(c_chk, 200, b_chk)
+
+        self.assertTrue(wait_until(
+            lambda: os.path.exists(wake_log) and "PHOENIX_ROLLOVER_RETRY" in pathlib.Path(wake_log).read_text(),
+            timeout=3.0,
+        ))
+        self.assertTrue(wait_until(
+            lambda: os.path.exists(notify_log) and "ROLLOVER_STALLED" in pathlib.Path(notify_log).read_text(),
+            timeout=3.0,
+        ))
+        evs = sd.control_rpc(self.state_dir, "events.list", {"agent_id": "r-w"})["events"]
+        stalled_evs = [e for e in evs if e["event_type"] == "rollover_stalled"]
+        self.assertEqual(len(stalled_evs), 1, evs)
+        self.assertGreaterEqual(stalled_evs[0]["payload"]["wait_s"], 0.25)
+
+    def test_spin_start_churn_and_wake_failed_event(self):
+        spin_log = os.path.join(self._tmp.name, "spin_churn_notify.log")
+        notify_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({spin_log!r}); p.open('a').write(sys.argv[1] + '\\n')",
+            "{why}",
+        ])
+        bad_wake = json.dumps([sys.executable, "-c", "import sys; sys.exit(2)"])
+        self.start_hub([
+            "--spin-start-churn-repeats", "3",
+            "--wake-cmd", bad_wake,
+            "--notify-cmd", notify_cmd,
+        ])
+
+        # Normal start -> step -> done progression must NOT trigger SPIN_START_CHURN.
+        self.register_agent("good-w")
+        for st_name in ("start", "step", "done"):
+            res = cli_run(
+                [
+                    "agent", "step", "good-w", st_name,
+                    "--task", "T-GOOD", "--note", f"n-{st_name}", "--evidence", "ev",
+                    "--goal", "g", "--doing", "d", "--next", "n",
+                    "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertNotIn("SPIN_START_CHURN", res.stdout)
+
+        # 3 consecutive start steps across distinct tasks triggers SPIN_START_CHURN + notify + wake_failed.
+        self.register_agent("churn-w")
+        last_out = ""
+        for idx, tname in enumerate(("T-1", "T-2", "T-3")):
+            res = cli_run(
+                [
+                    "agent", "step", "churn-w", "start",
+                    "--task", tname, "--note", f"begin-{idx}", "--evidence", f"ev-{idx}",
+                    "--goal", "g", "--doing", f"d-{idx}", "--next", "next",
+                    "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            last_out = res.stdout
+        self.assertIn("SPIN_START_CHURN", last_out)
+        self.assertIn("[HARNESS_INTERVENTION]", last_out)
+        self.assertTrue(wait_until(
+            lambda: os.path.exists(spin_log) and "SPIN_START_CHURN" in pathlib.Path(spin_log).read_text(),
+            timeout=3.0,
+        ))
+        evs = sd.control_rpc(self.state_dir, "events.list", {"agent_id": "churn-w"})["events"]
+        self.assertTrue(any(e["event_type"] == "spin_detected" and e["payload"]["reason"] == "SPIN_START_CHURN" for e in evs))
+
+        # Manual wake with failing wake_cmd emits wake_failed event with exit code.
+        w_res = sd.control_rpc(self.state_dir, "control.wake", {"agent_id": "good-w"})
+        self.assertTrue(w_res["ok"])
+        self.assertTrue(wait_until(
+            lambda: any(
+                e["event_type"] == "wake_failed" and e["payload"].get("exit") == 2
+                for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "good-w"})["events"]
+            ),
+            timeout=3.0,
+        ))
+
+    def test_idle_slot_after_s_for_completed_and_waiting_plus_fleet_summary(self):
+        wake_log = os.path.join(self._tmp.name, "slot_wake.log")
+        wake_cmd = json.dumps([
+            sys.executable, "-c",
+            f"import pathlib, sys; p = pathlib.Path({wake_log!r}); p.open('a').write('|'.join(sys.argv[1:]) + '\\n')",
+            "{agent}", "{why}", "{state}",
+        ])
+        self.start_hub([
+            "--watchdog-interval", "0.06",
+            "--idle-slot-after-s", "0.15",
+            "--no-auto-policy",
+            "--wake-backoff", "0.06",
+            "--max-wakes", "2",
+            "--wake-cmd", wake_cmd,
+        ])
+        rt = sd.read_runtime(self.state_dir)
+
+        # 1) w-done -> completed
+        self.register_agent("w-done", lease_ttl=10.0)
+        self.assertEqual(cli_run([
+            "agent", "step", "w-done", "done", "--task", "T-D", "--note", "finished", "--evidence", "sha1",
+            "--goal", "g", "--doing", "done", "--next", "none", "--state-dir", self.state_dir,
+        ], self.state_dir).returncode, 0)
+
+        # 2) w-hib -> hibernating (must NOT fire slot_underfilled)
+        self.register_agent("w-hib", lease_ttl=10.0)
+        self.assertEqual(cli_run(["agent", "hibernate", "w-hib", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+
+        # 3) w-pause -> paused (must NOT fire slot_underfilled)
+        self.register_agent("w-pause", lease_ttl=10.0)
+        self.assertEqual(cli_run(["pause", "w-pause", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+
+        # 4) w-wait -> active poll (waiting) with auto_policy=False; must still emit slot_underfilled!
+        reg_w = self.register_agent("w-wait", lease_ttl=10.0)
+        poll_done = []
+        poll_th = threading.Thread(
+            target=lambda: poll_done.append(http_raw(
+                f"{rt['http_url']}/agent/poll",
+                method="POST",
+                body={"agent_id": "w-wait", "epoch": reg_w["epoch"], "session_token": reg_w["session_token"], "hold_s": 1.2},
+            )),
+            daemon=True,
+        )
+        poll_th.start()
+        try:
+            self.assertTrue(wait_until(
+                lambda: any(
+                    e["event_type"] == "slot_underfilled"
+                    for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-done"})["events"]
+                ),
+                timeout=3.0,
+            ))
+            self.assertTrue(wait_until(
+                lambda: any(
+                    e["event_type"] == "slot_underfilled"
+                    for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-wait"})["events"]
+                ),
+                timeout=3.0,
+            ))
+            self.assertTrue(wait_until(
+                lambda: os.path.exists(wake_log)
+                and "w-done|SLOT_UNDERFILLED" in pathlib.Path(wake_log).read_text()
+                and "w-wait|SLOT_UNDERFILLED" in pathlib.Path(wake_log).read_text(),
+                timeout=3.0,
+            ))
+
+            # Verify hibernating & paused agents were NOT woken/emitted for slot_underfilled.
+            all_evs = sd.control_rpc(self.state_dir, "events.list", {})["events"]
+            slot_agents = {e["agent_id"] for e in all_evs if e["event_type"] == "slot_underfilled"}
+            self.assertEqual(slot_agents, {"w-done", "w-wait"})
+
+            # Verify fleet summary in hub.status and local brief (JSON + CLI text).
+            hst = sd.control_rpc(self.state_dir, "hub.status", {})
+            self.assertEqual(hst["fleet"]["total"], 4)
+            self.assertEqual(hst["fleet"]["idle_completed"], 1)
+            self.assertEqual(hst["fleet"]["hibernating"], 1)
+            self.assertEqual(hst["fleet"]["paused"], 1)
+            self.assertEqual(hst["fleet"]["waiting"], 1)
+
+            br_json = json.loads(cli_run(["brief", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+            self.assertEqual(br_json["fleet"]["idle_completed"], 1)
+            br_txt = cli_run(["brief", "--state-dir", self.state_dir], self.state_dir).stdout
+            self.assertIn("fleet: total=4", br_txt)
+            self.assertIn("idle_completed=1", br_txt)
+        finally:
+            poll_th.join(timeout=3.0)
+
+        # Verify default idle_slot_after_s=0.0 stays silent.
+        self.assertEqual(cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        self.start_hub(["--watchdog-interval", "0.05"])
+        self.register_agent("w-silent", lease_ttl=10.0)
+        self.assertEqual(cli_run([
+            "agent", "step", "w-silent", "done", "--task", "T-S", "--note", "finished", "--evidence", "sha2",
+            "--goal", "g", "--doing", "done", "--next", "none", "--state-dir", self.state_dir,
+        ], self.state_dir).returncode, 0)
+        time.sleep(0.25)
+        silent_evs = sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-silent"})["events"]
+        self.assertFalse(any(e["event_type"] == "slot_underfilled" for e in silent_evs), silent_evs)
+
+    def test_rollover_precedence_and_isolated_slot_underfilled_budget(self):
+        # 1) rollover_ready wins over stalled/lease_expired even when pending > 0
+        # Also configure failing --wake-cmd with split --token secret so wake failure event verifies _scrub_hook_argv end-to-end!
+        self.start_hub([
+            "--watchdog-interval", "0.05",
+            "--wake-backoff", "0.05",
+            "--max-wakes", "2",
+            "--idle-slot-after-s", "0.15",
+            "--wake-cmd", json.dumps(["/nonexistent-wake-bin-dotomation", "--token", "SPLIT_SECRET_VALUE_98765", "--agent", "{agent}"]),
+        ])
+        self.register_agent("w-roll", lease_ttl=0.25)
+        self.assertEqual(cli_run(["send", "w-roll", "task", "T-R", "--text", "pending work", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        self.assertEqual(cli_run([
+            "agent", "checkpoint", "w-roll", "--task", "T-R", "--phase", "p1", "--next", "handoff",
+            "--ready-for-rollover", "--state-dir", self.state_dir,
+        ], self.state_dir).returncode, 0)
+        time.sleep(0.35)
+        w_roll_ag = [a for a in sd.control_rpc(self.state_dir, "agent.list", {})["agents"] if a["agent_id"] == "w-roll"][0]
+        self.assertEqual(w_roll_ag["state"], "rollover_ready")
+        roll_evs = sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-roll"})["events"]
+        self.assertFalse(any(e["event_type"] == "agent_stalled" for e in roll_evs))
+
+        # 2) slot_underfilled budget stays isolated from agent.poll wake_count=0 reset AND local_send re-arms wake_count=0
+        self.register_agent("w-iso", lease_ttl=10.0)
+        self.assertEqual(cli_run([
+            "agent", "step", "w-iso", "done", "--task", "T-I", "--note", "done", "--evidence", "sha3",
+            "--goal", "g", "--doing", "done", "--next", "none", "--state-dir", self.state_dir,
+        ], self.state_dir).returncode, 0)
+        self.assertTrue(wait_until(
+            lambda: len([e for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-iso"})["events"]
+                         if e["event_type"] == "slot_underfilled_wake"]) >= 2,
+            timeout=3.5,
+        ))
+        time.sleep(0.3)
+        all_iso_evs = sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-iso"})["events"]
+        slot_evs = [e for e in all_iso_evs if e["event_type"] == "slot_underfilled"]
+        slot_wake_evs = [e for e in all_iso_evs if e["event_type"] == "slot_underfilled_wake"]
+        self.assertEqual(len(slot_evs), 1)
+        # Capped at max_wakes=2 (must not spam 3+)
+        self.assertEqual(len(slot_wake_evs), 2)
+
+        # Verify split-flag secret in wake_cmd was redacted cleanly in wake_triggered events
+        self.assertTrue(wait_until(
+            lambda: any(e["event_type"] == "wake_triggered"
+                        for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-iso"})["events"]),
+            timeout=3.0,
+        ))
+        wake_evs = [e for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-iso"})["events"]
+                    if e["event_type"] == "wake_triggered"]
+        self.assertTrue(wake_evs)
+        serialized_fail = json.dumps(wake_evs[0])
+        self.assertNotIn("SPLIT_SECRET_VALUE_98765", serialized_fail)
+        self.assertIn("[REDACTED]", serialized_fail)
+
+        # Verify brief text includes hibernating=, paused=, registered=
+        br_txt = cli_run(["brief", "--state-dir", self.state_dir], self.state_dir).stdout
+        for tok in ("hibernating=", "paused=", "registered="):
+            self.assertIn(tok, br_txt)
+
+        # Sending a new task to offline completed agent re-arms wake_count=0 and triggers wake #1 (wake_count -> 1) past earlier slot_underfilled wakes
+        prev_wakes = len(wake_evs)
+        self.assertEqual(cli_run(["send", "w-iso", "task", "T-I2", "--text", "next task", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        ag_iso = [a for a in sd.control_rpc(self.state_dir, "agent.list", {})["agents"] if a["agent_id"] == "w-iso"][0]
+        self.assertEqual(ag_iso["state"], "working")
+        self.assertEqual(ag_iso["wake_count"], 1)
+        self.assertIsNotNone(ag_iso["last_wake_at"])
+        self.assertTrue(wait_until(
+            lambda: len([e for e in sd.control_rpc(self.state_dir, "events.list", {"agent_id": "w-iso"})["events"]
+                         if e["event_type"] == "wake_triggered"]) > prev_wakes,
+            timeout=3.0,
+        ))
+
+        # OpsMirror must refuse reserved ops folder names including 'loops'
+        mirror_ops = os.path.join(self._tmp.name, "mirror_ops")
+        os.makedirs(mirror_ops, exist_ok=True)
+        mirror = sd.OpsMirror(mirror_ops)
+        skip_msg = mirror.mirror_mail("to_agent", {
+            "id": "m-res-1", "agent_id": "w-iso", "project": "loops",
+            "task": "evil", "kind": "task", "created_at_iso": "2026-11-28T00:00:00Z",
+        })
+        self.assertIn("reserved", skip_msg)
+        self.assertFalse(os.path.exists(os.path.join(mirror_ops, "loops")))
 
 
 if __name__ == "__main__":

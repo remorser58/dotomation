@@ -43,11 +43,20 @@
   "thresholds": {
     "stall_minutes": 30,
     "active_window_minutes": 15,
-    "long_window_minutes": 60
+    "long_window_minutes": 60,
+    "start_churn_window_minutes": 60,
+    "start_churn_repeats": 3
   },
   "limits": {
     "tail_bytes": 262144,
+    "roster_max_bytes": 1048576,
     "command_timeout_seconds": 25,
     "gh_timeout_seconds": 25
+  },
+  "daemon_health": {
+    "enabled": false,
+    "window_minutes": 30,
+    "max_session_files": 20,
+    "tail_bytes": 131072
   }
 }

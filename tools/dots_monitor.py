@@ -21,14 +21,21 @@ every printed value is redacted.
 
 from __future__ import annotations
 
+import os
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated and sys.path:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    if os.path.abspath(sys.path[0] or ".") == _SCRIPT_DIR:
+        sys.path.pop(0)
+
 import argparse
 import json
-import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
-import sys
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -55,8 +62,11 @@ DEFAULT_CONFIG = {
     "dots": {},
     "activity": [],
     "github": {"enabled": True, "repos": [], "cache_seconds": 300, "max_lookups": 60},
-    "thresholds": {"stall_minutes": 30, "active_window_minutes": 15, "long_window_minutes": 60},
-    "limits": {"tail_bytes": 262144, "command_timeout_seconds": 25, "gh_timeout_seconds": 25},
+    "thresholds": {"stall_minutes": 30, "active_window_minutes": 15, "long_window_minutes": 60,
+                   "start_churn_window_minutes": 60, "start_churn_repeats": 3},
+    "limits": {"tail_bytes": 262144, "roster_max_bytes": 1048576,
+               "command_timeout_seconds": 25, "gh_timeout_seconds": 25},
+    "daemon_health": {"enabled": False, "window_minutes": 30, "max_session_files": 20, "tail_bytes": 131072},
 }
 
 # ---------------------------------------------------------------------------
@@ -67,8 +77,13 @@ REDACT_RULES = (
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"), "[REDACTED]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "[REDACTED]"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[REDACTED]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"), "[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b"), "[REDACTED]"),
+    (re.compile(r"((?:https?|wss?)://)[^/\s:@]*:[^/\s@]+@"), r"\1[REDACTED]@"),
     (re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+[^\s\"',;]+"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}"), "Bearer [REDACTED]"),
     (
         re.compile(
             r"(?i)\b((?:[a-z0-9_]+_)?(?:bearer|token|secret|password|passwd|api[_-]?key)"
@@ -89,6 +104,9 @@ LONG_TOKEN_RE = re.compile(
     r"\b(?=[A-Za-z0-9]{32,}\b)(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[a-z])"
     r"(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}\b"
 )
+_TERM_CTRL_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b]"
+)
 
 
 def redact(text):
@@ -103,10 +121,11 @@ def redact(text):
 
 
 def one_line(text, limit=120):
-    """Collapse a value to one printable, redacted line."""
+    """Collapse a value to one printable, redacted, escape-free line."""
     if text is None:
         return ""
-    out = redact(" ".join(str(text).split()))
+    cleaned = _TERM_CTRL_RE.sub("", str(text))
+    out = redact(" ".join(cleaned.split()))
     if len(out) > limit:
         out = out[: max(0, limit - 1)] + "\u2026"
     return out
@@ -287,12 +306,13 @@ def parse_ledger_dump(text, nonce):
 def probe_reader(tail_bytes, nonce):
     """One bounded read. A failed tail aborts its frame, even after partial output."""
     return """read_probe() {
+  limit=${4:-%d}
   if [ -r "$1" ] && size=$(wc -c 2>&1 < "$1"); then
     while [ "${size# }" != "$size" ]; do size=${size# }; done
     case "$size" in ''|*[!0-9]*) ;; *)
       printf '%%s %%s\\n' "$2" "$size"
       # fd 3 streams file bytes; only the utility's diagnostic stays in the shell.
-      if diagnostic=$(tail -c %d "$1" 2>&1 >&3) && [ -z "$diagnostic" ]; then
+      if diagnostic=$(tail -c "$limit" "$1" 2>&1 >&3) && [ -z "$diagnostic" ]; then
         printf '\\n==END %s\\n'
       else
         printf '\\n%%s\\n' "$3"
@@ -304,9 +324,11 @@ def probe_reader(tail_bytes, nonce):
 } 3>&1""" % (tail_bytes, nonce)
 
 
-def ledger_script(root, dots, tail_bytes, nonce):
+def ledger_script(root, dots, tail_bytes, nonce, roster_max_bytes=None):
+    tbytes = max(1, int(tail_bytes))
+    rmax = max(1, int(roster_max_bytes or tbytes))
     quoted_root = _remote_path(root)
-    parts = ["set -u", "export LC_ALL=C", 'root=%s' % quoted_root, probe_reader(tail_bytes, nonce)]
+    parts = ["set -u", "export LC_ALL=C", 'root=%s' % quoted_root, probe_reader(tbytes, nonce)]
     parts.append("for dot in %s; do" % " ".join(shlex.quote(d) for d in dots))
     parts.append("""  printf '==DOT %s %%s\\n' "$dot" """ % nonce)
     parts.append('  d="$root/$dot"')
@@ -320,8 +342,8 @@ def ledger_script(root, dots, tail_bytes, nonce):
     parts.append('    read_probe "$f" "==FILE %s ${f##*/}" "==UNREAD %s ${f##*/}"' % (nonce, nonce))
     parts.append('  done')
     parts.append('  if [ -f "$d/roster.json" ]; then')
-    parts.append('    read_probe "$d/roster.json" "==FILE %s roster.json" "==UNREAD %s roster.json"'
-                 % (nonce, nonce))
+    parts.append('    read_probe "$d/roster.json" "==FILE %s roster.json" "==UNREAD %s roster.json" %d'
+                 % (nonce, nonce, rmax))
     parts.append('  fi')
     parts.append('done')
     return "\n".join(parts)
@@ -369,9 +391,11 @@ def legacy_time(raw):
 def collect_ledger(config, transport, errors):
     ledger = config["ledger"]
     dots = ledger["dots"]
-    tail_bytes = config["limits"]["tail_bytes"]
+    limits = config["limits"]
+    tail_bytes = limits["tail_bytes"]
+    roster_max_bytes = limits.get("roster_max_bytes", 1048576)
     nonce = new_nonce()
-    script = ledger_script(ledger["root"], dots, tail_bytes, nonce)
+    script = ledger_script(ledger["root"], dots, tail_bytes, nonce, roster_max_bytes=roster_max_bytes)
     out, error = transport.run(ledger["host"], script)
     if error:
         errors.append({"source": "ledger", "host": ledger["host"], "detail": error})
@@ -398,16 +422,22 @@ def collect_ledger(config, transport, errors):
     return dump
 
 
-def read_dot(dot, dump, tail_bytes):
+def read_dot(dot, dump, tail_bytes, roster_max_bytes=None):
     """Build per-agent record lists for one dot from a parsed dump."""
+    tbytes = max(1, int(tail_bytes))
+    rmax = max(1, int(roster_max_bytes or tbytes))
     entry = dump.get(dot) or {"files": {}}
     agents = {}
     roster = None
     roster_error = None
     dropped_files = []
     for name, info in entry["files"].items():
-        text = split_tail(info["text"], info["size"], tail_bytes)
         if name == "roster.json":
+            size = info.get("size")
+            if size is not None and size > rmax:
+                roster_error = "roster.json exceeds %d bytes (%d)" % (rmax, size)
+                continue
+            text = split_tail(info["text"], size, rmax)
             try:
                 value = json.loads(text)
             except ValueError:
@@ -418,6 +448,7 @@ def read_dot(dot, dump, tail_bytes):
                 else:
                     roster_error = "roster.json is not an object"
             continue
+        text = split_tail(info["text"], info["size"], tbytes)
         agent = name[:-6] if name.endswith(".jsonl") else name
         # The file name becomes the AGENT column; hold it to the same token rule
         # as a record's agent field so a name cannot carry a line break or escape.
@@ -488,7 +519,8 @@ LOG_LINE_RE = re.compile(
 
 
 def activity_script(paths, tail_bytes, nonce):
-    parts = ["set -u", "export LC_ALL=C", "i=0", probe_reader(tail_bytes, nonce)]
+    tbytes = max(1, int(tail_bytes))
+    parts = ["set -u", "export LC_ALL=C", "i=0", probe_reader(tbytes, nonce)]
     parts.append("for p in %s; do" % " ".join(_remote_path(p) for p in paths))
     parts.append("""  printf '==LOG %s %%s\\n' "$i" """ % nonce)
     parts.append("  i=$((i+1))")
@@ -633,6 +665,252 @@ def _timestamps(text, size, tail_bytes):
     return stamps
 
 
+RETAINED_LIMIT_RE = re.compile(
+    r'`: CreateProcess \{ message: "too many retained terminal sessions \(limit (\d+)\);'
+    r'[^"]*before starting another" \}\Z'
+)
+
+
+def daemon_health_script(sess_dirs, tail_bytes, max_files, window_minutes, nonce):
+    """Build a read-only POSIX shell script scanning recent */events.jsonl under configured session dirs."""
+    tail_bytes = max(1, int(tail_bytes))
+    max_files = max(1, int(max_files))
+    window_minutes = max(1, int(window_minutes))
+    parts = [
+        "set -u",
+        "export LC_ALL=C",
+        "i=0",
+        probe_reader(tail_bytes, nonce),
+        "for s in %s; do" % " ".join(_remote_path(p) for p in sess_dirs),
+        """  printf '==DIR %s %%s\\n' "$i" """ % nonce,
+        "  i=$((i+1))",
+        """  if [ ! -d "$s" ]; then printf '==NOSESS %s\\n'; continue; fi""" % nonce,
+        "  n=0",
+        '  find "$s" -maxdepth 2 -type f -name events.jsonl -mmin -%d 2>/dev/null | while IFS= read -r f; do' % window_minutes,
+        '    [ -f "$f" ] || continue',
+        "    n=$((n+1))",
+        """    [ "$n" -le %d ] || { printf '==TOOMANY %s\\n'; break; }""" % (max_files, nonce),
+        '    read_probe "$f" "==FILE %s ${f#$s/}" "==UNREAD %s ${f#$s/}"' % (nonce, nonce),
+        "  done",
+        "done",
+    ]
+    return "\n".join(parts)
+
+
+def parse_daemon_health_dump(text, nonce):
+    """Parse multi-session read_probe output keyed by configured dir index."""
+    dir_tag = "==DIR %s " % nonce
+    nosess_tag = "==NOSESS %s" % nonce
+    too_many_tag = "==TOOMANY %s" % nonce
+    unread_tag = "==UNREAD %s " % nonce
+    file_re = re.compile(r"^==FILE %s (.+) ([0-9]+)$" % re.escape(nonce))
+    end_tag = "==END %s" % nonce
+    out = {}
+    cur = None
+    name = None
+    size = None
+    buf = []
+    for line in text.splitlines():
+        if line.startswith(dir_tag):
+            cur = line[len(dir_tag):].strip()
+            out.setdefault(cur, {"files": {}, "nosess": False, "too_many": False, "unreadable": []})
+            name = None
+            buf = []
+            continue
+        if cur is None:
+            continue
+        if line == nosess_tag:
+            out[cur]["nosess"] = True
+            continue
+        if line == too_many_tag and name is None:
+            out[cur]["too_many"] = True
+            continue
+        if line.startswith(unread_tag):
+            out[cur]["unreadable"].append(line[len(unread_tag):])
+            name = None
+            buf = []
+            continue
+        match = file_re.match(line)
+        if match and name is None:
+            name = match.group(1)
+            size = int(match.group(2))
+            buf = []
+            continue
+        if line == end_tag and name is not None:
+            out[cur]["files"][name] = {"size": size, "text": "\n".join(buf)}
+            name = None
+            buf = []
+            continue
+        if name is not None:
+            buf.append(line)
+    return out
+
+
+def _entry_timestamp(obj):
+    if not isinstance(obj, dict):
+        return None
+    for key in ("t", "ts", "timestamp", "time", "at"):
+        val = obj.get(key)
+        if isinstance(val, str):
+            parsed = parse_ts(val)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _analyze_daemon_session_text(text, size, tail_bytes, now, window_minutes):
+    """Scan bounded session JSONL text for retained terminal session rejections and chat_error entries."""
+    cutoff = now - timedelta(minutes=window_minutes)
+    retained_hits = 0
+    retained_limit = None
+    last_retained_at = None
+    chat_error_hits = 0
+    last_chat_error_at = None
+    for raw in split_tail(text, size, tail_bytes).splitlines():
+        raw_s = raw.strip()
+        if not raw_s:
+            continue
+        try:
+            obj = json.loads(raw_s)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        ts = _entry_timestamp(obj)
+        if ts is not None and ts < cutoff:
+            continue
+        ev_type = str(obj.get("type") or obj.get("event") or obj.get("kind") or "")
+        if ev_type == "chat_error" or bool(obj.get("chat_error")):
+            chat_error_hits += 1
+            if ts is not None and (last_chat_error_at is None or ts > last_chat_error_at):
+                last_chat_error_at = ts
+        candidates = []
+        call = obj.get("call")
+        if isinstance(call, dict):
+            outcome = call.get("outcome")
+            if outcome in (None, "tool_rejected", "error", "failed"):
+                res = call.get("result")
+                if isinstance(res, dict) and isinstance(res.get("text"), str):
+                    candidates.append(res["text"])
+                elif isinstance(res, str):
+                    candidates.append(res)
+        for key in ("error",):
+            val = obj.get(key)
+            if isinstance(val, str):
+                candidates.append(val)
+            elif isinstance(val, dict) and isinstance(val.get("text"), str):
+                candidates.append(val["text"])
+        matched = False
+        for txt in candidates:
+            m = RETAINED_LIMIT_RE.search(txt.rstrip())
+            if m:
+                matched = True
+                lim = int(m.group(1))
+                retained_limit = lim if retained_limit is None else max(retained_limit, lim)
+                break
+        if matched:
+            retained_hits += 1
+            if ts is not None and (last_retained_at is None or ts > last_retained_at):
+                last_retained_at = ts
+    return {
+        "retained_hits": retained_hits,
+        "retained_limit": retained_limit,
+        "last_retained_at": last_retained_at,
+        "chat_error_hits": chat_error_hits,
+        "last_chat_error_at": last_chat_error_at,
+    }
+
+
+def collect_daemon_health(config, transport, now, errors):
+    """Collect optional read-only daemon session health per configured activity source or daemon_health.sessions_dir."""
+    dh_cfg = config.get("daemon_health") or {}
+    if not dh_cfg.get("enabled"):
+        return {}
+    tail_bytes = max(1, int(dh_cfg.get("tail_bytes", 131072)))
+    max_files = max(1, int(dh_cfg.get("max_session_files", 20)))
+    window_min = max(1, int(dh_cfg.get("window_minutes", 30)))
+    default_sess = dh_cfg.get("sessions_dir")
+    by_host = {}
+    for src in config.get("activity") or []:
+        sess_dir = src.get("sessions_dir") or (default_sess if isinstance(default_sess, str) and default_sess.strip() else None)
+        if not sess_dir:
+            base_dir = os.path.dirname(src["path"])
+            if not base_dir:
+                continue
+            sess_dir = base_dir.rstrip("/") + "/sessions"
+        by_host.setdefault(src["host"], []).append((src, sess_dir))
+    if not by_host and isinstance(default_sess, str) and default_sess.strip():
+        dots_cfg = (config.get("ledger") or {}).get("dots") or []
+        first_dot = dots_cfg[0] if dots_cfg else "DOT"
+        by_host.setdefault("local", []).append(({"dot": first_dot, "host": "local", "label": "local-sessions"}, default_sess.strip()))
+    per_dot = {}
+    for host, items in by_host.items():
+        nonce = new_nonce()
+        script = daemon_health_script([d for _s, d in items], tail_bytes, max_files, window_min, nonce)
+        out, error = transport.run(host, script)
+        if error:
+            errors.append({"source": "daemon_health", "host": host, "detail": error})
+            continue
+        dump = parse_daemon_health_dump(out, nonce)
+        for index, (src, sess_dir) in enumerate(items):
+            info = dump.get(str(index))
+            if info is None:
+                continue
+            for unread_name in info.get("unreadable") or []:
+                errors.append({"source": "daemon_health", "host": host,
+                               "detail": "%s unreadable: %s" % (src.get("dot"), one_line(unread_name, 80))})
+            r_hits = 0
+            r_lim = None
+            r_last = None
+            c_hits = 0
+            c_last = None
+            for fname, finfo in info["files"].items():
+                stats = _analyze_daemon_session_text(finfo["text"], finfo["size"], tail_bytes, now, window_min)
+                r_hits += stats["retained_hits"]
+                if stats["retained_limit"] is not None:
+                    r_lim = stats["retained_limit"] if r_lim is None else max(r_lim, stats["retained_limit"])
+                if stats["last_retained_at"] is not None and (r_last is None or stats["last_retained_at"] > r_last):
+                    r_last = stats["last_retained_at"]
+                c_hits += stats["chat_error_hits"]
+                if stats["last_chat_error_at"] is not None and (c_last is None or stats["last_chat_error_at"] > c_last):
+                    c_last = stats["last_chat_error_at"]
+            label = src.get("label") or host
+            slot = per_dot.setdefault(src["dot"], {})
+            slot[label] = {
+                "sessions_dir": sess_dir,
+                "sessions_scanned": len(info["files"]),
+                "retained_limit_hits": r_hits,
+                "retained_limit": r_lim,
+                "last_retained_at": iso(r_last),
+                "chat_error_hits": c_hits,
+                "last_chat_error_at": iso(c_last),
+                "truncated_scan": bool(info.get("too_many")),
+            }
+    return per_dot
+
+
+def detect_start_churn(records, now, window_minutes=60, min_starts=3):
+    """Return churn detail string when recent trailing records are consecutive 'start' lines."""
+    if not records:
+        return None
+    cutoff = now - timedelta(minutes=window_minutes)
+    count = 0
+    tasks = set()
+    for rec in reversed(records):
+        if rec.get("state") != "start":
+            break
+        t = rec.get("_t")
+        if t is None or t < cutoff or t > now + timedelta(minutes=5):
+            break
+        count += 1
+        tname = str(rec.get("task") or "").strip()
+        if tname:
+            tasks.add(tname)
+    if count >= min_starts and (len(tasks) >= 2 or count >= min_starts + 1):
+        return "%d consecutive start lines (%d task(s)) in %dm without step/done" % (count, len(tasks), window_minutes)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # evidence
 
@@ -650,6 +928,9 @@ def evidence_refs(text):
     refs = []
     for match in GH_URL_RE.finditer(text):
         owner, repo, rest = match.group(1), match.group(2), (match.group(3) or "")
+        if owner in (".", "..") or repo in (".", "..") or ".." in owner or ".." in repo:
+            refs.append({"kind": "invalid", "label": "invalid repo path"})
+            continue
         path, _, anchor = rest.partition("#")
         segs = [s for s in path.partition("?")[0].split("/") if s]
         base = "repos/%s/%s" % (owner, repo)
@@ -674,12 +955,13 @@ def evidence_refs(text):
         elif len(segs) >= 2 and segs[0] == "issues" and segs[1].isdigit():
             refs.append({"kind": "issue", "endpoint": "%s/issues/%s" % (base, segs[1]),
                          "label": "%s/%s#%s" % (owner, repo, segs[1]), "repo": repository})
-        elif len(segs) >= 2 and segs[0] == "commit":
-            refs.append({"kind": "commit", "endpoint": "%s/commits/%s" % (base, segs[1]),
-                         "label": "%s/%s@%s" % (owner, repo, segs[1][:7]), "repo": "%s/%s" % (owner, repo)})
-        elif len(segs) >= 2 and segs[0] in ("blob", "tree"):
-            refs.append({"kind": "commit", "endpoint": "%s/commits/%s" % (base, segs[1]),
-                         "label": "%s/%s@%s" % (owner, repo, segs[1][:7]), "repo": "%s/%s" % (owner, repo)})
+        elif len(segs) >= 2 and segs[0] in ("commit", "blob", "tree"):
+            ref_tok = segs[1]
+            if ref_tok in (".", "..") or ".." in ref_tok or not re.fullmatch(r"[A-Za-z0-9._-]+", ref_tok):
+                refs.append({"kind": "invalid", "label": "%s/%s ref" % (owner, repo)})
+            else:
+                refs.append({"kind": "commit", "endpoint": "%s/commits/%s" % (base, ref_tok),
+                             "label": "%s/%s@%s" % (owner, repo, ref_tok[:7]), "repo": "%s/%s" % (owner, repo)})
         elif len(segs) >= 3 and segs[0] == "actions" and segs[1] == "runs" and segs[2].isdigit():
             refs.append({"kind": "run", "endpoint": "%s/actions/runs/%s" % (base, segs[2]),
                          "label": "%s/%s run %s" % (owner, repo, segs[2]), "repo": "%s/%s" % (owner, repo)})
@@ -878,14 +1160,21 @@ def classify(row, stall_minutes):
 def build_snapshot(config, transport, now, errors=None):
     if errors is None:
         errors = []
-    stall = config["thresholds"]["stall_minutes"]
+    thresholds = config.get("thresholds") or {}
+    stall = thresholds["stall_minutes"]
+    churn_window = int(thresholds.get("start_churn_window_minutes", 60))
+    churn_repeats = int(thresholds.get("start_churn_repeats", 3))
+    limits = config.get("limits") or {}
+    tail_bytes = limits["tail_bytes"]
+    roster_max_bytes = limits.get("roster_max_bytes", 1048576)
     ledger = collect_ledger(config, transport, errors)
     activity = collect_activity(config, transport, now, errors)
+    daemon_health = collect_daemon_health(config, transport, now, errors)
     activity_configured = {src["dot"] for src in config["activity"]}
     resolver = EvidenceResolver(config, transport, now, errors)
     dots = {}
     for dot in config["ledger"]["dots"]:
-        data = read_dot(dot, ledger, config["limits"]["tail_bytes"])
+        data = read_dot(dot, ledger, tail_bytes, roster_max_bytes=roster_max_bytes)
         slots, dropped_slots = roster_slots(data["roster"])
         if data["roster_error"]:
             errors.append({"source": "roster", "host": config["ledger"]["host"],
@@ -937,6 +1226,7 @@ def build_snapshot(config, transport, now, errors=None):
             if dot in activity:
                 since = 0 if clock_t is None else sum(1 for ts in stamps if ts >= clock_t)
             status, detail, refs = evidence_status(evidence, resolver)
+            churn_detail = detect_start_churn(records, now, window_minutes=churn_window, min_starts=churn_repeats)
             row = {
                 "dot": dot,
                 "agent": agent,
@@ -963,6 +1253,8 @@ def build_snapshot(config, transport, now, errors=None):
                 "in_roster": bool(slot),
                 "roster_state": slot.get("state"),
                 "records": len(records),
+                "start_churn": churn_detail is not None,
+                "start_churn_detail": churn_detail or "",
             }
             row["classification"] = classify(row, stall)
             rows.append(row)
@@ -987,6 +1279,7 @@ def build_snapshot(config, transport, now, errors=None):
                 }
                 for label, value in sorted(dot_activity["by_host"].items())
             },
+            "daemon_health": daemon_health.get(dot, {}),
             "agents": rows,
             "unrostered": [r["agent"] for r in rows if not r["in_roster"]],
         }
@@ -1032,11 +1325,17 @@ def render_table(snapshot):
             one_line(str(roster.get("updated_at") or "")[:19], 40) or "?", roster.get("slots") or 0))
         for label, act in data["activity"].items():
             lines.append("  activity %-6s 15m=%-4d 60m=%-5d last=%s covered_since=%s%s" % (
-                label, act["calls_15m"], act["calls_60m"], act["last_call_at"] or "-",
+                one_line(label, 30), act["calls_15m"], act["calls_60m"], act["last_call_at"] or "-",
                 act["covered_since"] or "-", " (window clipped by log rotation)" if act["partial_window"] else ""))
         if not data["activity"]:
             lines.append("  activity unknown" if data["activity_configured"]
                          else "  activity none configured")
+        for label, dh in sorted((data.get("daemon_health") or {}).items()):
+            if dh.get("retained_limit_hits") or dh.get("chat_error_hits") or dh.get("truncated_scan"):
+                trunc_s = " (truncated >max_files)" if dh.get("truncated_scan") else ""
+                lines.append("  ALERT daemon %-6s retained_limit_hits=%d limit=%s chat_errors=%d sessions=%d%s" % (
+                    one_line(label, 30), dh.get("retained_limit_hits", 0), dh.get("retained_limit") or "?",
+                    dh.get("chat_error_hits", 0), dh.get("sessions_scanned", 0), trunc_s))
         headers = ("AGENT", "CLASS", "STATE", "AGE", "EVID", "ROLE", "TASK")
         rows = []
         for row in data["agents"]:
@@ -1060,6 +1359,8 @@ def render_table(snapshot):
                 lines.append("      evidence: %s (%s)" % (
                     one_line(agent_row["evidence"], 80) or "-",
                     agent_row["evidence_detail"]))
+            if agent_row.get("start_churn"):
+                lines.append("      warn: START-CHURN (%s)" % one_line(agent_row.get("start_churn_detail"), 120))
         unrostered = data.get("unrostered") or []
         if unrostered:
             lines.append("  note: live file without roster slot: %s"
@@ -1091,19 +1392,25 @@ def render_json(snapshot):
 def diff_events(previous, snapshot):
     """Return (events, state) where events hold only real changes."""
     events = []
-    state = {"agents": {}, "activity": {}, "errors": set()}
+    state = {"agents": {}, "activity": {}, "errors": set(), "daemon_health": {}}
+    prev_dh = previous.get("daemon_health") or {}
     for dot, data in snapshot["dots"].items():
         for row in data["agents"]:
             key = (dot, row["agent"])
             old = previous["agents"].get(key)
+            churn_now = bool(row.get("start_churn"))
             state["agents"][key] = {"classification": row["classification"],
                                     "evidence_status": row["evidence_status"],
-                                    "state": row["state"], "task": row["task"]}
+                                    "state": row["state"], "task": row["task"],
+                                    "start_churn": churn_now}
             if old is None:
                 events.append({"event": "DOTS_NEW_AGENT", "dot": dot, "agent": row["agent"],
                                "detail": {"role": row["role"], "task": row["task"],
                                           "class": row["classification"],
                                           "evidence": row["evidence_status"]}})
+                if churn_now:
+                    events.append({"event": "DOTS_START_CHURN", "dot": dot, "agent": row["agent"],
+                                   "detail": {"task": row["task"], "detail": row.get("start_churn_detail")}})
                 continue
             if old["classification"] != row["classification"]:
                 events.append({
@@ -1114,6 +1421,31 @@ def diff_events(previous, snapshot):
                                "age": row["age"], "task": row["task"],
                                "evidence": row["evidence_status"], "note": row["note"]},
                 })
+            if churn_now and not old.get("start_churn"):
+                events.append({"event": "DOTS_START_CHURN", "dot": dot, "agent": row["agent"],
+                               "detail": {"task": row["task"], "detail": row.get("start_churn_detail")}})
+        dh_map = data.get("daemon_health") or {}
+        if any(e.get("source") == "daemon_health" for e in snapshot.get("errors") or []):
+            for dh_key, old_dh in prev_dh.items():
+                if isinstance(dh_key, tuple) and dh_key[0] == dot and dh_key[1] not in dh_map:
+                    state["daemon_health"][dh_key] = old_dh
+        for label, dh in sorted(dh_map.items()):
+            dh_key = (dot, label)
+            has_ret = bool(dh.get("retained_limit_hits"))
+            has_chat = bool(dh.get("chat_error_hits"))
+            state["daemon_health"][dh_key] = {"retained": has_ret, "chat": has_chat}
+            old_dh = prev_dh.get(dh_key) or {"retained": False, "chat": False}
+            if has_ret and not old_dh.get("retained"):
+                events.append({"event": "DOTS_DAEMON_LIMIT", "dot": dot, "agent": "-",
+                               "detail": {"source": one_line(label, 30), "detail": "retained=%d limit=%s" % (
+                                   dh.get("retained_limit_hits", 0), dh.get("retained_limit") or "?")}})
+            if has_chat and not old_dh.get("chat"):
+                events.append({"event": "DOTS_CHAT_ERROR", "dot": dot, "agent": "-",
+                               "detail": {"source": one_line(label, 30), "detail": "chat_errors=%d" % dh.get("chat_error_hits", 0)}})
+            if (old_dh.get("retained") and not has_ret) or (old_dh.get("chat") and not has_chat):
+                if not has_ret and not has_chat:
+                    events.append({"event": "DOTS_DAEMON_RECOVERED", "dot": dot, "agent": "-",
+                                   "detail": {"source": one_line(label, 30)}})
         if not data["activity"]:
             # Compare the next successful read with the last observed activity.
             if dot in previous["activity"]:
@@ -1163,7 +1495,7 @@ def emit_event(event, as_json):
 
 
 def watch(config, transport, interval, as_json, out=sys.stdout):
-    previous = {"agents": {}, "activity": {}, "errors": set()}
+    previous = {"agents": {}, "activity": {}, "errors": set(), "daemon_health": {}}
     first = True
     while True:
         started = time.time()
@@ -1259,9 +1591,24 @@ def default_config_path():
 
 
 def load_config(path):
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
+        fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise SystemExit("config not regular file: %s" % path)
+            with os.fdopen(fd, "rb") as handle:
+                blob = handle.read(1024 * 1024 + 1)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        if len(blob) > 1024 * 1024:
+            raise SystemExit("config too large: %s" % path)
+        raw = json.loads(blob.decode("utf-8"))
     except OSError:
         raise SystemExit("config not found: %s" % path) from None
     config = json.loads(json.dumps(DEFAULT_CONFIG))
@@ -1270,6 +1617,12 @@ def load_config(path):
             config[key].update(value)
         else:
             config[key] = value
+    raw_stall = (config.get("thresholds") or {}).get("stall_minutes", 30)
+    try:
+        stall_val = 30 if isinstance(raw_stall, bool) else int(raw_stall)
+    except (TypeError, ValueError):
+        stall_val = 30
+    config["thresholds"]["stall_minutes"] = max(1, stall_val)
     for dot in config["ledger"]["dots"]:
         config["dots"].setdefault(dot, {})
     for index, source in enumerate(config["activity"]):
@@ -1290,21 +1643,25 @@ def main(argv=None):
     snap = sub.add_parser("snapshot", help="print one snapshot and exit")
     snap.add_argument("--json", action="store_true", help="machine-readable output")
     snap.add_argument("--no-github", action="store_true", help="do not resolve evidence references")
+    snap.add_argument("--daemon-health", action="store_true", help="scan recent daemon sessions for retained-session limits and chat errors")
     snap.add_argument("--stall-minutes", type=int, default=None)
 
     watch_cmd = sub.add_parser("watch", help="print one line per state change")
     watch_cmd.add_argument("--interval", type=int, default=60, help="seconds between scans")
     watch_cmd.add_argument("--json", action="store_true", help="one JSON object per line")
     watch_cmd.add_argument("--no-github", action="store_true")
+    watch_cmd.add_argument("--daemon-health", action="store_true", help="scan recent daemon sessions for retained-session limits and chat errors")
     watch_cmd.add_argument("--stall-minutes", type=int, default=None)
 
     args = parser.parse_args(argv)
     path = args.config or default_config_path()
     config = load_config(path)
-    if args.stall_minutes:
-        config["thresholds"]["stall_minutes"] = args.stall_minutes
+    if args.stall_minutes is not None:
+        config["thresholds"]["stall_minutes"] = max(1, int(args.stall_minutes))
     if args.no_github:
         config["github"]["enabled"] = False
+    if getattr(args, "daemon_health", False):
+        config.setdefault("daemon_health", dict(DEFAULT_CONFIG["daemon_health"]))["enabled"] = True
     transport = Transport(config["limits"]["command_timeout_seconds"],
                           config["limits"]["gh_timeout_seconds"])
     if args.command == "snapshot":

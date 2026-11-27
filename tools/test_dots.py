@@ -1912,6 +1912,184 @@ class WatchTests(Base):
         self.assertIn("idle=argv:", config)
         self.assertIn("rewake_min=argv:0", config)
 
+    def test_active_wait_suppresses_stall_until_wait_stall_min(self):
+        os.makedirs(os.path.join(self.base, "listen"), exist_ok=True)
+        for agent, mins in (("agent-w1", 45), ("agent-w2", 70)):
+            self.live("step", mins, agent=agent, task="waiting work")
+            d.write_atomic(
+                os.path.join(self.base, "listen", f"{agent}.99999.json"),
+                json.dumps({"v": 1, "agent": agent, "pid": 99999, "host": "local",
+                            "until": d.iso_after(600)}) + "\n",
+            )
+        self.live("step", 45, agent="agent-no-wait", task="dead turn")
+
+        res = run(["board", "--json", "DOT-A"], self.base)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rows = {r["agent"]: r for r in json.loads(res.stdout)["agents"]}
+        self.assertTrue(rows["agent-w1"]["listening"])
+        self.assertNotIn("STALLED", rows["agent-w1"]["flags"])
+        self.assertTrue(rows["agent-w2"]["listening"])
+        self.assertIn("STALLED", rows["agent-w2"]["flags"])
+        self.assertFalse(rows["agent-no-wait"]["listening"])
+        self.assertIn("STALLED", rows["agent-no-wait"]["flags"])
+
+    def test_start_churn_board_flag_and_watch_start_churn_once_per_streak(self):
+        for idx, tname in enumerate(("t1", "t2", "t3", "t4")):
+            self.live("start", 20 - idx * 3, agent="churner", task=tname)
+        self.live("start", 12, agent="healthy", task="ok-1")
+        self.live("step", 8, agent="healthy", task="ok-1")
+        self.live("done", 2, agent="healthy", task="ok-1")
+
+        b_txt = run(["board", "DOT-A"], self.base)
+        self.assertEqual(b_txt.returncode, 0, b_txt.stderr)
+        self.assertIn("START-CHURN", b_txt.stdout)
+        self.assertIn("churn:", b_txt.stdout)
+
+        b_json = json.loads(run(["board", "--json", "DOT-A"], self.base).stdout)
+        rows = {r["agent"]: r for r in b_json["agents"]}
+        self.assertTrue(rows["churner"]["start_churn"])
+        self.assertIn("START-CHURN", rows["churner"]["flags"])
+        self.assertIsNone(rows["healthy"]["start_churn"])
+
+        idle_target, idle_cmd = self.recorder("idle_churn.txt", ("{dot}", "{agent}", "{why}"))
+        w1 = run(["watch", "--dot", "DOT-A", "--idle-cmd", json.dumps(idle_cmd)], self.base)
+        self.assertEqual(w1.returncode, 0, w1.stderr)
+        self.assertIn("WATCH_START_CHURN DOT-A churner", w1.stdout)
+        self.assertFalse(os.path.exists(idle_target))
+
+        w2 = run(["watch", "--dot", "DOT-A", "--idle-cmd", json.dumps(idle_cmd)], self.base)
+        self.assertEqual(w2.returncode, 0, w2.stderr)
+        self.assertNotIn("WATCH_START_CHURN", w2.stdout)
+
+    def test_keep_full_fill_cmd_independent_and_coordinator_fallback_vs_invalid(self):
+        self.make_dot("DOT-A")
+        roster_path = os.path.join(self.base, "live", "DOT-A", "roster.json")
+        d.write_atomic(roster_path, json.dumps({
+            "updated_at": d.now(),
+            "actors": [
+                {"agent": "coord-x", "role": "coordinator", "occupies_slot": True, "slot_state": "working"},
+                {"agent": "w1", "role": "worker", "occupies_slot": True, "slot_state": "idle"},
+            ],
+        }) + "\n")
+        fill_target, fill_cmd = self.recorder("fill.txt", ("{dot}", "{agent}", "{lanes}", "{track}"))
+        out = self.keep_full("--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd))
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=1 total=2", out)
+        self.assertIn("coordinator=coord-x", out)
+        self.assertEqual(read(fill_target).splitlines(), ["DOT-A coord-x w1 none"])
+
+        d.write_atomic(roster_path, json.dumps({
+            "updated_at": d.now(),
+            "coordinator": "-bad",
+            "slots_total": 2,
+            "slots_unassigned": 1,
+            "actors": [{"agent": "coord-x", "role": "coordinator", "occupies_slot": True}],
+        }) + "\n")
+        out_bad = self.keep_full("--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd), "--rewake-min", "0")
+        self.assertIn("WATCH_ERROR keep-full DOT-A invalid coordinator", out_bad)
+        self.assertEqual(len(read(fill_target).splitlines()), 1)
+
+    def test_stale_roster_falls_back_to_live_lanes_and_resets_without_false_filled(self):
+        self.put_roster(
+            updated_at=d.iso_after(-180 * 60),
+            slots_total=2,
+            slots_unassigned=0,
+            actors=[
+                {"agent": "lead", "role": "coordinator", "occupies_slot": True, "slot_state": "working"},
+                {"agent": "w1", "role": "worker", "occupies_slot": True, "slot_state": "working"},
+            ],
+        )
+        self.live("step", 5, agent="w1", task="kice-1")
+        fill_target, fill_cmd = self.recorder("stale_fill.txt", ("{dot}", "{agent}", "{lanes}", "{track}"))
+        out_busy = self.keep_full("--roster-fresh-min", "120", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd))
+        self.assertIn("WATCH_SKIP DOT-A reason=live_busy", out_busy)
+        self.assertNotIn("WATCH_FILLED", out_busy)
+        self.assertFalse(os.path.exists(fill_target))
+
+        self.live("done", 2, agent="w1", task="kice-1")
+        out_empty = self.keep_full("--roster-fresh-min", "120", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd))
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=1", out_empty)
+        self.assertIn("source=live", out_empty)
+        self.assertIn("empty_lanes=w1", out_empty)
+        self.assertEqual(read(fill_target).splitlines(), ["DOT-A lead w1 none"])
+        st = d.load_json(os.path.join(self.base, "watch", "state.json"))
+        self.assertIn("DOT-A", st["capacity"])
+
+        self.live("start", 0, agent="w1", task="kice-2")
+        out_resumed = self.keep_full("--roster-fresh-min", "120", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd))
+        self.assertIn("WATCH_SKIP DOT-A reason=live_busy", out_resumed)
+        self.assertNotIn("WATCH_FILLED", out_resumed)
+        st2 = d.load_json(os.path.join(self.base, "watch", "state.json"))
+        self.assertNotIn("DOT-A", st2["capacity"])
+
+    def test_fresh_roster_detects_newer_done_live_lane(self):
+        self.put_roster(
+            updated_at=d.iso_after(-10 * 60),
+            slots_total=2,
+            slots_unassigned=0,
+            actors=[
+                {"agent": "lead", "role": "coordinator", "occupies_slot": True, "slot_state": "working"},
+                {"agent": "w1", "role": "worker", "occupies_slot": True, "slot_state": "working"},
+            ],
+        )
+        self.live("done", 1, agent="w1", task="ux-1")
+        fill_target, fill_cmd = self.recorder("fresh_fill.txt", ("{dot}", "{lanes}"))
+        out = self.keep_full("--roster-fresh-min", "120", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_cmd))
+        self.assertIn("WATCH_UNDERFILLED DOT-A free=1 total=2", out)
+        self.assertIn("empty_lanes=w1", out)
+        self.assertEqual(read(fill_target).splitlines(), ["DOT-A w1"])
+
+    def test_wake_and_fill_retries_before_giving_up_and_fail_still_notifies(self):
+        mid = self.waiting_message(read=False)
+        fail_cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
+        notify_target, notify_cmd = self.recorder("fail_notify.txt", ("{id}",))
+        self.config_with(watch={"after_min": 0, "notify_after_min": 0, "rewake_min": 120, "fill_after_min": 0})
+
+        w1 = run(["watch", "--wake-retries", "2", "--wake-cmd", json.dumps(fail_cmd),
+                  "--notify-cmd", json.dumps(notify_cmd)], self.base)
+        self.assertEqual(w1.returncode, 0, w1.stderr)
+        self.assertIn(f"WATCH_WAKE proj agent-1 {mid}", w1.stdout)
+        self.assertNotIn("WATCH_WAKE_GAVE_UP", w1.stdout)
+        self.assertIn(f"WATCH_NOTIFY proj agent-1 {mid}", w1.stdout)
+        self.assertEqual(read(notify_target).splitlines(), [mid])
+
+        w2 = run(["watch", "--wake-retries", "2", "--wake-cmd", json.dumps(fail_cmd),
+                  "--notify-cmd", json.dumps(notify_cmd)], self.base)
+        self.assertEqual(w2.returncode, 0, w2.stderr)
+        self.assertIn(f"WATCH_WAKE_GAVE_UP proj agent-1 {mid} tries=2", w2.stdout)
+
+        w3 = run(["watch", "--wake-retries", "2", "--wake-cmd", json.dumps(fail_cmd)], self.base)
+        self.assertIn(f"WATCH_SKIP proj agent-1 {mid} reason=wake_already", w3.stdout)
+
+        self.put_roster(slots_total=3, slots_unassigned=1)
+        k1 = self.keep_full("--wake-retries", "2", "--fill-after-min", "0", "--fill-cmd", json.dumps(fail_cmd))
+        self.assertIn("WATCH_ERROR keep-full DOT-A fill-cmd exit=1", k1)
+        self.assertNotIn("gave_up", k1)
+        k2 = self.keep_full("--wake-retries", "2", "--fill-after-min", "0", "--fill-cmd", json.dumps(fail_cmd))
+        self.assertIn("WATCH_ERROR keep-full DOT-A fill-cmd gave_up tries=2", k2)
+        k3 = self.keep_full("--wake-retries", "2", "--fill-after-min", "0", "--fill-cmd", json.dumps(fail_cmd))
+        self.assertIn("WATCH_SKIP DOT-A reason=fill_rewake", k3)
+
+    def test_watch_lock_skips_overlap_and_idle_max_age_skips_ancient(self):
+        import fcntl
+        lock_path = os.path.join(self.base, "watch", "state.json.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                res = run(["watch"], self.base)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("WATCH_SKIP watch - reason=watch_locked", res.stdout)
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+        self.live("step", 500, agent="ancient", task="old task")
+        self.live("step", 45, agent="recent", task="fresh task")
+        self.live("blocked", 500, agent="blk-old", task="blocked task")
+        target, cmd = self.recorder("maxage.txt", ("{agent}", "{why}"))
+        out = run(["watch", "--dot", "DOT-A", "--idle-max-age-min", "200", "--idle-cmd", json.dumps(cmd)], self.base).stdout
+        self.assertIn("WATCH_SKIP DOT-A ancient reason=idle_too_old age=500m max=200m", out)
+        self.assertEqual(sorted(read(target).splitlines()), ["blk-old BLOCKED", "recent STALLED"])
+
 class ReadWarningTests(unittest.TestCase):
     """A path that cannot be read is reported once, and once more if it breaks again after working."""
     def test_an_append_that_wins_the_race_is_refused_not_blocked(self):
@@ -2751,6 +2929,420 @@ class HardeningRegressionTests(Base):
         m1_text = out.getvalue()
         self.assertIn("remote pushing", m1_text)
         self.assertIn("No pedantic 'not explicitly specified' or non-owner refusals", m1_text)
+
+
+class LoopTests(Base):
+    """Focused regressions for Mode 1 self-driving multi-track loops and watchdog loop monitoring."""
+
+    def recorder(self, name, placeholders=("{dot}", "{agent}", "{why}", "{track}")):
+        target = os.path.join(self.base, name)
+        code = ("import pathlib, sys;"
+                "pathlib.Path(sys.argv[1]).open('a').write(' '.join(sys.argv[2:]) + chr(10))")
+        return target, [sys.executable, "-c", code, target, *placeholders]
+
+    def test_loop_init_sha_pinning_contract_validation_and_dedup(self):
+        init1 = run([
+            "loop", "init", "DOT-A", "ux", "--project", "rem",
+            "--objective", "Continuous UX research loop",
+            "--continuous", "--feeds-to", "ui", "--feeds-to", "impl", "--gate", "tests_ok",
+        ], self.base)
+        self.assertEqual(init1.returncode, 0, init1.stderr)
+        m_sha = re.search(r"sha256=([0-9a-f]{64})", init1.stdout)
+        self.assertIsNotNone(m_sha, init1.stdout)
+        orig_sha = m_sha.group(1)
+
+        init2 = run([
+            "loop", "init", "DOT-A", "ux", "--project", "rem",
+            "--objective", "SHOULD NOT OVERWRITE",
+        ], self.base)
+        self.assertEqual(init2.returncode, 0, init2.stderr)
+        self.assertIn(f"sha256={orig_sha}", init2.stdout)
+        cpath = os.path.join(self.base, "loops", "DOT-A", "ux.contract.json")
+        self.assertEqual(d.load_json(cpath)["objective"], "Continuous UX research loop")
+
+        sec = run(["loop", "enqueue", "DOT-A", "ux", "--title", "t1", "--brief", "token ghp_ABCDEFGHIJKLMNOPQRST"], self.base)
+        self.assertEqual(sec.returncode, 2)
+        e_low = run(["loop", "enqueue", "DOT-A", "ux", "--title", "Low prio", "--key", "Flow-A", "--priority", "2"], self.base)
+        self.assertEqual(e_low.returncode, 0, e_low.stderr)
+        e_dup = run(["loop", "enqueue", "DOT-A", "ux", "--title", "Duplicate", "--key", "  flow-a  ", "--priority", "9"], self.base)
+        self.assertEqual(e_dup.returncode, 0, e_dup.stderr)
+        self.assertIn("LOOP_DEDUP dot=DOT-A track=ux key=flow-a", e_dup.stdout)
+        e_high = run(["loop", "enqueue", "DOT-A", "ux", "--title", "High prio", "--key", "flow-b", "--priority", "9"], self.base)
+        self.assertEqual(e_high.returncode, 0, e_high.stderr)
+
+        c_ok = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux", "--contract-sha256", orig_sha], self.base)
+        self.assertEqual(c_ok.returncode, 0, c_ok.stderr)
+        self.assertIn("priority=9 title=\"High prio\"", c_ok.stdout)
+        self.assertIn("[STANDING_GOAL]", c_ok.stdout)
+        self.assertIn("[PREAUTHORIZED_AUTONOMY]", c_ok.stdout)
+
+        bad_sha_res = run(["loop", "progress", "DOT-A", "ux", "--agent", "w-ux", "--item", "l-none",
+                           "--note", "n", "--evidence", "e", "--contract-sha256", "0" * 64], self.base)
+        self.assertEqual(bad_sha_res.returncode, 2)
+        self.assertIn("sha256 mismatch", bad_sha_res.stderr)
+
+        cdoc = d.load_json(cpath)
+        cdoc["feeds_to"] = ["../escape"]
+        d.write_atomic(cpath, json.dumps(cdoc) + "\n")
+        bad_contract = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(bad_contract.returncode, 2)
+        self.assertIn("invalid feeds_to", bad_contract.stderr)
+
+    def test_loop_end_to_end_handoff_wait_anti_churn_skip_blocked_pause_and_watch(self):
+        self.assertEqual(run([
+            "loop", "init", "DOT-A", "ux", "--project", "rem", "--objective", "Research UX flows",
+            "--continuous", "--feeds-to", "ui", "--feeds-to", "cap1", "--gate", "ux_verified",
+            "--max-items", "4", "--max-consecutive-blocks", "2", "--idle-after-min", "5",
+        ], self.base).returncode, 0)
+        self.assertEqual(run([
+            "loop", "init", "DOT-A", "ui", "--project", "rem", "--objective", "Design UI from UX",
+            "--idle-after-min", "5",
+        ], self.base).returncode, 0)
+        self.assertEqual(run([
+            "loop", "init", "DOT-A", "cap1", "--project", "rem", "--objective", "Capped downstream",
+            "--max-items", "1",
+        ], self.base).returncode, 0)
+        self.assertEqual(run(["loop", "enqueue", "DOT-A", "cap1", "--title", "Already full"], self.base).returncode, 0)
+        cap_claim = run(["loop", "claim", "DOT-A", "cap1", "--agent", "w-cap"], self.base)
+        cap_id = re.search(r"item_id=(l-\S+)", cap_claim.stdout).group(1)
+        self.assertEqual(run([
+            "loop", "complete", "DOT-A", "cap1", "--agent", "w-cap", "--item", cap_id,
+            "--summary", "Done", "--evidence", "cap_done_sha1",
+        ], self.base).returncode, 0)
+
+        self.assertEqual(run(["loop", "enqueue", "DOT-A", "ux", "--title", "Item 1", "--priority", "9"], self.base).returncode, 0)
+        self.assertEqual(run(["loop", "enqueue", "DOT-A", "ux", "--title", "Item 2", "--priority", "5"], self.base).returncode, 0)
+
+        c1 = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(c1.returncode, 0, c1.stderr)
+        item1_id = re.search(r"item_id=(l-\S+)", c1.stdout).group(1)
+
+        c_dup = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertIn(f"LOOP_ACTIVE_ENFORCED {item1_id}", c_dup.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.base, "live", "DOT-A", "w-ux.jsonl")))
+        self.assertTrue(os.path.exists(os.path.join(self.base, "memory", "DOT-A", "w-ux.json")))
+
+        bad_ev = run(["loop", "complete", "DOT-A", "ux", "--agent", "w-ux", "--item", item1_id,
+                      "--summary", "done", "--evidence", "ok", "--gate", "ux_verified"], self.base)
+        self.assertEqual(bad_ev.returncode, 2)
+        bad_gate = run(["loop", "complete", "DOT-A", "ux", "--agent", "w-ux", "--item", item1_id,
+                        "--summary", "done", "--evidence", "docs/ux.md#1"], self.base)
+        self.assertEqual(bad_gate.returncode, 2)
+
+        ui_waiter = spawn(["loop", "claim", "DOT-A", "ui", "--agent", "w-ui", "--wait", "10"], self.base)
+        self.procs.append(ui_waiter)
+        time.sleep(0.25)
+
+        t0 = time.monotonic()
+        self.assertEqual(run([
+            "loop", "progress", "DOT-A", "ux", "--agent", "w-ux", "--item", item1_id,
+            "--note", "Surveyed community threads", "--evidence", "notes/community.md",
+        ], self.base).returncode, 0)
+        comp1 = run([
+            "loop", "complete", "DOT-A", "ux", "--agent", "w-ux", "--item", item1_id,
+            "--summary", "Ergonomic flow defined", "--evidence", "specs/flow-v1.md",
+            "--gate", "ux_verified",
+        ], self.base)
+        self.assertEqual(comp1.returncode, 0, comp1.stderr)
+        self.assertIn(f"LOOP_COMPLETED {item1_id}", comp1.stdout)
+        self.assertIn("LOOP_HANDOFF ux -> ui ", comp1.stdout)
+        self.assertIn("LOOP_HANDOFF_SKIP ux -> cap1 reason=max_items_reached", comp1.stdout)
+        self.assertIn("LOOP_NEXT CLAIM_NOW", comp1.stdout)
+
+        ui_out, ui_err = ui_waiter.communicate(timeout=6)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(ui_waiter.returncode, 0, ui_err)
+        self.assertLess(elapsed, 4.0)
+        self.assertIn("LOOP_CLAIMED ", ui_out)
+        self.assertIn("from_track=ux", ui_out)
+
+        c2 = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        item2_id = re.search(r"item_id=(l-\S+)", c2.stdout).group(1)
+        b_false = run(["loop", "block", "DOT-A", "ux", "--agent", "w-ux", "--item", item2_id,
+                       "--reason", "승인 미확인이라 수정할 수 없음"], self.base)
+        self.assertEqual(b_false.returncode, 0, b_false.stderr)
+        self.assertIn("LOOP_AUTONOMY_OVERRIDE", b_false.stdout)
+        self.assertEqual(d.load_json(os.path.join(self.base, "loops", "DOT-A", "ux.state.json"))["active"]["id"], item2_id)
+
+        b_real = run(["loop", "block", "DOT-A", "ux", "--agent", "w-ux", "--item", item2_id,
+                      "--reason", "missing video LS100030074766 in drive folder"], self.base)
+        self.assertEqual(b_real.returncode, 0, b_real.stderr)
+        self.assertIn(f"LOOP_BLOCKED {item2_id}", b_real.stdout)
+        self.assertIn("LOOP_NEXT SKIP_BLOCKED_SEED", b_real.stdout)
+
+        c_seed = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(c_seed.returncode, 0, c_seed.stderr)
+        self.assertIn("LOOP_SEED_REQUIRED", c_seed.stdout)
+        self.assertIn("recent_done_keys=", c_seed.stdout)
+
+        self.assertEqual(run(["loop", "enqueue", "DOT-A", "ux", "--title", "Item 3"], self.base).returncode, 0)
+        c3 = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        item3_id = re.search(r"item_id=(l-\S+)", c3.stdout).group(1)
+        self.assertEqual(run(["loop", "block", "DOT-A", "ux", "--agent", "w-ux", "--item", item3_id,
+                              "--reason", "missing input data", "--hard-stop"], self.base).returncode, 0)
+        c_circ = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(c_circ.returncode, 3)
+        self.assertIn("LOOP_CIRCUIT_OPEN", c_circ.stdout)
+
+        self.assertEqual(run(["loop", "pause", "DOT-A", "ux", "--reason", "owner review"], self.base).returncode, 0)
+        c_paused = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(c_paused.returncode, 4)
+        self.assertIn("LOOP_PAUSED", c_paused.stdout)
+        self.assertEqual(run(["loop", "resume", "DOT-A", "ux"], self.base).returncode, 0)
+        c_resumed = run(["loop", "claim", "DOT-A", "ux", "--agent", "w-ux"], self.base)
+        self.assertEqual(c_resumed.returncode, 0)
+        self.assertIn("LOOP_SEED_REQUIRED", c_resumed.stdout)
+
+        d.write_atomic(os.path.join(self.base, "live", "DOT-A", "roster.json"), json.dumps({
+            "coordinator": "lead", "slots_total": 2, "slots_unassigned": 0,
+            "actors": [
+                {"agent": "lead", "role": "coordinator", "occupies_slot": True, "slot_state": "working"},
+                {"agent": "w-ux", "role": "worker", "occupies_slot": True, "slot_state": "working"},
+            ],
+        }) + "\n")
+        ux_spath = os.path.join(self.base, "loops", "DOT-A", "ux.state.json")
+        ux_st = d.load_json(ux_spath)
+        ux_st["last_activity_at"] = d.iso_after(-15 * 60)
+        d.write_atomic(ux_spath, json.dumps(ux_st) + "\n")
+
+        ui_spath = os.path.join(self.base, "loops", "DOT-A", "ui.state.json")
+        ui_st = d.load_json(ui_spath)
+        ui_st["active"]["claimed_at"] = d.iso_after(-45 * 60)
+        ui_st["last_activity_at"] = d.iso_after(-45 * 60)
+        d.write_atomic(ui_spath, json.dumps(ui_st) + "\n")
+
+        loop_fill_target, loop_fill_cmd = self.recorder("loop_fill.txt", ("{dot}", "{agent}", "{why}", "{track}"))
+        w_loop = run(["watch", "--keep-full", "DOT-A", "--fill-cmd", json.dumps(loop_fill_cmd)], self.base)
+        self.assertEqual(w_loop.returncode, 0, w_loop.stderr)
+        self.assertIn("WATCH_LOOP_IDLE DOT-A ux", w_loop.stdout)
+        self.assertIn("WATCH_LOOP_STALLED DOT-A ui", w_loop.stdout)
+        lines_fired = read(loop_fill_target).splitlines()
+        self.assertIn("DOT-A lead LOOP_IDLE ux", lines_fired)
+        self.assertIn("DOT-A w-ui LOOP_STALLED ui", lines_fired)
+
+        st_out = run(["loop", "status", "DOT-A"], self.base)
+        self.assertEqual(st_out.returncode, 0, st_out.stderr)
+        self.assertIn("DOT-A ux project=rem", st_out.stdout)
+        self.assertIn("DOT-A ui project=rem", st_out.stdout)
+
+    def test_security_and_loop_reliability_regressions(self):
+        # 1) Reserved ops dirs rejected on mail send/reply
+        bad_send = run(["send", "loops", "w1", "task", "evil"], self.base, stdin="hi")
+        self.assertEqual(bad_send.returncode, 2)
+        self.assertIn("reserved", bad_send.stderr)
+        bad_reply = run(["reply", "live", "w1", "note", "evil", "--re", "m-1", "--no-wait"], self.base, stdin="hi")
+        self.assertEqual(bad_reply.returncode, 2)
+
+        # 2) Shell metacharacters scrubbed from {task}/{why}; invalid {id} rejected
+        argv, miss = d.argv_for(
+            ["cmd", "{task}", "{why}", "{id}"],
+            {"task": "--bad;rm -rf /|`whoami`", "why": "WHY$(id)", "id": "item-1"},
+        )
+        self.assertIsNone(miss)
+        self.assertFalse(any(ch in argv[1] for ch in (";", "|", "`", "$", "(", ")")))
+        self.assertFalse(argv[1].startswith("-"))
+        self.assertEqual(argv[2], "WHY_id_")
+        _, bad_id_miss = d.argv_for(["cmd", "{id}"], {"id": "../escape"})
+        self.assertEqual(bad_id_miss, "id")
+
+        # 3) WATCH_START_CHURN suppressed once per unbroken streak & WATCH_IDLE_GAVE_UP on retries
+        prev_base = d.BASE
+        d.BASE = self.base
+        try:
+            os.makedirs(os.path.join(self.base, "live", "DOT-A"), exist_ok=True)
+            for idx, (task_s, age_m) in enumerate([("t1", 25), ("t2", 15), ("t3", 5)], 1):
+                d.append_line(os.path.join(self.base, "live", "DOT-A", "churner.jsonl"), {
+                    "t": d.iso_after(-age_m * 60), "agent": "churner", "role": "worker",
+                    "model": "m", "project": "p", "task": task_s, "state": "start",
+                    "host": "local", "note": "n", "evidence": "e",
+                })
+            fail_idle = [sys.executable, "-c", "import sys; sys.exit(1)"]
+            w1 = run(["watch", "--dot", "DOT-A", "--wake-retries", "2", "--idle-cmd", json.dumps(fail_idle)], self.base)
+            self.assertEqual(w1.stdout.count("WATCH_START_CHURN DOT-A churner"), 1)
+            d.append_line(os.path.join(self.base, "live", "DOT-A", "churner.jsonl"), {
+                "t": d.iso_after(-2 * 60), "agent": "churner", "role": "worker",
+                "model": "m", "project": "p", "task": "t4", "state": "start",
+                "host": "local", "note": "n", "evidence": "e",
+            })
+            w2 = run(["watch", "--dot", "DOT-A", "--wake-retries", "2", "--idle-cmd", json.dumps(fail_idle)], self.base)
+            self.assertNotIn("WATCH_START_CHURN", w2.stdout)
+
+            # Corrupt updated_at & unassigned slots in stale roster fallback
+            d.write_atomic(os.path.join(self.base, "live", "DOT-A", "roster.json"), json.dumps({
+                "coordinator": "lead", "updated_at": "not-a-timestamp",
+                "slots_total": 3, "slots_unassigned": 1,
+                "actors": [
+                    {"agent": "lead", "role": "coordinator", "occupies_slot": True, "slot_state": "working"},
+                    {"agent": "churner", "role": "worker", "occupies_slot": True, "slot_state": "working"},
+                ],
+            }) + "\n")
+            d.append_line(os.path.join(self.base, "live", "DOT-A", "churner.jsonl"), {
+                "t": d.iso_after(-1 * 60), "agent": "churner", "role": "worker",
+                "model": "m", "project": "p", "task": "t5", "state": "step",
+                "host": "local", "note": "step", "evidence": "ok",
+            })
+            w_cap = run(["watch", "--keep-full", "DOT-A", "--fill-after-min", "0", "--wake-retries", "2", "--fill-cmd", json.dumps(fail_idle)], self.base)
+            self.assertIn("WATCH_UNDERFILLED DOT-A free=1 total=3", w_cap.stdout)
+            self.assertIn("unassigned=1", w_cap.stdout)
+        finally:
+            d.BASE = prev_base
+
+        # 4) Korean + inflected English hard stops, fast LOOP_CIRCUIT_OPEN on --wait, ANSI empty summary pre-commit guard
+        self.assertEqual(run(["loop", "init", "DOT-B", "research", "--project", "rem", "--continuous", "--max-consecutive-blocks", "1", "--objective", "Analyze docs"], self.base).returncode, 0)
+        enq = run(["loop", "enqueue", "DOT-B", "research", "--title", "Item-KR"], self.base)
+        self.assertEqual(enq.returncode, 0)
+        iid = enq.stdout.splitlines()[0].split()[1]
+        self.assertEqual(run(["loop", "claim", "DOT-B", "research", "--agent", "w1"], self.base).returncode, 0)
+
+        # ANSI-only summary fails BEFORE mutating active item
+        bad_comp = run(["loop", "complete", "DOT-B", "research", "--agent", "w1", "--item", iid, "--summary", "\x1b[31m   \x1b[0m", "--evidence", "rev/1"], self.base)
+        self.assertEqual(bad_comp.returncode, 2)
+        st_still = d.load_json(os.path.join(self.base, "loops", "DOT-B", "research.state.json"))
+        self.assertIsNotNone(st_still["active"])
+
+        # Korean hard stop bypasses autonomy override and opens circuit breaker (max_consecutive_blocks=1)
+        blk = run(["loop", "block", "DOT-B", "research", "--agent", "w1", "--item", iid, "--reason", "원본 영상 파일 누락으로 진행 불가"], self.base)
+        self.assertEqual(blk.returncode, 0)
+        self.assertIn("LOOP_BLOCKED", blk.stdout)
+        self.assertNotIn("LOOP_AUTONOMY_OVERRIDE", blk.stdout)
+
+        # --wait stops immediately on LOOP_CIRCUIT_OPEN (no 5s wait) and exits 3
+        t0 = time.monotonic()
+        wait_open = run(["loop", "claim", "DOT-B", "research", "--agent", "w1", "--wait", "5"], self.base)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(wait_open.returncode, 3)
+        self.assertIn("LOOP_CIRCUIT_OPEN", wait_open.stdout)
+        self.assertLess(elapsed, 2.0)
+
+        # Kept loop init event records kept=True and actual contract project
+        kept_init = run(["loop", "init", "DOT-B", "research", "--project", "other", "--objective", "Ignored"], self.base)
+        self.assertEqual(kept_init.returncode, 0)
+        ev_lines = [json.loads(x) for x in read(os.path.join(self.base, "loops", "DOT-B", "research.events.jsonl")).splitlines() if x.strip()]
+        last_init = [e for e in ev_lines if e["event"] == "init"][-1]
+        self.assertTrue(last_init["payload"]["kept"])
+        self.assertEqual(last_init["payload"]["project"], "rem")
+
+        # 5) init rejects reserved project dir name 'loops'
+        bad_init = run(["init", "--mode", "dots-only", "--dot", "DOT-C", "--project", "loops=/tmp/reserved", "--yes"], self.base)
+        self.assertEqual(bad_init.returncode, 2)
+        self.assertIn("reserved", bad_init.stderr)
+
+        # 6) loop progress rejects ANSI-only note BEFORE mutating state.json
+        self.assertEqual(run(["loop", "init", "DOT-C", "research", "--project", "rem", "--objective", "Research docs"], self.base).returncode, 0)
+        enq_c = run(["loop", "enqueue", "DOT-C", "research", "--title", "Item-P"], self.base)
+        self.assertEqual(enq_c.returncode, 0)
+        iid_c = enq_c.stdout.splitlines()[0].split()[1]
+        self.assertEqual(run(["loop", "claim", "DOT-C", "research", "--agent", "w1"], self.base).returncode, 0)
+        st_c_path = os.path.join(self.base, "loops", "DOT-C", "research.state.json")
+        before_act = d.load_json(st_c_path)["last_activity_at"]
+        bad_prog = run(["loop", "progress", "DOT-C", "research", "--agent", "w1", "--item", iid_c, "--note", "\x1b[31m   \x1b[0m"], self.base)
+        self.assertEqual(bad_prog.returncode, 2)
+        self.assertEqual(d.load_json(st_c_path)["last_activity_at"], before_act)
+
+        # 7) watch_loops_for_dot fires LOOP_IDLE with fill-cmd without roster.json (target_agent='none') & {project} resolves cleanly
+        with tempfile.TemporaryDirectory() as outer_tmp:
+            fill_log = os.path.join(outer_tmp, "fill_args.log")
+            fill_spy = [sys.executable, "-c", "import pathlib, sys; p=pathlib.Path(sys.argv[1]); p.write_text((p.read_text() if p.exists() else '') + '|'.join(sys.argv[2:]) + '\\n')", fill_log, "{dot}", "{agent}", "{project}", "{why}"]
+            self.assertEqual(run(["loop", "init", "DOT-C", "idle-track", "--project", "rem", "--continuous", "--objective", "Idle wake check"], self.base).returncode, 0)
+            st_idle_path = os.path.join(self.base, "loops", "DOT-C", "idle-track.state.json")
+            st_idle = d.load_json(st_idle_path)
+            st_idle["last_activity_at"] = "2020-01-01T00:00:00Z"
+            d.write_atomic(st_idle_path, json.dumps(st_idle) + "\n")
+            w_no_roster = run(["watch", "--dot", "DOT-C", "--keep-full", "DOT-C", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_spy)], self.base)
+            self.assertEqual(w_no_roster.returncode, 0, w_no_roster.stdout + w_no_roster.stderr)
+            self.assertNotIn("missing=project", w_no_roster.stdout)
+            spy_txt = read(fill_log)
+            self.assertIn("DOT-C|none|rem|LOOP_IDLE", spy_txt)
+
+            # Also test watch_capacity {project} resolves 'none' when DOT-D has roster with no project & 2+ projects exist
+            self.make_project("proj2", "proj2-main")
+            os.makedirs(os.path.join(self.base, "live", "DOT-D"), exist_ok=True)
+            d.write_atomic(os.path.join(self.base, "live", "DOT-D", "roster.json"), json.dumps({
+                "coordinator": "lead", "updated_at": d.now(), "slots_total": 2, "slots_unassigned": 1,
+                "actors": [{"agent": "lead", "role": "coordinator", "occupies_slot": True, "slot_state": "working"}],
+            }) + "\n")
+            w_none_proj = run(["watch", "--dot", "DOT-D", "--keep-full", "DOT-D", "--fill-after-min", "0", "--fill-cmd", json.dumps(fill_spy)], self.base)
+            self.assertEqual(w_none_proj.returncode, 0)
+            self.assertNotIn("missing=project", w_none_proj.stdout)
+            self.assertIn("DOT-D|lead|none|UNDERFILLED", read(fill_log))
+
+            # 8) watch_lock refuses symlinked <BASE>/watch dir without touching outside lock file
+            outside_watch = os.path.join(outer_tmp, "outside_watch")
+            os.makedirs(outside_watch, exist_ok=True)
+            base_sym = os.path.join(outer_tmp, "ops_sym")
+            os.makedirs(base_sym, exist_ok=True)
+            os.symlink(outside_watch, os.path.join(base_sym, "watch"))
+            w_sym = run(["watch", "--dot", "DOT-A"], base_sym)
+            self.assertEqual(w_sym.returncode, 0, w_sym.stderr)
+            self.assertIn("WATCH_ERROR lock OSError", w_sym.stdout)
+            self.assertFalse(os.path.exists(os.path.join(outside_watch, "state.json.lock")))
+
+            # 9) loop complete rejects ANSI-only --evidence BEFORE mutating state.json
+            self.assertEqual(run(["loop", "init", "DOT-E", "evtrack", "--project", "rem", "--objective", "Verify evidence"], self.base).returncode, 0)
+            enq_e = run(["loop", "enqueue", "DOT-E", "evtrack", "--title", "EvItem"], self.base)
+            iid_e = enq_e.stdout.splitlines()[0].split()[1]
+            self.assertEqual(run(["loop", "claim", "DOT-E", "evtrack", "--agent", "w1"], self.base).returncode, 0)
+            bad_ev_comp = run(["loop", "complete", "DOT-E", "evtrack", "--agent", "w1", "--item", iid_e, "--summary", "Valid sum", "--evidence", "\x1b[31m   \x1b[0m"], self.base)
+            self.assertEqual(bad_ev_comp.returncode, 2)
+            st_e = d.load_json(os.path.join(self.base, "loops", "DOT-E", "evtrack.state.json"))
+            self.assertIsNotNone(st_e["active"])
+
+            # 10) Upgraded SECRET regex + redaction across memo(), board --json, show_mail, and loop status --json
+            pem_secret = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtokenBody1234567890\n-----END RSA PRIVATE KEY-----"
+            env_secret = "OPENAI_API_KEY=sk-proj-secretval123456 AWS_SECRET_ACCESS_KEY=awssec9876543210 bearer abcdef1234567890abcdef"
+            self.make_dot("DOT-F")
+            os.makedirs(os.path.join(self.base, "live", "DOT-F"), exist_ok=True)
+            d.write_atomic(os.path.join(self.base, "memory", "DOT-F", "w1.json"), json.dumps({
+                "v": 1, "t": d.now(), "dot": "DOT-F", "agent": "w1", "project": "rem",
+                "task": f"task with {env_secret}", "state": "step", "host": "h-sk-secretkey1234567890",
+                "goal": "g", "doing": "OPENAI_API_KEY=leakval987654", "next": "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXX",
+                "decisions": [], "blockers": [],
+            }) + "\n")
+            d.append_line(os.path.join(self.base, "live", "DOT-F", "w1.jsonl"), {
+                "t": d.now(), "agent": "w1", "role": "worker", "model": "m",
+                "project": "rem", "task": "OPENAI_API_KEY=livetask123456", "state": "step",
+                "host": "local", "note": "note bearer zzzzzz1111112222223333", "evidence": "https://discord.com/api/webhooks/12345/abcdef67890",
+            })
+            memo_res = run(["memo", "DOT-F", "w1"], self.base)
+            self.assertEqual(memo_res.returncode, 0)
+            for leaked in ("sk-proj-secretval123456", "awssec9876543210", "abcdef1234567890abcdef", "sk-secretkey1234567890", "leakval987654", "T000/B000", "livetask123456", "zzzzzz1111112222223333", "12345/abcdef67890"):
+                self.assertNotIn(leaked, memo_res.stdout)
+            self.assertIn("[REDACTED]", memo_res.stdout)
+
+            board_json = run(["board", "--json", "DOT-F"], self.base)
+            self.assertEqual(board_json.returncode, 0)
+            for leaked in ("sk-secretkey1234567890", "leakval987654", "T000/B000"):
+                self.assertNotIn(leaked, board_json.stdout)
+
+            red_pem = d._redact_text(f"before\n{pem_secret}\nafter")
+            self.assertNotIn("MIIEpAIBAAKCAQEAtokenBody1234567890", red_pem)
+            self.assertIn("[REDACTED]", red_pem)
+            self.assertIn("after", red_pem)
+
+            # loop status --json redacts secrets in contract/state
+            st_e_cur = d.load_json(os.path.join(self.base, "loops", "DOT-E", "evtrack.state.json"))
+            st_e_cur["active"]["title"] = "Leak OPENAI_API_KEY=loopsecret123456"
+            st_e_cur["active"]["claimed_by"] = "w-sk-proj-1234567890abcd"
+            d.write_atomic(os.path.join(self.base, "loops", "DOT-E", "evtrack.state.json"), json.dumps(st_e_cur) + "\n")
+            ls_res = run(["loop", "status", "DOT-E", "--json"], self.base)
+            self.assertEqual(ls_res.returncode, 0)
+            self.assertNotIn("loopsecret123456", ls_res.stdout)
+            self.assertNotIn("sk-proj-1234567890abcd", ls_res.stdout)
+
+            self.assertEqual(d._redact_text("Basic verification passed"), "Basic verification passed")
+            self.assertEqual(d._redact_text("Basic verification step 1"), "Basic verification step 1")
+            self.assertEqual(d._redact_text("Basic dXNlcjpwYXNz"), "[REDACTED]")
+            self.assertEqual(d._redact_text("sort_key=priority"), "sort_key=priority")
+
+            # 11) Reserved 'loops' rejected in loop init and planted loops/mail does not deadlock tick done
+            self.assertEqual(run(["loop", "init", "DOT-E", "t-res", "--project", "loops", "--objective", "Bad"], self.base).returncode, 2)
+            os.makedirs(os.path.join(self.base, "loops", "mail", "w1"), exist_ok=True)
+            d.write_atomic(os.path.join(self.base, "loops", "mail", "w1", "in.jsonl"), json.dumps({
+                "v": 1, "id": "m-planted", "t": d.now(), "from": "m", "to": "w1",
+                "task": "t", "kind": "task", "re": None, "text": "body", "refs": [],
+            }) + "\n")
+            tick_ok = run(["tick", "DOT-E", "w1", "done", "--project", "rem", "--host", "local", "--task", "t", "--note", "ok", "--evidence", "rev/1", "--goal", "g", "--doing", "d", "--next", "n"], self.base)
+            self.assertEqual(tick_ok.returncode, 0, tick_ok.stderr)
 
 
 if __name__ == "__main__":
