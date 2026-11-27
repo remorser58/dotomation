@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 UNIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -58,14 +58,14 @@ _TERM_CTRL_RE = re.compile(
 _SECRET_RE = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{10,}"
     r"|xox[abps]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+    r"|-----BEGIN (?:[A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?(?:-----END (?:[A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|\Z)"
     r"|(?i:\bBearer\s+[A-Za-z0-9._~+/-]{16,}|Authorization:\s*Basic\s+[A-Za-z0-9._+/=-]{8,})"
     r"|\b(?i:Basic)\s+(?=[A-Za-z0-9+/=]{8,}\b)(?:(?=[A-Za-z0-9+/=]*[0-9+/=])|(?=[A-Za-z0-9+/=]{12,}\b)(?=[A-Za-z0-9+/=]*[A-Z])(?=[A-Za-z0-9+/=]*[a-z]))[A-Za-z0-9+/=]{8,}"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
     r"|https?://[^/\s:@]+:[^/\s@]+@"
     r"|https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{10,}"
     r"|https://(?:discord\.com|discordapp\.com)/api/webhooks/[A-Za-z0-9/_-]{10,}"
-    r"|(?i:\b(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|webhook[_-]?url)\s*[:=]\s*[\"']?[^\s\"',;]{6,})"
+    r"|(?i:\b(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|webhook[_-]?url)\s*[:=]\s*(?:\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|[^\s\"',;]{6,}))"
     r"|(?i:[?&](?:token|key|api_key|access_token|secret|password|auth|sig|signature)=[^&\s]+))"
 )
 
@@ -246,6 +246,8 @@ def _check_no_symlink_under(base, path):
 
 
 def _resolve_safe_pilot_path(path):
+    if not isinstance(path, str) or any(ch in path for ch in ("\n", "\r", "\x00")):
+        _die("pilot directory must not contain newlines or NUL bytes")
     expanded = os.path.abspath(os.path.expanduser(path))
     parent = os.path.dirname(expanded)
     leaf = os.path.basename(expanded)
@@ -269,6 +271,8 @@ def _resolve_safe_pilot_path(path):
         resolved = os.path.join(parent_real, leaf)
     else:
         resolved = expanded
+    if any(ch in resolved for ch in ("\n", "\r", "\x00")):
+        _die("pilot directory must not contain newlines or NUL bytes")
     if os.path.islink(resolved):
         _die(f"pilot directory must not be a symlink: {resolved}")
     return resolved
@@ -331,6 +335,13 @@ def _load_private_json(path, base, default=None, require_strict_mode=True):
         return default
     raw = _read_private_bytes(path, base, require_strict_mode=require_strict_mode)
     return json.loads(raw.decode("utf-8"))
+
+
+def _load_private_json_safe(path, base, default=None, require_strict_mode=True):
+    try:
+        return _load_private_json(path, base, default=default, require_strict_mode=require_strict_mode)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return default
 
 
 def _write_private_atomic(path, text_data, base):
@@ -1476,7 +1487,7 @@ def _run_once_locked(cfg, pilot_dir):
             else:
                 raw_tracks = parsed.get("tracks")
                 loop_tracks = raw_tracks if isinstance(raw_tracks, list) else []
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             print(
                 f"PILOT_LOOP_STATUS_WARN exit=0 detail=invalid loop status JSON: {_clean_oneline(_redact_text(str(exc)))}",
                 flush=True,
@@ -1620,17 +1631,27 @@ def cmd_say(args):
 
 
 def cmd_status(args):
-    pilot_dir = _ensure_private_dir(args.pilot_dir)
-    cfg = _load_private_json(os.path.join(pilot_dir, "config.json"), pilot_dir, default={})
-    hb = _load_private_json(os.path.join(pilot_dir, "heartbeat.json"), pilot_dir, default=None)
-    ledger = _load_private_json(os.path.join(pilot_dir, "ledger.json"), pilot_dir, default={})
+    pilot_dir = _resolve_safe_pilot_path(args.pilot_dir)
+    cfg = _load_private_json_safe(os.path.join(pilot_dir, "config.json"), pilot_dir, default={})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    hb = _load_private_json_safe(os.path.join(pilot_dir, "heartbeat.json"), pilot_dir, default=None)
+    if not isinstance(hb, dict):
+        hb = None
+    ledger = _load_private_json_safe(os.path.join(pilot_dir, "ledger.json"), pilot_dir, default={})
+    if not isinstance(ledger, dict):
+        ledger = {}
     ok_pin, dots_py, actual_sha, pin_err = _verify_dots_pin(cfg) if cfg else (False, None, None, "uninitialized")
     ok_mon_pin, _, _, mon_pin_err = _verify_monitor_pin(cfg) if cfg else (False, None, None, "uninitialized")
     tracks = []
     loop_status_err = None
-    if ok_pin and cfg.get("dot"):
-        ops_base = os.path.abspath(os.path.expanduser(cfg.get("ops_base") or DEFAULT_OPS_BASE))
-        lproc = _run_dots(dots_py, ops_base, ["loop", "status", cfg["dot"], "--json"], check=False, expected_sha256=actual_sha)
+    dot_val = cfg.get("dot")
+    if ok_pin and isinstance(dot_val, str) and TOKEN_RE.fullmatch(dot_val):
+        raw_ops = cfg.get("ops_base")
+        ops_base = os.path.abspath(
+            os.path.expanduser(raw_ops if isinstance(raw_ops, str) and raw_ops.strip() else DEFAULT_OPS_BASE)
+        )
+        lproc = _run_dots(dots_py, ops_base, ["loop", "status", dot_val, "--json"], check=False, expected_sha256=actual_sha)
         if lproc.returncode != 0:
             loop_status_err = _clean_oneline(_redact_text(lproc.stderr or lproc.stdout or f"exit={lproc.returncode}"))
         else:
@@ -1641,7 +1662,7 @@ def cmd_status(args):
                 else:
                     raw_tracks = parsed.get("tracks")
                     tracks = raw_tracks if isinstance(raw_tracks, list) else []
-            except ValueError as exc:
+            except (ValueError, RecursionError) as exc:
                 loop_status_err = _clean_oneline(f"invalid loop status JSON: {exc}")
     out = _redact_tree({
         "v": 1,
@@ -1658,17 +1679,23 @@ def cmd_status(args):
         "loop_status_error": loop_status_err,
         "heartbeat": hb,
         "tracks": tracks,
-        "last_heal_at": (ledger or {}).get("last_heal_at"),
+        "last_heal_at": ledger.get("last_heal_at"),
     })
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 0
-    print(f"PILOT_STATUS dot={out['dot'] or '-'} project={out['project'] or '-'} pin={'ok' if ok_pin else _clean_oneline(out['dots_pin_error'] or '')} tracks={len(out['tracks'])}")
+    dot_txt = _clean_oneline(out["dot"] if out.get("dot") not in (None, "") else "-")
+    proj_txt = _clean_oneline(out["project"] if out.get("project") not in (None, "") else "-")
+    print(f"PILOT_STATUS dot={dot_txt} project={proj_txt} pin={'ok' if ok_pin else _clean_oneline(out['dots_pin_error'] or '')} tracks={len(out['tracks'])}")
     if loop_status_err:
         print(f"  loop_status_error={_clean_oneline(_redact_text(loop_status_err))}")
     out_hb = out.get("heartbeat")
     if isinstance(out_hb, dict):
-        print(f"  heartbeat t={_clean_oneline(out_hb.get('t'))} wakes={out_hb.get('wakes')} notifies={out_hb.get('notifies')}")
+        print(
+            f"  heartbeat t={_clean_oneline(out_hb.get('t'))}"
+            f" wakes={_clean_oneline(out_hb.get('wakes'))}"
+            f" notifies={_clean_oneline(out_hb.get('notifies'))}"
+        )
     for t in out["tracks"]:
         if isinstance(t, dict):
             print(f"  track={_clean_oneline(t.get('track'))} done={t.get('done')} queued={t.get('queued')} blocked={t.get('blocked')} paused={t.get('paused')}")
@@ -1749,15 +1776,22 @@ def cmd_doctor(args):
 
 
 def _systemd_quote(value):
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    s = str(value)
+    if any(ch in s for ch in ("\n", "\r", "\x00")):
+        _die("systemd value must not contain newlines or NUL bytes")
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
     return f'"{escaped}"'
 
 
 def cmd_render_service(args):
     pilot_dir = _resolve_safe_pilot_path(args.pilot_dir)
-    cfg = _load_private_json(os.path.join(pilot_dir, "config.json"), pilot_dir, default={}) or {}
+    cfg = _load_private_json_safe(os.path.join(pilot_dir, "config.json"), pilot_dir, default={})
+    if not isinstance(cfg, dict):
+        cfg = {}
     interval = _safe_int(args.interval, _safe_int(cfg.get("interval_sec"), 180, 15), 15)
-    dot = _clean_oneline(cfg.get("dot") or "DOT-A")
+    dot_raw = cfg.get("dot")
+    dot_clean = _clean_oneline(dot_raw) if isinstance(dot_raw, str) else ""
+    dot = dot_clean or "DOT-A"
     py = os.path.abspath(sys.executable)
     script = os.path.abspath(__file__)
     log_out = os.path.join(pilot_dir, "pilot.stdout.log")

@@ -75,7 +75,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROTOCOL_VERSION = 1
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -511,13 +511,15 @@ def read_regular_text(path: str, max_bytes: int = MAX_HTTP_BODY_BYTES) -> Option
 
 
 @contextlib.contextmanager
-def open_ops_dir_nofollow(base_dir: str, rel_parts: Sequence[str]):
-    """Create and traverse a relative ops directory chain rejecting symlinks at every segment."""
+def open_ops_dir_nofollow(base_dir: str, rel_parts: Sequence[str], *, create: bool = True):
+    """Traverse (and optionally create) a relative ops directory chain rejecting symlinks at every segment."""
     try:
         bst = os.lstat(base_dir)
         if stat.S_ISLNK(bst.st_mode) or not stat.S_ISDIR(bst.st_mode):
             raise OSError(f"{base_dir} must be a non-symlink directory")
     except FileNotFoundError:
+        if not create:
+            raise
         os.makedirs(base_dir, mode=0o755, exist_ok=True)
         bst = os.lstat(base_dir)
         if stat.S_ISLNK(bst.st_mode) or not stat.S_ISDIR(bst.st_mode):
@@ -532,11 +534,12 @@ def open_ops_dir_nofollow(base_dir: str, rel_parts: Sequence[str]):
             if not part or part in (".", "..") or "/" in part or "\\" in part or "\x00" in part:
                 raise OSError(f"unsafe ops path component: {part!r}")
             created = False
-            try:
-                os.mkdir(part, 0o755, dir_fd=cur_fd)
-                created = True
-            except FileExistsError:
-                pass
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=cur_fd)
+                    created = True
+                except FileExistsError:
+                    pass
             next_fd = os.open(part, os.O_RDONLY | o_dir | nofollow | os.O_NONBLOCK, dir_fd=cur_fd)
             os.close(cur_fd)
             cur_fd = next_fd
@@ -842,12 +845,45 @@ _SHELL_META_RE = re.compile(r"(?:;|&&|\|\||\||&|>|<|`|\$\(|\$\{|\r|\n|\x0b|\x0c)
 def _is_case_insensitive_fs(path: Optional[str] = None) -> bool:
     if os.name == "nt" or sys.platform == "darwin":
         return True
-    if path and os.path.exists(path):
-        parent = os.path.abspath(path)
-        if parent.lower() != parent.upper():
-            swapped = parent[:-1] + (parent[-1].lower() if parent[-1].isupper() else parent[-1].upper())
-            with contextlib.suppress(OSError):
-                return os.path.samefile(parent, swapped)
+    if not path:
+        return False
+    try:
+        abs_path = os.path.realpath(path)
+        if not os.path.isdir(abs_path):
+            return False
+        with os.scandir(abs_path) as it:
+            for entry in it:
+                name = entry.name
+                swapped = name.swapcase()
+                if swapped == name:
+                    continue
+                try:
+                    st_orig = os.lstat(entry.path)
+                    if stat.S_ISLNK(st_orig.st_mode) or (not stat.S_ISDIR(st_orig.st_mode) and st_orig.st_nlink > 1):
+                        continue
+                    st_swap = os.lstat(os.path.join(abs_path, swapped))
+                    if stat.S_ISLNK(st_swap.st_mode) or (not stat.S_ISDIR(st_swap.st_mode) and st_swap.st_nlink > 1):
+                        continue
+                    return (st_orig.st_dev, st_orig.st_ino) == (st_swap.st_dev, st_swap.st_ino)
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    continue
+        base = os.path.basename(abs_path)
+        parent_dir = os.path.dirname(abs_path)
+        swapped_base = base.swapcase()
+        if base and parent_dir and swapped_base != base:
+            st_orig = os.lstat(abs_path)
+            st_parent = os.lstat(parent_dir)
+            if not stat.S_ISLNK(st_orig.st_mode) and st_orig.st_dev == st_parent.st_dev:
+                try:
+                    st_swap = os.lstat(os.path.join(parent_dir, swapped_base))
+                    if not stat.S_ISLNK(st_swap.st_mode):
+                        return (st_orig.st_dev, st_orig.st_ino) == (st_swap.st_dev, st_swap.st_ino)
+                except FileNotFoundError:
+                    return False
+    except OSError:
+        return False
     return False
 
 
@@ -924,19 +960,14 @@ def validate_workspace_root(raw: Any) -> str:
         st = os.lstat(expanded)
     except FileNotFoundError as exc:
         raise ValueError(f"workspace_root does not exist: {expanded}") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot access workspace_root {expanded}: {exc}") from exc
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise ValueError(f"workspace_root must be a non-symlink directory: {expanded}")
     return os.path.realpath(expanded)
 
 
-def resolve_workspace_path(
-    workspace_root: str,
-    rel_path: str,
-    *,
-    allow_missing: bool = False,
-    forbid_git_dir: bool = False,
-) -> Tuple[str, str]:
-    ws_real = validate_workspace_root(workspace_root)
+def normalize_workspace_rel_path(rel_path: str, *, forbid_git_dir: bool = False) -> Tuple[str, List[str]]:
     raw = validate_one_line("path", rel_path, limit=512).strip()
     if "\\" in raw or "\x00" in raw:
         raise HubError("SCOPE_VIOLATION", "invalid path characters", status=403)
@@ -953,6 +984,18 @@ def resolve_workspace_path(
         raise HubError("SCOPE_VIOLATION", f"path traversal is forbidden: {raw!r}", status=403)
     if forbid_git_dir and any(p.lower() == ".git" for p in parts):
         raise HubError("SCOPE_VIOLATION", ".git directory access is forbidden", status=403)
+    return "/".join(parts), parts
+
+
+def resolve_workspace_path(
+    workspace_root: str,
+    rel_path: str,
+    *,
+    allow_missing: bool = False,
+    forbid_git_dir: bool = False,
+) -> Tuple[str, str]:
+    ws_real = validate_workspace_root(workspace_root)
+    cleaned, parts = normalize_workspace_rel_path(rel_path, forbid_git_dir=forbid_git_dir)
 
     cur = ws_real
     for i, part in enumerate(parts):
@@ -967,6 +1010,8 @@ def resolve_workspace_path(
             if os.path.commonpath([ws_real, parent_real]) != ws_real:
                 raise HubError("SCOPE_VIOLATION", f"path escapes workspace: {cleaned}", status=403) from exc
             continue
+        except OSError as exc:
+            raise HubError("SCOPE_VIOLATION", f"cannot inspect workspace path {cleaned}: {exc}", status=403) from exc
         if stat.S_ISLNK(st.st_mode):
             raise HubError("SCOPE_VIOLATION", f"symlinks are forbidden inside workspace path: {cleaned}", status=403)
         if not is_last and not stat.S_ISDIR(st.st_mode):
@@ -975,7 +1020,7 @@ def resolve_workspace_path(
     resolved = os.path.realpath(os.path.join(ws_real, *parts))
     if os.path.commonpath([ws_real, resolved]) != ws_real:
         raise HubError("SCOPE_VIOLATION", f"path escapes workspace: {cleaned}", status=403)
-    return resolved, "/".join(parts)
+    return resolved, cleaned
 
 
 def check_path_policy(rel_posix: str, contract: Optional[Dict[str, Any]], *, write: bool) -> Optional[str]:
@@ -985,13 +1030,37 @@ def check_path_policy(rel_posix: str, contract: Optional[Dict[str, Any]], *, wri
         return f"path {rel_posix!r} is outside contract workspace_root"
     ws_root = contract.get("workspace_root") or ""
     ci_allow = _is_case_insensitive_fs(ws_root)
+    rel_parts = [p for p in rel_posix.strip("/").split("/") if p]
+    prefixes = ["/".join(rel_parts[: i + 1]) for i in range(len(rel_parts))] or [rel_posix]
     for pat in contract.get("forbidden_paths") or []:
-        if match_rel_path(rel_posix, pat, case_insensitive=True):
-            return f"path {rel_posix!r} matches forbidden pattern {pat!r}"
+        for cand in prefixes:
+            if match_rel_path(cand, pat, case_insensitive=True):
+                return f"path {rel_posix!r} matches forbidden pattern {pat!r}"
     allowed = contract.get("allowed_paths") or []
     if write and allowed:
         if not any(match_rel_path(rel_posix, pat, case_insensitive=ci_allow) for pat in allowed):
             return f"path {rel_posix!r} is outside allowed_paths"
+    return None
+
+
+def _extract_abs_workspace_rel(ws_real: str, abs_path: str) -> Optional[str]:
+    """Map an absolute path (without '..') to relative POSIX path inside ws_real, or None if outside."""
+    norm = os.path.normpath(re.sub(r"/+", "/", abs_path))
+    if os.path.commonpath([ws_real, norm]) == ws_real:
+        return "." if norm == ws_real else os.path.relpath(norm, ws_real).replace(os.sep, "/")
+    parts = [p for p in norm.split("/") if p]
+    cur = "/"
+    for idx, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            break
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        if stat.S_ISDIR(st.st_mode) and os.path.realpath(cur) == ws_real:
+            rem = parts[idx + 1 :]
+            return "/".join(rem) if rem else "."
     return None
 
 
@@ -1009,25 +1078,28 @@ def check_cmd_policy(
         except ValueError as exc:
             return "CWD_OUTSIDE_WORKSPACE", str(exc)
         raw_cwd = cwd or ws_real
-        if not isinstance(raw_cwd, str) or "\x00" in raw_cwd:
+        if not isinstance(raw_cwd, str) or "\x00" in raw_cwd or "\\" in raw_cwd:
             return "CWD_OUTSIDE_WORKSPACE", "invalid cwd"
-        cand = raw_cwd if os.path.isabs(raw_cwd) else os.path.join(ws_real, raw_cwd)
-        cand = os.path.abspath(cand)
+        if any(seg == ".." for seg in raw_cwd.split("/")):
+            return "CWD_OUTSIDE_WORKSPACE", f"cwd traversal is forbidden: {raw_cwd!r}"
+        cand = os.path.normpath(re.sub(r"/+", "/", raw_cwd if os.path.isabs(raw_cwd) else os.path.join(ws_real, raw_cwd)))
+        rel_lex = _extract_abs_workspace_rel(ws_real, cand)
+        if rel_lex is None:
+            return "CWD_OUTSIDE_WORKSPACE", f"cwd {raw_cwd!r} escapes contract workspace_root"
+        if rel_lex != ".":
+            rel_parts = [p for p in rel_lex.split("/") if p and p != "."]
+            if any(p.lower() == ".git" for p in rel_parts):
+                return "CWD_OUTSIDE_WORKSPACE", "cwd must not be inside .git directory"
+            try:
+                with open_ops_dir_nofollow(ws_real, rel_parts, create=False):
+                    pass
+            except (OSError, ValueError):
+                return "CWD_OUTSIDE_WORKSPACE", f"cwd path contains unsafe component or symlink: {raw_cwd!r}"
         if os.path.islink(cand) or not os.path.isdir(cand):
             return "CWD_OUTSIDE_WORKSPACE", f"cwd must be a real directory inside workspace: {raw_cwd!r}"
         cwd_real = os.path.realpath(cand)
         if os.path.commonpath([ws_real, cwd_real]) != ws_real:
             return "CWD_OUTSIDE_WORKSPACE", f"cwd {raw_cwd!r} escapes contract workspace_root"
-        rel_cwd = os.path.relpath(cwd_real, ws_real)
-        if rel_cwd != ".":
-            rel_parts = [p for p in rel_cwd.split(os.sep) if p and p != "."]
-            if any(p.lower() == ".git" for p in rel_parts):
-                return "CWD_OUTSIDE_WORKSPACE", "cwd must not be inside .git directory"
-            try:
-                with open_ops_dir_nofollow(ws_real, rel_parts):
-                    pass
-            except (OSError, ValueError):
-                return "CWD_OUTSIDE_WORKSPACE", f"cwd path contains unsafe component or symlink: {raw_cwd!r}"
 
     for rx_str in contract.get("forbidden_cmds") or []:
         try:
@@ -1066,7 +1138,7 @@ def _read_workspace_file_nofollow(ws_real: str, rel_posix: str, max_bytes: int =
     rel_dirs, fname = rel_parts[:-1], rel_parts[-1]
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        with open_ops_dir_nofollow(ws_real, rel_dirs) as dir_fd:
+        with open_ops_dir_nofollow(ws_real, rel_dirs, create=False) as dir_fd:
             st = os.lstat(fname, dir_fd=dir_fd)
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
                 raise HubError("SCOPE_VIOLATION", f"{rel_posix} must be a regular file", status=403)
@@ -3655,9 +3727,11 @@ class HubCore:
         false_refusal_info: Optional[Dict[str, Any]] = None
         autonomy_directive = ""
         refusal_notify_values: Optional[Dict[str, Any]] = None
+        dot_name = ""
 
         with self.ledger.tx() as conn:
             agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
+            dot_name = agent.get("dot") or ""
             contract = self._get_contract_locked(conn, agent_id)
             gate_exc, deferred_failed = self._enforce_steering_gate_locked(
                 conn, agent, contract, now_ts, action="step", ack_ids=ack_ids, readback=readback
@@ -3930,7 +4004,7 @@ class HubCore:
                     )
 
         if deferred_exc is not None:
-            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name if 'dot_name' in locals() else '')
+            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name)
             self.wake_hub.wake_events()
             raise deferred_exc
 
@@ -4825,31 +4899,39 @@ class HubCore:
                 if deferred_exc is None and paths_in and contract is not None:
                     ws = contract.get("workspace_root") or ""
                     for p in paths_in:
-                        rel_p = p
-                        if ws and os.path.isabs(p):
-                            try:
-                                ws_real = validate_workspace_root(ws)
-                                target_real = os.path.realpath(p)
-                                if os.path.commonpath([ws_real, target_real]) != ws_real:
-                                    raise HubError("SCOPE_VIOLATION", f"path {p!r} escapes workspace", status=403)
-                                rel_p = os.path.relpath(target_real, ws_real).replace(os.sep, "/")
-                            except HubError as exc:
-                                self.ledger.emit_event_locked(conn, agent_id, "scope_violation", {"path": p, "reason": exc.message}, now_ts)
-                                deferred_exc = exc
-                                break
-                        elif ws:
-                            try:
-                                _, rel_p = resolve_workspace_path(
-                                    ws, p, allow_missing=True, forbid_git_dir=(action in ("tool_write", "commit"))
+                        try:
+                            if ws:
+                                if os.path.isabs(p):
+                                    if "\\" in p or "\x00" in p:
+                                        raise HubError("SCOPE_VIOLATION", "invalid path characters", status=403)
+                                    if any(seg == ".." for seg in p.split("/")):
+                                        raise HubError("SCOPE_VIOLATION", f"path traversal is forbidden: {p!r}", status=403)
+                                    ws_real = validate_workspace_root(ws)
+                                    rel_cand = _extract_abs_workspace_rel(ws_real, p)
+                                    if rel_cand is None:
+                                        raise HubError("SCOPE_VIOLATION", f"path {p!r} escapes workspace", status=403)
+                                else:
+                                    rel_cand = p
+                                rel_p, _ = normalize_workspace_rel_path(rel_cand, forbid_git_dir=True)
+                                vreason = check_path_policy(rel_p, contract, write=(action in ("tool_write", "commit")))
+                                if vreason is not None:
+                                    raise HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_p})
+                                _, rel_p = resolve_workspace_path(ws, rel_p, allow_missing=True, forbid_git_dir=True)
+                            else:
+                                rel_p, _ = normalize_workspace_rel_path(p, forbid_git_dir=True)
+                                vreason = check_path_policy(rel_p, contract, write=(action in ("tool_write", "commit")))
+                                if vreason is not None:
+                                    raise HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_p})
+                        except HubError as exc:
+                            if exc.code == "SCOPE_VIOLATION":
+                                self.ledger.emit_event_locked(
+                                    conn,
+                                    agent_id,
+                                    "scope_violation",
+                                    {"path": (exc.extra or {}).get("path") or p, "reason": exc.message},
+                                    now_ts,
                                 )
-                            except HubError as exc:
-                                self.ledger.emit_event_locked(conn, agent_id, "scope_violation", {"path": p, "reason": exc.message}, now_ts)
-                                deferred_exc = exc
-                                break
-                        vreason = check_path_policy(rel_p, contract, write=(action in ("tool_write", "commit")))
-                        if vreason is not None:
-                            self.ledger.emit_event_locked(conn, agent_id, "scope_violation", {"path": rel_p, "reason": vreason}, now_ts)
-                            deferred_exc = HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_p})
+                            deferred_exc = exc
                             break
 
                 if deferred_exc is None:
@@ -4857,7 +4939,7 @@ class HubCore:
                     agent_row = dict(conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone())
                     _, capsule_text = self._maybe_build_capsule_locked(conn, agent_row, contract, now_ts, force=False)
 
-        self._notify_unacked_failures(agent_id, failed, dot=dot_name)
+        self._notify_unacked_failures(agent_id, failed or deferred_failed, dot=dot_name)
         self.wake_hub.wake_events()
         if deferred_exc is not None:
             raise deferred_exc
@@ -4916,14 +4998,27 @@ class HubCore:
             if gate_exc is not None:
                 deferred_exc = gate_exc
             else:
-                _, rel_posix = resolve_workspace_path(ws_root, rel_path, allow_missing=False, forbid_git_dir=True)
-                vreason = check_path_policy(rel_posix, contract, write=False)
-                if vreason is not None:
-                    self.ledger.emit_event_locked(conn, agent_id, "scope_violation", {"path": rel_posix, "reason": vreason}, now_ts)
-                    deferred_exc = HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_posix})
+                try:
+                    rel_posix, _ = normalize_workspace_rel_path(rel_path, forbid_git_dir=True)
+                    vreason = check_path_policy(rel_posix, contract, write=False)
+                    if vreason is not None:
+                        raise HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_posix})
+                    _, rel_posix = resolve_workspace_path(
+                        ws_root, rel_posix, allow_missing=False, forbid_git_dir=True
+                    )
+                except HubError as exc:
+                    if exc.code == "SCOPE_VIOLATION":
+                        self.ledger.emit_event_locked(
+                            conn,
+                            agent_id,
+                            "scope_violation",
+                            {"path": (exc.extra or {}).get("path") or rel_path, "reason": exc.message},
+                            now_ts,
+                        )
+                    deferred_exc = exc
 
         if deferred_exc is not None:
-            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name if 'dot_name' in locals() else '')
+            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name)
             self.wake_hub.wake_events()
             raise deferred_exc
 
@@ -4999,6 +5094,7 @@ class HubCore:
         ack_ids = validate_str_list("ack_ids", params.get("ack_ids"), max_items=64, item_limit=64)
         readback = params.get("readback")
         now_ts = utc_now_ts()
+        allow_create_new = bool(create and not target)
 
         deferred_exc: Optional[HubError] = None
         deferred_failed: List[Dict[str, Any]] = []
@@ -5018,16 +5114,27 @@ class HubCore:
             if gate_exc is not None:
                 deferred_exc = gate_exc
             else:
-                _, rel_posix = resolve_workspace_path(
-                    ws_root, rel_path, allow_missing=create, forbid_git_dir=True
-                )
-                vreason = check_path_policy(rel_posix, contract, write=True)
-                if vreason is not None:
-                    self.ledger.emit_event_locked(conn, agent_id, "scope_violation", {"path": rel_posix, "reason": vreason}, now_ts)
-                    deferred_exc = HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_posix})
+                try:
+                    rel_posix, _ = normalize_workspace_rel_path(rel_path, forbid_git_dir=True)
+                    vreason = check_path_policy(rel_posix, contract, write=True)
+                    if vreason is not None:
+                        raise HubError("SCOPE_VIOLATION", vreason, status=403, extra={"path": rel_posix})
+                    _, rel_posix = resolve_workspace_path(
+                        ws_root, rel_posix, allow_missing=allow_create_new, forbid_git_dir=True
+                    )
+                except HubError as exc:
+                    if exc.code == "SCOPE_VIOLATION":
+                        self.ledger.emit_event_locked(
+                            conn,
+                            agent_id,
+                            "scope_violation",
+                            {"path": (exc.extra or {}).get("path") or rel_path, "reason": exc.message},
+                            now_ts,
+                        )
+                    deferred_exc = exc
 
         if deferred_exc is not None:
-            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name if 'dot_name' in locals() else '')
+            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name)
             self.wake_hub.wake_events()
             raise deferred_exc
 
@@ -5037,108 +5144,116 @@ class HubCore:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         file_mode = 0o644
         created_new = False
+        new_text = ""
 
-        with open_ops_dir_nofollow(ws_real, rel_dirs) as dir_fd:
-            existing_text: Optional[str] = None
-            try:
-                st = os.lstat(fname, dir_fd=dir_fd)
-                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-                    raise HubError("SCOPE_VIOLATION", f"{rel_posix} must be a regular file", status=403)
-                if st.st_nlink > 1:
-                    raise HubError("SCOPE_VIOLATION", f"{rel_posix} must not have hardlinks", status=403)
-                file_mode = stat.S_IMODE(st.st_mode)
-                fd = os.open(fname, os.O_RDONLY | nofollow | os.O_NONBLOCK, dir_fd=dir_fd)
-                opened = False
-                try:
-                    fst = os.fstat(fd)
-                    if not stat.S_ISREG(fst.st_mode):
-                        raise HubError("SCOPE_VIOLATION", f"{rel_posix} must be a regular file", status=403)
-                    if fst.st_nlink > 1:
-                        raise HubError("SCOPE_VIOLATION", f"{rel_posix} must not have hardlinks", status=403)
-                    with os.fdopen(fd, "rb") as fh:
-                        opened = True
-                        raw_b = fh.read(MAX_TOOL_FILE_BYTES + 1)
-                    if len(raw_b) > MAX_TOOL_FILE_BYTES:
-                        raise HubError("PAYLOAD_TOO_LARGE", f"{rel_posix} exceeds {MAX_TOOL_FILE_BYTES} bytes", status=413)
-                    existing_text = raw_b.decode("utf-8")
-                except BaseException:
-                    if not opened:
-                        with contextlib.suppress(OSError):
-                            os.close(fd)
-                    raise
-            except FileNotFoundError:
-                if not create or target:
-                    raise HubError("PATH_NOT_FOUND", f"target file not found: {rel_posix}", status=404)
-                created_new = True
-
-            if created_new:
-                new_text = replacement
-            else:
-                assert existing_text is not None
-                if not isinstance(target, str) or not target:
-                    raise HubError("FILE_EXISTS", f"{rel_posix} already exists; provide target to patch", status=409)
-                cnt = existing_text.count(target)
-                if cnt == 0:
-                    raise HubError("TARGET_NOT_FOUND", f"target block not found in {rel_posix}", status=404)
-                if cnt > 1:
-                    raise HubError("TARGET_NOT_UNIQUE", f"target block matched {cnt} times in {rel_posix}", status=409)
-                new_text = existing_text.replace(target, replacement, 1)
-
-            if len(new_text.encode("utf-8")) > MAX_TOOL_FILE_BYTES:
-                raise HubError("PAYLOAD_TOO_LARGE", "patched file exceeds max size", status=413)
-
-            tmp_name = f".{fname}.subdots.{os.getpid()}.{secrets.token_hex(6)}"
-            wfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | os.O_NONBLOCK, file_mode, dir_fd=dir_fd)
-            w_opened = False
-            try:
-                with os.fdopen(wfd, "w", encoding="utf-8") as fh:
-                    w_opened = True
-                    if hasattr(os, "fchmod"):
-                        with contextlib.suppress(OSError):
-                            os.fchmod(fh.fileno(), file_mode)
-                    fh.write(new_text)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_name, fname, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            except BaseException:
-                if not w_opened:
-                    with contextlib.suppress(OSError):
-                        os.close(wfd)
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_name, dir_fd=dir_fd)
-                raise
-
-        fin_ts = utc_now_ts()
         messages: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
         capsule_text = ""
         dot_name = ""
         agent_row: Dict[str, Any] = {}
-        with self.ledger.tx() as conn:
-            agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
-            dot_name = agent.get("dot") or ""
-            try:
-                dirty = json.loads(agent.get("observed_dirty_json") or "[]")
-            except ValueError:
-                dirty = []
-            if not isinstance(dirty, list):
-                dirty = []
-            if rel_posix not in dirty:
-                dirty.append(rel_posix)
-            conn.execute(
-                "UPDATE agents SET last_mutation_at = ?, observed_dirty_json = ?, updated_at = ? WHERE agent_id = ?",
-                (fin_ts, json.dumps(dirty[:128], ensure_ascii=False), fin_ts, agent_id),
-            )
-            self._recover_agent_liveness_locked(conn, agent, "tool_patch", fin_ts)
-            self.ledger.emit_event_locked(
-                conn, agent_id, "tool_patch", {"path": rel_posix, "created": created_new, "bytes": len(new_text)}, fin_ts
-            )
-            agent_row = dict(conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone())
-            self._record_fatigue_and_maybe_rollover_locked(
-                conn, agent_row, contract, fin_ts, calls_delta=1, bytes_delta=len(replacement)
-            )
-            messages, failed = self._collect_piggyback_locked(conn, agent_id, fin_ts)
-            _, capsule_text = self._maybe_build_capsule_locked(conn, agent_row, contract, fin_ts, force=False)
+
+        try:
+            with open_ops_dir_nofollow(ws_real, rel_dirs, create=allow_create_new) as dir_fd:
+                existing_text: Optional[str] = None
+                try:
+                    st = os.lstat(fname, dir_fd=dir_fd)
+                    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                        raise HubError("SCOPE_VIOLATION", f"{rel_posix} must be a regular file", status=403)
+                    if st.st_nlink > 1:
+                        raise HubError("SCOPE_VIOLATION", f"{rel_posix} must not have hardlinks", status=403)
+                    file_mode = stat.S_IMODE(st.st_mode) & 0o777
+                    fd = os.open(fname, os.O_RDONLY | nofollow | os.O_NONBLOCK, dir_fd=dir_fd)
+                    opened = False
+                    try:
+                        fst = os.fstat(fd)
+                        if not stat.S_ISREG(fst.st_mode):
+                            raise HubError("SCOPE_VIOLATION", f"{rel_posix} must be a regular file", status=403)
+                        if fst.st_nlink > 1:
+                            raise HubError("SCOPE_VIOLATION", f"{rel_posix} must not have hardlinks", status=403)
+                        with os.fdopen(fd, "rb") as fh:
+                            opened = True
+                            raw_b = fh.read(MAX_TOOL_FILE_BYTES + 1)
+                        if len(raw_b) > MAX_TOOL_FILE_BYTES:
+                            raise HubError("PAYLOAD_TOO_LARGE", f"{rel_posix} exceeds {MAX_TOOL_FILE_BYTES} bytes", status=413)
+                        existing_text = raw_b.decode("utf-8")
+                    except BaseException:
+                        if not opened:
+                            with contextlib.suppress(OSError):
+                                os.close(fd)
+                        raise
+                except FileNotFoundError:
+                    if not create or target:
+                        raise HubError("PATH_NOT_FOUND", f"target file not found: {rel_posix}", status=404)
+                    created_new = True
+
+                if created_new:
+                    new_text = replacement
+                else:
+                    assert existing_text is not None
+                    if not isinstance(target, str) or not target:
+                        raise HubError("FILE_EXISTS", f"{rel_posix} already exists; provide target to patch", status=409)
+                    cnt = existing_text.count(target)
+                    if cnt == 0:
+                        raise HubError("TARGET_NOT_FOUND", f"target block not found in {rel_posix}", status=404)
+                    if cnt > 1:
+                        raise HubError("TARGET_NOT_UNIQUE", f"target block matched {cnt} times in {rel_posix}", status=409)
+                    new_text = existing_text.replace(target, replacement, 1)
+
+                if len(new_text.encode("utf-8")) > MAX_TOOL_FILE_BYTES:
+                    raise HubError("PAYLOAD_TOO_LARGE", "patched file exceeds max size", status=413)
+
+                tmp_name = f".{fname}.subdots.{os.getpid()}.{secrets.token_hex(6)}"
+                wfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | os.O_NONBLOCK, file_mode, dir_fd=dir_fd)
+                w_opened = False
+                try:
+                    with os.fdopen(wfd, "w", encoding="utf-8") as fh:
+                        w_opened = True
+                        if hasattr(os, "fchmod"):
+                            with contextlib.suppress(OSError):
+                                os.fchmod(fh.fileno(), file_mode)
+                        fh.write(new_text)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    fin_ts = utc_now_ts()
+                    with self.ledger.tx() as conn:
+                        agent = self._verify_epoch_locked(conn, agent_id, epoch, session_token)
+                        dot_name = agent.get("dot") or ""
+                        try:
+                            dirty = json.loads(agent.get("observed_dirty_json") or "[]")
+                        except ValueError:
+                            dirty = []
+                        if not isinstance(dirty, list):
+                            dirty = []
+                        if rel_posix not in dirty:
+                            dirty.append(rel_posix)
+                        conn.execute(
+                            "UPDATE agents SET last_mutation_at = ?, observed_dirty_json = ?, updated_at = ? WHERE agent_id = ?",
+                            (fin_ts, json.dumps(dirty[:128], ensure_ascii=False), fin_ts, agent_id),
+                        )
+                        self._recover_agent_liveness_locked(conn, agent, "tool_patch", fin_ts)
+                        self.ledger.emit_event_locked(
+                            conn, agent_id, "tool_patch", {"path": rel_posix, "created": created_new, "bytes": len(new_text)}, fin_ts
+                        )
+                        agent_row = dict(conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone())
+                        self._record_fatigue_and_maybe_rollover_locked(
+                            conn, agent_row, contract, fin_ts, calls_delta=1, bytes_delta=len(replacement)
+                        )
+                        messages, failed = self._collect_piggyback_locked(conn, agent_id, fin_ts)
+                        _, capsule_text = self._maybe_build_capsule_locked(conn, agent_row, contract, fin_ts, force=False)
+                        os.replace(tmp_name, fname, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                except BaseException:
+                    if not w_opened:
+                        with contextlib.suppress(OSError):
+                            os.close(wfd)
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_name, dir_fd=dir_fd)
+                    raise
+        except FileNotFoundError as exc:
+            raise HubError("PATH_NOT_FOUND", f"target file not found: {rel_posix}", status=404) from exc
+        except UnicodeDecodeError as exc:
+            raise HubError("INVALID_INPUT", f"{rel_posix} is not valid UTF-8: {exc}", status=400) from exc
+        except OSError as exc:
+            raise HubError("SCOPE_VIOLATION", f"unsafe or inaccessible path {rel_posix}: {exc}", status=403) from exc
 
         self._notify_unacked_failures(agent_id, failed, dot=dot_name)
         self.wake_hub.wake_events()
@@ -5208,22 +5323,34 @@ class HubCore:
             if gate_exc is not None:
                 deferred_exc = gate_exc
             else:
-                cwd_cand = raw_cwd or ws_root
-                if cwd_cand.strip() in ("", ".", "./"):
-                    cwd_abs = validate_workspace_root(ws_root)
-                elif not os.path.isabs(cwd_cand):
-                    cwd_abs, _ = resolve_workspace_path(ws_root, cwd_cand, allow_missing=False, forbid_git_dir=True)
-                else:
-                    cwd_abs = cwd_cand
-                pol = check_cmd_policy(cmd_str, cwd_abs, contract)
-                if pol is not None:
-                    self.ledger.emit_event_locked(
-                        conn, agent_id, "cmd_policy_blocked", {"code": pol[0], "cmd": cmd_norm[:160], "cwd": cwd_abs}, now_ts
-                    )
-                    deferred_exc = HubError(pol[0], pol[1], status=403)
+                try:
+                    cwd_cand = raw_cwd or ws_root
+                    if cwd_cand.strip() in ("", ".", "./"):
+                        cwd_abs = validate_workspace_root(ws_root)
+                    elif not os.path.isabs(cwd_cand):
+                        cwd_abs, _ = resolve_workspace_path(ws_root, cwd_cand, allow_missing=False, forbid_git_dir=True)
+                    else:
+                        cwd_abs = cwd_cand
+                    pol = check_cmd_policy(cmd_str, cwd_abs, contract)
+                    if pol is not None:
+                        self.ledger.emit_event_locked(
+                            conn, agent_id, "cmd_policy_blocked", {"code": pol[0], "cmd": cmd_norm[:160], "cwd": cwd_abs}, now_ts
+                        )
+                        raise HubError(pol[0], pol[1], status=403)
+                    cwd_abs = os.path.realpath(cwd_abs)
+                except HubError as exc:
+                    if exc.code == "SCOPE_VIOLATION":
+                        self.ledger.emit_event_locked(
+                            conn,
+                            agent_id,
+                            "scope_violation",
+                            {"path": (exc.extra or {}).get("path") or (raw_cwd or ""), "reason": exc.message},
+                            now_ts,
+                        )
+                    deferred_exc = exc
 
         if deferred_exc is not None:
-            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name if 'dot_name' in locals() else '')
+            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name)
             self.wake_hub.wake_events()
             raise deferred_exc
 
@@ -5504,7 +5631,7 @@ class HubCore:
                 deferred_exc = gate_exc
 
         if deferred_exc is not None:
-            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name if 'dot_name' in locals() else '')
+            self._notify_unacked_failures(agent_id, deferred_failed, dot=dot_name)
             self.wake_hub.wake_events()
             raise deferred_exc
 

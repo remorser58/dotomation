@@ -119,7 +119,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Iterator, Optional, Tuple, Union
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 VERSION_LINE = re.compile(rb'^VERSION = "([0-9]+(?:\.[0-9]+)+)"\r?$', re.MULTILINE)
 UPDATE_API = "https://api.github.com/repos/remorser58/dotomation/releases/latest"
 UPDATE_LIMIT = 2 * 1024 * 1024
