@@ -1,4 +1,4 @@
-# Mode 1: `dots-only` (닷 자체 쿼터 전용 · `v1.3`)
+# Mode 1: `dots-only` (닷 자체 쿼터 전용 · `v1.4`)
 
 내 로컬 AI 세션(Antigravity, Claude Code, OMP 등)의 쿼터를 전혀 쓰지 않고 **Dots 자체 쿼터만으로** 작업을 수행할 때 선택하는 모드입니다.
 

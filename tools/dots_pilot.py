@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import pathlib
 import re
 import secrets
 import shlex
@@ -43,7 +44,9 @@ import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
+DEFAULT_IDLE_MAX_AGE_MIN = 1440
+WGPT_MAX_INSTRUCTIONS_CHARS = 3800
 
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 UNIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -331,41 +334,57 @@ def _check_no_symlink_under(base, path):
             raise OSError(f"symlink not allowed in private path: {cur}")
 
 
-def _resolve_safe_pilot_path(path):
-    if not isinstance(path, str) or any(ch in path for ch in ("\n", "\r", "\x00")):
-        _die("pilot directory must not contain newlines or NUL bytes")
-    expanded = os.path.abspath(os.path.expanduser(path))
+def _resolve_safe_pilot_path(path, label="pilot directory"):
+    if not isinstance(path, str) or not path.strip() or any(ch in path for ch in ("\n", "\r", "\x00")):
+        _die(f"{label} must be a single-line non-empty path")
+    expanded = os.path.abspath(os.path.expanduser(path.strip()))
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
     parent = os.path.dirname(expanded)
     leaf = os.path.basename(expanded)
     if os.path.islink(expanded):
-        _die(f"pilot directory must not be a symlink: {expanded}")
+        _die(f"{label} must not be a symlink: {expanded}")
     if parent:
         cur = os.path.sep if os.path.isabs(parent) else "."
         for part in parent.split(os.path.sep):
             if not part or part == ".":
                 continue
             cur = os.path.join(cur, part)
-            if os.path.islink(cur):
-                try:
-                    lst = os.lstat(cur)
-                except OSError as exc:
-                    _die(f"cannot inspect pilot parent {cur}: {exc}")
+            try:
+                lst = os.lstat(cur)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _die(f"cannot inspect {label} parent {cur}: {exc}")
+            if stat.S_ISLNK(lst.st_mode):
                 # Allow OS system links like macOS /tmp -> private/tmp owned by root
-                if lst.st_uid != 0:
-                    _die(f"untrusted symlink in pilot parent path: {cur}")
-        parent_real = os.path.realpath(parent)
-        resolved = os.path.join(parent_real, leaf)
+                if not (euid is not None and lst.st_uid == 0 and lst.st_uid != euid):
+                    _die(f"untrusted symlink in {label} parent path: {cur}")
+                try:
+                    st_chk = os.stat(cur)
+                except OSError as exc:
+                    _die(f"cannot inspect {label} parent {cur}: {exc}")
+            else:
+                st_chk = lst
+            if not stat.S_ISDIR(st_chk.st_mode):
+                _die(f"{label} parent is not a directory: {cur}")
+            if euid is not None and st_chk.st_uid not in (0, euid):
+                _die(f"untrusted owner on {label} parent {cur}")
+            if (st_chk.st_mode & 0o002) and not (st_chk.st_mode & stat.S_ISVTX):
+                _die(f"refusing unsticky world-writable {label} parent: {cur}")
+        resolved = os.path.realpath(expanded)
+        if os.path.islink(resolved):
+            _die(f"{label} must not be a symlink: {resolved}")
     else:
         resolved = expanded
     if any(ch in resolved for ch in ("\n", "\r", "\x00")):
-        _die("pilot directory must not contain newlines or NUL bytes")
+        _die(f"{label} must not contain newlines or NUL bytes")
     if os.path.islink(resolved):
-        _die(f"pilot directory must not be a symlink: {resolved}")
+        _die(f"{label} must not be a symlink: {resolved}")
     return resolved
 
 
-def _ensure_private_dir(path):
-    apath = _resolve_safe_pilot_path(path)
+def _ensure_private_dir(path, label="pilot directory"):
+    apath = _resolve_safe_pilot_path(path, label=label)
     os.makedirs(apath, mode=0o700, exist_ok=True)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     o_dir = getattr(os, "O_DIRECTORY", 0)
@@ -576,6 +595,106 @@ def _load_pinned_module(mod_name, file_path, expected_sha256=None):
     exec(compile(raw.decode("utf-8"), apath, "exec"), mod.__dict__)
     _MOD_CACHE[apath] = (actual, mod)
     return mod
+
+
+def _check_safe_filesystem_path(raw_path, label="path"):
+    if not isinstance(raw_path, str) or not raw_path.strip() or any(c in raw_path for c in ("\n", "\r", "\x00")):
+        _die(f"{label} must be a single-line non-empty path")
+    apath = os.path.abspath(os.path.expanduser(raw_path.strip()))
+    if os.path.islink(apath):
+        _die(f"{label} must not be a symlink: {apath}")
+    return apath
+
+
+def _ensure_independent_anchor_dir(anchor_dir, ops_base):
+    apath = _resolve_safe_pilot_path(anchor_dir, label="recovery anchor dir")
+    real_ops = os.path.realpath(os.path.abspath(os.path.expanduser(ops_base)))
+    real_anchor = os.path.realpath(apath)
+    try:
+        if os.path.commonpath([real_ops, real_anchor]) == real_ops:
+            _die(f"recovery anchor_dir must stay outside ops_base ({real_ops}) to remain independent")
+    except ValueError:
+        pass
+    return _ensure_private_dir(apath, label="recovery anchor dir")
+
+
+def _atomic_replace_owned_file(path, text_data, preserve_mode=True, create_backup=False):
+    abs_path = _check_safe_filesystem_path(path, "target file")
+    parent = os.path.dirname(abs_path)
+    base_name = os.path.basename(abs_path)
+    if os.path.islink(parent):
+        _die(f"parent directory must not be a symlink: {parent}")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    o_nb = getattr(os, "O_NONBLOCK", 0)
+    dir_fd = os.open(parent, os.O_RDONLY | o_dir | nofollow | o_nb)
+    backup_path = None
+    try:
+        st_p = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st_p.st_mode):
+            raise OSError(f"{parent} is not a directory")
+        if hasattr(os, "geteuid") and st_p.st_uid != os.geteuid():
+            raise OSError(f"{parent} uid mismatch")
+        st_cur = os.lstat(base_name, dir_fd=dir_fd)
+        if stat.S_ISLNK(st_cur.st_mode) or not stat.S_ISREG(st_cur.st_mode) or st_cur.st_nlink != 1:
+            raise OSError(f"{abs_path} must be a regular unlinked file")
+        if hasattr(os, "geteuid") and st_cur.st_uid != os.geteuid():
+            raise OSError(f"{abs_path} uid mismatch")
+        mode = stat.S_IMODE(st_cur.st_mode) if preserve_mode else 0o600
+        if create_backup:
+            rfd = os.open(base_name, os.O_RDONLY | nofollow | o_nb, dir_fd=dir_fd)
+            try:
+                old_bytes = _fstat_regular_fd(rfd, abs_path, max_bytes=MAX_JSON_BYTES)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(rfd)
+            ts = _now_utc().strftime("%Y%m%dT%H%M%SZ")
+            bak_name = f"{base_name}.bak-dotomation-{ts}"
+            if os.path.lexists(os.path.join(parent, bak_name)):
+                bak_name = f"{bak_name}-{secrets.token_hex(3)}"
+            bfd = os.open(bak_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | o_nb, mode, dir_fd=dir_fd)
+            opened_b = False
+            try:
+                with os.fdopen(bfd, "wb") as bfh:
+                    opened_b = True
+                    os.fchmod(bfh.fileno(), mode)
+                    bfh.write(old_bytes)
+                    bfh.flush()
+                    os.fsync(bfh.fileno())
+            except BaseException:
+                if not opened_b:
+                    with contextlib.suppress(OSError):
+                        os.close(bfd)
+                raise
+            backup_path = os.path.join(parent, bak_name)
+
+        tmp_name = f".{base_name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        tfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | o_nb, mode, dir_fd=dir_fd)
+        opened_t = False
+        try:
+            with os.fdopen(tfd, "w", encoding="utf-8") as tfh:
+                opened_t = True
+                os.fchmod(tfh.fileno(), mode)
+                tfh.write(text_data)
+                tfh.flush()
+                os.fsync(tfh.fileno())
+            st_chk = os.lstat(base_name, dir_fd=dir_fd)
+            if stat.S_ISLNK(st_chk.st_mode) or not stat.S_ISREG(st_chk.st_mode) or st_chk.st_nlink != 1:
+                raise OSError(f"{abs_path} changed during write")
+            if hasattr(os, "geteuid") and st_chk.st_uid != os.geteuid():
+                raise OSError(f"{abs_path} uid mismatch")
+            os.replace(tmp_name, base_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            if not opened_t:
+                with contextlib.suppress(OSError):
+                    os.close(tfd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dir_fd)
+    return backup_path
 
 
 def _parse_argv_json(spec, label):
@@ -1212,14 +1331,16 @@ def _apply_tracks_to_ops(cfg, dots_py, force=False, dots_sha256=None):
     return results
 
 
-def _format_wake_nudge(dot, project, events):
-    reasons = sorted({ev.get("why") or ev.get("kind") or "wake" for ev in events})
-    tracks = sorted({ev.get("track") for ev in events if ev.get("track") and ev.get("track") != "none"})
-    lanes = sorted({ev.get("lanes") for ev in events if ev.get("lanes") and ev.get("lanes") not in ("-", "none")})
-    agents = sorted({ev.get("agent") for ev in events if ev.get("agent") and ev.get("agent") != "none"})
+def _format_wake_nudge(dot, project, events, has_loops=True):
+    reasons = sorted({c for c in (_clean_oneline(_redact_text(ev.get("why") or ev.get("kind") or "wake")) for ev in events) if c})
+    tracks = sorted({c for c in (_clean_oneline(_redact_text(ev.get("track"))) for ev in events if ev.get("track") and ev.get("track") != "none") if c})
+    lanes = sorted({c for c in (_clean_oneline(_redact_text(ev.get("lanes"))) for ev in events if ev.get("lanes") and ev.get("lanes") not in ("-", "none")) if c})
+    agents = sorted({c for c in (_clean_oneline(_redact_text(ev.get("agent"))) for ev in events if ev.get("agent") and ev.get("agent") != "none") if c})
+    dot_s = _clean_oneline(_redact_text(dot)) or "none"
+    proj_s = _clean_oneline(_redact_text(project)) or "none"
     parts = [
-        f"[PILOT_WAKE dot={dot} project={project}]",
-        f"reasons={','.join(reasons)}",
+        f"[PILOT_WAKE dot={dot_s} project={proj_s}]",
+        f"reasons={','.join(reasons) or 'wake'}",
     ]
     if tracks:
         parts.append(f"tracks={','.join(tracks)}")
@@ -1227,9 +1348,14 @@ def _format_wake_nudge(dot, project, events):
         parts.append(f"lanes={','.join(lanes)}")
     if agents:
         parts.append(f"agents={','.join(agents)}")
-    parts.append(
-        "Action: execute `dots.py loop claim` / skip single blocked items (`loop block`) / keep reversible local & rev/* progress moving directly without asking owner unless a true hard-stop occurs."
-    )
+    if has_loops:
+        parts.append(
+            "Action: execute `dots.py loop claim` / skip single blocked items (`loop block`) / keep reversible local & rev/* progress moving directly without asking owner unless a true hard-stop occurs."
+        )
+    else:
+        parts.append(
+            "Action: handle owed mail / unblock or advance active workers cleanly; keep reversible local & rev/* progress moving directly without asking owner unless a true hard-stop occurs."
+        )
     return " ".join(parts)
 
 
@@ -1361,6 +1487,38 @@ def cmd_init(args):
     dh_cfg.setdefault("heal_cooldown_min", 15)
     dh_cfg.setdefault("activity_paths", [])
 
+    idle_max_raw = getattr(args, "idle_max_age_min", None)
+    if idle_max_raw is not None:
+        if isinstance(idle_max_raw, bool) or int(idle_max_raw) < 0:
+            _die("--idle-max-age-min must be an integer >= 0")
+        idle_max_age_min = int(idle_max_raw)
+    else:
+        idle_max_age_min = _safe_int(base_cfg.get("idle_max_age_min"), DEFAULT_IDLE_MAX_AGE_MIN, 0)
+
+    base_rec = base_cfg.get("recovery") if isinstance(base_cfg.get("recovery"), dict) else {}
+    rec_script_raw = getattr(args, "recovery_script", None) or base_rec.get("script")
+    rec_sha_raw = getattr(args, "recovery_sha256", None) or base_rec.get("sha256")
+    rec_ledger_raw = getattr(args, "recovery_ledger", None) or base_rec.get("ledger_dir")
+    rec_anchor_raw = getattr(args, "recovery_anchor_dir", None) or base_rec.get("anchor_dir")
+    recovery_cfg = None
+    if any(x is not None for x in (rec_script_raw, rec_sha_raw, rec_ledger_raw, rec_anchor_raw)):
+        sha_rec = str(rec_sha_raw or "").strip().lower()
+        if not rec_script_raw or not HEX64_RE.fullmatch(sha_rec):
+            _die("--recovery-script and 64-hex --recovery-sha256 must be configured together")
+        script_abs = _check_safe_filesystem_path(rec_script_raw, "--recovery-script")
+        if os.path.lexists(script_abs):
+            actual_rec_sha = _sha256_file(script_abs)
+            if actual_rec_sha != sha_rec:
+                _die(f"recovery.py sha256 mismatch expected={sha_rec} actual={actual_rec_sha}")
+        ledger_abs = _check_safe_filesystem_path(rec_ledger_raw, "--recovery-ledger") if rec_ledger_raw else None
+        anchor_abs = _ensure_independent_anchor_dir(rec_anchor_raw, ops_base) if rec_anchor_raw else None
+        recovery_cfg = {
+            "script": script_abs,
+            "sha256": sha_rec,
+            "ledger_dir": ledger_abs,
+            "anchor_dir": anchor_abs,
+        }
+
     tracks = (
         list(base_cfg["tracks"])
         if (args.preset is None and args.config and isinstance(base_cfg.get("tracks"), list) and base_cfg["tracks"])
@@ -1382,11 +1540,14 @@ def cmd_init(args):
         "keep_full": bool(base_cfg.get("keep_full", True)),
         "interval_sec": _safe_int(args.interval, _safe_int(base_cfg.get("interval_sec"), 180, 15), 15),
         "cooldown_min": _safe_int(args.cooldown_min, _safe_int(base_cfg.get("cooldown_min"), 10, 1), 1),
+        "idle_max_age_min": idle_max_age_min,
         "tracks": tracks,
         "chat": chat_cfg,
         "daemon_health": dh_cfg,
         "notify": notify_cfg,
     }
+    if recovery_cfg is not None:
+        cfg["recovery"] = recovery_cfg
 
     cfg_path = os.path.join(pilot_dir, "config.json")
     apply_sha = dots_sha
@@ -1402,9 +1563,12 @@ def cmd_init(args):
         _write_private_atomic(cfg_path, json.dumps(cfg, ensure_ascii=False, indent=1) + "\n", pilot_dir)
         print(f"PILOT_INIT config={cfg_path} preset={preset} dot={dot} project={project} dots_sha256={dots_sha[:12]}", flush=True)
 
-    applied = _apply_tracks_to_ops(cfg, dots_py, force=args.force, dots_sha256=apply_sha)
-    for item in applied:
-        print(f"PILOT_TRACK_READY {dot}/{item['track']}", flush=True)
+    if not getattr(args, "no_apply_tracks", False):
+        applied = _apply_tracks_to_ops(cfg, dots_py, force=args.force, dots_sha256=apply_sha)
+        for item in applied:
+            print(f"PILOT_TRACK_READY {dot}/{item['track']}", flush=True)
+    else:
+        print(f"PILOT_TRACKS_SKIPPED {dot}", flush=True)
     return 0
 
 
@@ -1458,8 +1622,8 @@ def cmd_sentinel(args):
         "agent": _validate_token("agent", args.agent),
         "project": _validate_token("project", args.project),
         "id": _validate_token("id", args.id),
-        "why": _clean_oneline(args.why or args.kind),
-        "lanes": _clean_oneline(args.lanes or "-"),
+        "why": _clean_oneline(_redact_text(args.why or args.kind)),
+        "lanes": _clean_oneline(_redact_text(args.lanes or "-")),
         "track": _validate_token("track", args.track or "none"),
         "task": _clean_oneline(_redact_text(args.task or "")),
         "age": _clean_oneline(args.age or "-"),
@@ -1528,6 +1692,16 @@ def _run_once_locked(cfg, pilot_dir):
             "--idle-cmd", json.dumps(idle_cmd),
             "--notify-cmd", json.dumps(notify_cmd),
         ]
+        idle_max = _safe_int(cfg.get("idle_max_age_min"), DEFAULT_IDLE_MAX_AGE_MIN, 0)
+        if idle_max > 0:
+            watch_args.extend(["--idle-max-age-min", str(idle_max)])
+        rec_cfg = cfg.get("recovery") if isinstance(cfg.get("recovery"), dict) else None
+        if rec_cfg and rec_cfg.get("script") and rec_cfg.get("sha256"):
+            watch_args.extend(["--recovery-script", str(rec_cfg["script"]), "--recovery-sha256", str(rec_cfg["sha256"])])
+            if rec_cfg.get("ledger_dir"):
+                watch_args.extend(["--ledger", f"{dot}={rec_cfg['ledger_dir']}"])
+            if rec_cfg.get("anchor_dir"):
+                watch_args.extend(["--anchor-dir", f"{dot}={rec_cfg['anchor_dir']}"])
         if cfg.get("keep_full", True):
             watch_args.extend(["--keep-full", dot, "--fill-cmd", json.dumps(fill_cmd)])
         proc = _run_dots(
@@ -1535,12 +1709,17 @@ def _run_once_locked(cfg, pilot_dir):
             env_extra={"DOTS_PILOT_SENTINEL_NONCE": nonce}, expected_sha256=actual_sha,
         )
         watch_out = proc.stdout + proc.stderr
+        vm_warns = []
         if proc.returncode != 0:
             print(f"PILOT_WATCH_WARN exit={proc.returncode} detail={_clean_oneline(_redact_text(watch_out))}", flush=True)
         else:
             for wline in watch_out.splitlines():
                 if "WATCH_ERROR" in wline or "WATCH_TOOL_CHANGED" in wline:
                     print(f"PILOT_WATCH_WARN {_clean_oneline(_redact_text(wline))}", flush=True)
+                elif wline.startswith(("WATCH_VM_UNREGISTERED", "WATCH_VM_ANCHOR_MISSING", "WATCH_VM_ANCHOR_DRIFT")):
+                    clean_vm = _clean_oneline(_redact_text(wline))
+                    vm_warns.append(clean_vm)
+                    print(f"PILOT_VM_WARN {clean_vm}", flush=True)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(nonce_path)
@@ -1606,7 +1785,7 @@ def _run_once_locked(cfg, pilot_dir):
             print(f"PILOT_WAKE_COOLDOWN {ckey}", flush=True)
 
     if eligible_wakes:
-        msg = _format_wake_nudge(dot, project, [e for _, e in eligible_wakes])
+        msg = _format_wake_nudge(dot, project, [e for _, e in eligible_wakes], has_loops=bool(loop_tracks))
         ok_chat, detail_chat = _send_chat_message(cfg, msg, values=eligible_wakes[0][1])
         if ok_chat:
             ts = _now_iso()
@@ -1633,6 +1812,16 @@ def _run_once_locked(cfg, pilot_dir):
         nkey = f"notify:{ev.get('dot')}:{ev.get('id') or ev.get('why')}"
         if not _cooldown_active(ledger["notify_cooldowns"], nkey, cooldown_min, current=current):
             ok_n, _ = _send_notification(cfg, f"WATCH_NOTIFY {ev.get('dot')}", f"agent={ev.get('agent')} id={ev.get('id')} why={ev.get('why')}")
+            if ok_n:
+                ledger["notify_cooldowns"][nkey] = _now_iso()
+
+    for vw in vm_warns:
+        vparts = vw.split()
+        vkind = vparts[0] if vparts else "WATCH_VM"
+        vsub = vparts[2] if len(vparts) > 2 else "-"
+        nkey = f"vm_warn:{dot}:{vkind}:{vsub}"
+        if not _cooldown_active(ledger["notify_cooldowns"], nkey, cooldown_min, current=current):
+            ok_n, _ = _send_notification(cfg, f"VM_WATCHDOG {dot}", vw)
             if ok_n:
                 ledger["notify_cooldowns"][nkey] = _now_iso()
 
@@ -1864,6 +2053,33 @@ def cmd_doctor(args):
             add_check("notify_webhook", valid_u, f"env={env_name} {'ok' if valid_u else u_detail}")
         else:
             add_check("notify_mode", nm in ("stdout", "command"), nm)
+        rec = cfg.get("recovery")
+        if isinstance(rec, dict):
+            r_script = rec.get("script")
+            r_sha = rec.get("sha256")
+            r_ok = False
+            r_detail = "missing recovery script/sha256"
+            if isinstance(r_script, str) and isinstance(r_sha, str) and HEX64_RE.fullmatch(r_sha):
+                try:
+                    actual_r = _sha256_file(r_script)
+                    r_ok = actual_r == r_sha
+                    r_detail = r_script if r_ok else f"sha256 mismatch actual={actual_r[:12]}"
+                except OSError as exc:
+                    r_detail = str(exc)
+            add_check("recovery_pin", r_ok, r_detail)
+            if rec.get("ledger_dir"):
+                ldir = str(rec["ledger_dir"])
+                add_check("recovery_ledger", os.path.isdir(ldir) and not os.path.islink(ldir), ldir)
+            if rec.get("anchor_dir"):
+                adir = str(rec["anchor_dir"])
+                try:
+                    real_ops = os.path.realpath(ops_base)
+                    real_anc = os.path.realpath(adir)
+                    indep = os.path.commonpath([real_ops, real_anc]) != real_ops
+                except ValueError:
+                    indep = True
+                anc_ok = os.path.isdir(adir) and not os.path.islink(adir) and indep
+                add_check("recovery_anchor", anc_ok, adir if indep else f"inside ops_base: {adir}")
 
     if args.json:
         print(json.dumps({"v": 1, "ok": ok_all, "checks": checks}, ensure_ascii=False, indent=1))
@@ -2015,6 +2231,423 @@ def cmd_render_service(args):
     return 0
 
 
+def _load_pilot_cfg_optional(args):
+    try:
+        pdir = _resolve_safe_pilot_path(args.pilot_dir)
+    except SystemExit:
+        return None, {}
+    if not os.path.isdir(pdir):
+        return pdir, {}
+    cfg = _load_private_json_safe(os.path.join(pdir, "config.json"), pdir, default={})
+    return pdir, (cfg if isinstance(cfg, dict) else {})
+
+
+def _build_wgpt_instructions(dot=None, project=None, ops_base=None, role="worker", dots_py=None, expected_sha256=None):
+    base_text = None
+    dots_cand = os.path.abspath(os.path.expanduser(dots_py)) if dots_py else os.path.join(_TOOL_DIR, "dots.py")
+    if os.path.isfile(dots_cand) and not os.path.islink(dots_cand):
+        sha_to_use = expected_sha256
+        if not sha_to_use:
+            with contextlib.suppress(OSError):
+                sha_to_use = _sha256_file(dots_cand)
+        if sha_to_use:
+            proc = _run_dots(
+                dots_cand,
+                os.path.abspath(os.path.expanduser(ops_base or DEFAULT_OPS_BASE)),
+                ["prompt", "--wgpt-connector", "--mode", "dots-only", "--role", role, "--json"],
+                check=False,
+                expected_sha256=sha_to_use,
+            )
+            if proc.returncode == 0:
+                with contextlib.suppress(ValueError):
+                    parsed = json.loads(proc.stdout)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+                        base_text = parsed["text"]
+    if not base_text:
+        base_text = "\n".join([
+            f"[DOTOMATION STANDBY HARNESS | astra-v2 | mode=dots-only | role={role}]",
+            "1. Model & Effort: Use GPT-6.2 Astra (ultra coordinator; xhigh workers/reviewers). NEVER invoke Codex.",
+            "2. Delegated Autonomy: Work on owner-assigned dots/queues/contracts is pre-authorized. Execute implied reversible local reads/edits/tests/local rev/* commits directly without asking for separate GO while runnable work remains.",
+            "3. Narrow Hard Stops Only: Stop only on remote push/PR/merge to main, destructive wipe, prod deploy/release, spending, missing credentials/host access, or explicit owner refusal ('Refusals are final').",
+            "4. Loop & Isolation: `dots.py loop claim -> ack --profile-sha -> progress -> complete -> next claim`; isolate single blocked items via `loop block`.",
+            "5. Verification & VM Safety: Root-cause fix first; <=3 attempts; EXECUTED vs TRACED vs UNVERIFIED + Not verified; keep durable checkpoints off VMs on local + external backup anchor.",
+        ])
+    ctx_parts = []
+    if dot:
+        ctx_parts.append(f"Dot={_clean_oneline(_redact_text(dot))}")
+    if project:
+        ctx_parts.append(f"Project={_clean_oneline(_redact_text(project))}")
+    if ops_base:
+        ctx_parts.append(f"OpsBase={_clean_oneline(_redact_text(ops_base))}")
+    text = _redact_text(base_text if not ctx_parts else f"{base_text}\nContext: {' | '.join(ctx_parts)}")
+    if len(text) > WGPT_MAX_INSTRUCTIONS_CHARS:
+        _die(f"rendered wgpt connector instructions exceed {WGPT_MAX_INSTRUCTIONS_CHARS} chars ({len(text)})")
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return text, sha
+
+
+def cmd_wgpt_instructions(args):
+    _, cfg = _load_pilot_cfg_optional(args)
+    dot = getattr(args, "dot", None) or cfg.get("dot")
+    project = getattr(args, "project", None) or cfg.get("project")
+    ops_base = getattr(args, "ops_base", None) or cfg.get("ops_base")
+    if dot:
+        dot = _validate_token("dot", dot)
+    if project:
+        project = _validate_token("project", project)
+    role = getattr(args, "role", None) or "worker"
+    dots_py = getattr(args, "dots_py", None) or cfg.get("dots_py")
+    expected_sha = cfg.get("dots_sha256") if not getattr(args, "dots_py", None) else None
+    text, sha = _build_wgpt_instructions(
+        dot=dot, project=project, ops_base=ops_base, role=role, dots_py=dots_py, expected_sha256=expected_sha
+    )
+    action = args.wgpt_cmd
+
+    if action == "render":
+        if args.json:
+            print(json.dumps({
+                "v": 1, "sha256": sha, "chars": len(text), "max_chars": WGPT_MAX_INSTRUCTIONS_CHARS, "text": text,
+            }, ensure_ascii=False, indent=1))
+        else:
+            print(text, flush=True)
+        return 0
+
+    cfg_path = _check_safe_filesystem_path(args.config, "--config")
+    try:
+        raw_bytes, _ = _safe_read_regular_bytes(cfg_path, max_bytes=MAX_JSON_BYTES)
+        st_cfg = os.lstat(cfg_path)
+        if hasattr(os, "geteuid") and st_cfg.st_uid != os.geteuid():
+            _die(f"wgpt config uid mismatch: {cfg_path}")
+        doc = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        _die(f"cannot read wgpt config {cfg_path}: {exc}")
+    if not isinstance(doc, dict):
+        _die("wgpt config must contain a JSON object")
+
+    mcp_obj = doc.get("mcp")
+    if mcp_obj is not None and not isinstance(mcp_obj, dict):
+        _die("wgpt config 'mcp' field must be an object")
+
+    if action == "check":
+        current_txt = str((mcp_obj or {}).get("instructions") or "")
+        current_sha = hashlib.sha256(current_txt.encode("utf-8")).hexdigest()[:16] if current_txt else ""
+        matched = current_txt == text and len(current_txt) <= 4000
+        res = {
+            "ok": matched,
+            "config": cfg_path,
+            "chars": len(current_txt),
+            "daemon_limit": 4000,
+            "current_sha256": current_sha,
+            "expected_sha256": sha,
+        }
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False, indent=1))
+        else:
+            print(
+                f"WGPT_INSTRUCTIONS_CHECK ok={str(matched).lower()} chars={len(current_txt)}/4000 "
+                f"current={current_sha or 'empty'} expected={sha}",
+                flush=True,
+            )
+        return 0 if matched else 2
+
+    # action == "apply"
+    updated = dict(doc)
+    new_mcp = dict(mcp_obj or {})
+    new_mcp["instructions"] = text
+    updated["mcp"] = new_mcp
+    payload = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
+    if getattr(args, "dry_run", False):
+        out = {
+            "ok": True,
+            "dry_run": True,
+            "config": cfg_path,
+            "sha256": sha,
+            "chars": len(text),
+            "daemon_limit": 4000,
+            "restart_needed_for_live_sessions": True,
+        }
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+        else:
+            print(f"WGPT_INSTRUCTIONS_DRY_RUN config={cfg_path} sha256={sha} chars={len(text)}/4000", flush=True)
+        return 0
+
+    try:
+        backup_path = _atomic_replace_owned_file(cfg_path, payload, preserve_mode=True, create_backup=True)
+    except (OSError, ValueError) as exc:
+        _die(f"failed updating wgpt config {cfg_path}: {exc}")
+    out = {
+        "ok": True,
+        "dry_run": False,
+        "config": cfg_path,
+        "backup": backup_path,
+        "sha256": sha,
+        "chars": len(text),
+        "daemon_limit": 4000,
+        "restart_needed_for_live_sessions": True,
+    }
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        print(
+            f"WGPT_INSTRUCTIONS_APPLIED config={cfg_path} sha256={sha} chars={len(text)}/4000 "
+            f"restart_needed_for_live_sessions=true backup={backup_path}",
+            flush=True,
+        )
+    return 0
+
+
+def _resolve_recovery_args(args):
+    _, cfg = _load_pilot_cfg_optional(args)
+    rec = cfg.get("recovery") if isinstance(cfg.get("recovery"), dict) else {}
+    dot = _validate_token("dot", getattr(args, "dot", None) or cfg.get("dot") or _die("--dot or pilot config.dot required"))
+    ops_base = os.path.abspath(os.path.expanduser(getattr(args, "ops_base", None) or cfg.get("ops_base") or DEFAULT_OPS_BASE))
+    script_raw = getattr(args, "recovery_script", None) or rec.get("script")
+    sha_raw = getattr(args, "recovery_sha256", None) or rec.get("sha256")
+    ledger_raw = getattr(args, "ledger_dir", None) or rec.get("ledger_dir")
+    anchor_raw = getattr(args, "anchor_dir", None) or rec.get("anchor_dir")
+    sha = str(sha_raw or "").strip().lower()
+    if not script_raw or not HEX64_RE.fullmatch(sha):
+        _die("recovery script and 64-hex sha256 required (via flags or pilot config)")
+    script_abs = _check_safe_filesystem_path(script_raw, "--recovery-script")
+    if not ledger_raw:
+        _die("--ledger-dir (or pilot recovery.ledger_dir) required")
+    ledger_abs = _check_safe_filesystem_path(ledger_raw, "--ledger-dir")
+    if not os.path.isdir(ledger_abs):
+        _die(f"recovery ledger directory not found: {ledger_abs}")
+    anchor_abs = None
+    if anchor_raw:
+        anchor_cand = _resolve_safe_pilot_path(anchor_raw, label="recovery anchor dir")
+        real_ops = os.path.realpath(ops_base)
+        real_anc = os.path.realpath(anchor_cand)
+        try:
+            if os.path.commonpath([real_ops, real_anc]) == real_ops:
+                _die(f"anchor_dir must stay outside ops_base ({real_ops})")
+        except ValueError:
+            pass
+        anchor_abs = anchor_cand
+    try:
+        mod = _load_pinned_module("dots_recovery", script_abs, expected_sha256=sha)
+    except Exception as exc:
+        _die(str(exc))
+    if not callable(getattr(mod, "identity", None)) or not callable(getattr(mod, "inspect", None)):
+        _die(f"{script_abs} must define identity(root) and inspect(root)")
+    return dot, ops_base, script_abs, sha, ledger_abs, anchor_abs, mod
+
+
+def _normalize_recovery_jobs(raw_jobs):
+    if not isinstance(raw_jobs, dict) or not all(isinstance(v, dict) and isinstance(v.get("phase"), str) for v in raw_jobs.values()):
+        _die("unexpected recovery.py inspect() ledger shape")
+    out = {}
+    for jid, row in sorted(raw_jobs.items()):
+        out[str(jid)] = {
+            "phase": row.get("phase"),
+            "rev": row.get("rev") if row.get("rev") is not None else row.get("revision"),
+            "head": row.get("head") or row.get("sha256") or row.get("checkpoint"),
+            "stage": row.get("stage"),
+            "next_stage": row.get("next_stage"),
+            "environment": row.get("environment"),
+            "generation": row.get("generation"),
+            "attempt": row.get("attempt"),
+            "recoveries": row.get("recoveries"),
+        }
+    return out
+
+
+def _validate_recovery_scalar(label, raw_val, allow_none=False):
+    if raw_val is None and allow_none:
+        return None
+    if isinstance(raw_val, bool) or raw_val is None or not isinstance(raw_val, (int, str)):
+        _die(f"invalid {label} in recovery ledger: expected integer or safe token")
+    txt = str(raw_val)
+    if not TOKEN_RE.fullmatch(txt):
+        _die(f"unsafe {label} in recovery ledger: {txt!r}")
+    return txt
+
+
+def _validate_store_uuid(raw_uuid):
+    if not isinstance(raw_uuid, str) or not raw_uuid.strip() or any(c in raw_uuid for c in ("\n", "\r", "\x00")):
+        _die("invalid store_uuid returned by recovery identity()")
+    cleaned = _clean_oneline(_redact_text(raw_uuid))
+    if not cleaned:
+        _die("invalid store_uuid returned by recovery identity()")
+    return cleaned
+
+
+def cmd_vm_backup(args):
+    dot, ops_base, script_abs, sha, ledger_abs, anchor_abs, mod = _resolve_recovery_args(args)
+    lpath = pathlib.Path(ledger_abs)
+    action = args.vm_cmd
+
+    if action == "status":
+        try:
+            store_uuid = _validate_store_uuid(mod.identity(lpath))
+            jobs = _normalize_recovery_jobs(mod.inspect(lpath))
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _die(f"recovery inspect failed: {exc}")
+        anchor_doc = None
+        if anchor_abs:
+            dot_sub_raw = os.path.join(anchor_abs, dot)
+            if os.path.islink(dot_sub_raw):
+                _die(f"recovery dot anchor dir must not be a symlink: {dot_sub_raw}")
+            if os.path.isdir(dot_sub_raw) and os.path.lexists(os.path.join(dot_sub_raw, "anchor.json")):
+                dot_dir = _ensure_private_dir(dot_sub_raw, label="recovery dot anchor dir")
+                anchor_doc = _load_private_json_safe(os.path.join(dot_dir, "anchor.json"), dot_dir, default=None)
+        if not anchor_abs:
+            parity = "ANCHOR_UNCONFIGURED"
+        elif not isinstance(anchor_doc, dict):
+            parity = "EMPTY_VERIFIED" if not jobs else "ANCHOR_MISSING"
+        elif anchor_doc.get("store_uuid") == store_uuid and anchor_doc.get("jobs") == jobs:
+            parity = "EMPTY_VERIFIED" if not jobs else "MATCH"
+        else:
+            parity = "DRIFT"
+        res = {
+            "v": 1,
+            "dot": dot,
+            "store_uuid": store_uuid,
+            "recovery_script": script_abs,
+            "recovery_sha256": sha,
+            "ledger_dir": ledger_abs,
+            "anchor_dir": anchor_abs,
+            "parity": parity,
+            "job_count": len(jobs),
+            "jobs": jobs,
+        }
+        if args.json:
+            print(json.dumps(_redact_tree(res), ensure_ascii=False, indent=1))
+        else:
+            print(f"VM_BACKUP_STATUS dot={dot} store_uuid={_clean_oneline(_redact_text(store_uuid))} jobs={len(jobs)} parity={parity}", flush=True)
+            for jid, jrow in sorted(jobs.items()):
+                jid_s = _clean_oneline(_redact_text(jid)) or "-"
+                phase_s = _clean_oneline(_redact_text(jrow.get("phase"))) or "-"
+                rev_s = _clean_oneline(_redact_text(jrow.get("rev"))) or "-"
+                next_s = _clean_oneline(_redact_text(jrow.get("next_stage"))) or "-"
+                head_s = (_clean_oneline(_redact_text(jrow.get("head") or "")) or "")[:16]
+                print(
+                    f"  job={jid_s} phase={phase_s} rev={rev_s} next={next_s} head={head_s}",
+                    flush=True,
+                )
+        return 0
+
+    if action == "sync-anchor":
+        if not anchor_abs:
+            _die("--anchor-dir (or pilot recovery.anchor_dir) is required for sync-anchor")
+        try:
+            id1 = _validate_store_uuid(mod.identity(lpath))
+            jobs1 = _normalize_recovery_jobs(mod.inspect(lpath))
+            id2 = _validate_store_uuid(mod.identity(lpath))
+            jobs2 = _normalize_recovery_jobs(mod.inspect(lpath))
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _die(f"recovery inspect failed: {exc}")
+        if id1 != id2 or jobs1 != jobs2:
+            _die("ledger mutated during single-writer read window; retry when idle", code=2)
+        safe_jobs = {}
+        for jid, jrow in sorted(jobs1.items()):
+            safe_jid = _validate_token("job", jid)
+            safe_jobs[safe_jid] = jrow
+        base_anchor = _ensure_independent_anchor_dir(anchor_abs, ops_base)
+        dot_dir = _ensure_private_dir(os.path.join(base_anchor, dot), label="recovery dot anchor dir")
+        anchor_doc = {
+            "schema": 1,
+            "dot": dot,
+            "store_uuid": id1,
+            "recovery_sha256": sha,
+            "verified_utc": _now_iso(),
+            "jobs": safe_jobs,
+        }
+        anchor_text = json.dumps(anchor_doc, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+        anchor_path = os.path.join(dot_dir, "anchor.json")
+        _write_private_atomic(anchor_path, anchor_text, dot_dir)
+        readback_bytes = _read_private_bytes(anchor_path, dot_dir, require_strict_mode=True)
+        expected_sha = hashlib.sha256(anchor_text.encode("utf-8")).hexdigest()
+        actual_sha = hashlib.sha256(readback_bytes).hexdigest()
+        if actual_sha != expected_sha:
+            _die("anchor readback hash mismatch")
+        job_files = []
+        for safe_jid, jrow in sorted(safe_jobs.items()):
+            jdoc = {
+                "schema": 1,
+                "dot": dot,
+                "store_uuid": id1,
+                "job": safe_jid,
+                "verified_utc": anchor_doc["verified_utc"],
+                **jrow,
+            }
+            jpath = os.path.join(dot_dir, f"job-{safe_jid}.json")
+            _write_private_atomic(jpath, json.dumps(jdoc, ensure_ascii=False, indent=1, sort_keys=True) + "\n", dot_dir)
+            job_files.append(jpath)
+        res = {
+            "ok": True,
+            "dot": dot,
+            "store_uuid": id1,
+            "anchor_path": anchor_path,
+            "anchor_sha256": actual_sha,
+            "job_count": len(safe_jobs),
+            "job_files": job_files,
+        }
+        if args.json:
+            print(json.dumps(_redact_tree(res), ensure_ascii=False, indent=1))
+        else:
+            print(
+                f"VM_ANCHOR_SYNCED dot={dot} store_uuid={_clean_oneline(_redact_text(id1))} jobs={len(safe_jobs)} "
+                f"anchor={anchor_path} sha256={actual_sha[:16]}",
+                flush=True,
+            )
+        return 0
+
+    # action == "restore-cmd"
+    job_id = _validate_token("job", args.job)
+    try:
+        store_uuid = _validate_store_uuid(mod.identity(lpath))
+        jobs = _normalize_recovery_jobs(mod.inspect(lpath))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _die(f"recovery inspect failed: {exc}")
+    if job_id not in jobs:
+        _die(f"job {job_id!r} not found in recovery ledger {ledger_abs}")
+    j = jobs[job_id]
+    rev_arg = _validate_recovery_scalar("rev", j.get("rev"))
+    att_arg = _validate_recovery_scalar("attempt", j.get("attempt"), allow_none=True) or "0"
+    raw_head = str(j.get("head") or "")
+    if any(c in raw_head for c in ("\n", "\r", "\x00")):
+        _die(f"unsafe head in recovery ledger for job {job_id!r}")
+    default_preview = re.sub(r"[^A-Za-z0-9_-]+", "-", f"{job_id}-preview")[:64].strip("-") or "preview"
+    explicit_preview = getattr(args, "preview_name", None)
+    raw_preview = explicit_preview if explicit_preview is not None else default_preview
+    if not isinstance(raw_preview, str) or not re.fullmatch(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\Z", raw_preview):
+        _die(f"--preview-name must match ^[A-Za-z0-9_][A-Za-z0-9_-]{{0,63}}$ (got {raw_preview!r})")
+    dest_name = raw_preview
+    cmds = [
+        f"sha256sum {shlex.quote(script_abs)}  # must equal {sha}",
+        f"python3 -B {shlex.quote(script_abs)} identity  # must equal {store_uuid}",
+        f"python3 -B {shlex.quote(script_abs)} status",
+        f"python3 -B {shlex.quote(script_abs)} anchor {shlex.quote(job_id)} {shlex.quote(rev_arg)} {shlex.quote(raw_head)}",
+        f"python3 -B {shlex.quote(script_abs)} preview {shlex.quote(job_id)} {shlex.quote(rev_arg)} {shlex.quote(att_arg)} {shlex.quote(dest_name)}",
+    ]
+    res = {
+        "v": 1,
+        "dot": dot,
+        "store_uuid": store_uuid,
+        "job": job_id,
+        "state": j,
+        "commands": cmds,
+    }
+    if args.json:
+        print(json.dumps(_redact_tree(res), ensure_ascii=False, indent=1))
+    else:
+        phase_s = _clean_oneline(_redact_text(j.get("phase"))) or "-"
+        next_s = _clean_oneline(_redact_text(j.get("next_stage"))) or "-"
+        print(f"VM_RESTORE_PLAN dot={dot} job={job_id} phase={phase_s} next_stage={next_s}", flush=True)
+        for c in cmds:
+            print(_clean_oneline(_redact_text(c)), flush=True)
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="dots_pilot.py",
@@ -2043,7 +2676,13 @@ def build_parser():
     pi.add_argument("--unit-label", dest="unit_label")
     pi.add_argument("--interval", type=int)
     pi.add_argument("--cooldown-min", dest="cooldown_min", type=int)
+    pi.add_argument("--idle-max-age-min", dest="idle_max_age_min", type=int)
+    pi.add_argument("--recovery-script", dest="recovery_script")
+    pi.add_argument("--recovery-sha256", dest="recovery_sha256")
+    pi.add_argument("--recovery-ledger", dest="recovery_ledger")
+    pi.add_argument("--recovery-anchor-dir", dest="recovery_anchor_dir")
     pi.add_argument("--require-astra-ack", dest="require_astra_ack", action="store_true")
+    pi.add_argument("--no-apply-tracks", dest="no_apply_tracks", action="store_true")
     pi.add_argument("--force", action="store_true")
 
     pa = sub.add_parser("apply-tracks", help="apply configured preset/tracks into ops_base via dots.py loop init")
@@ -2086,6 +2725,36 @@ def build_parser():
     prs.add_argument("--target", required=True, choices=("launchd", "systemd"))
     prs.add_argument("--interval", type=int)
 
+    pwg = sub.add_parser("wgpt-instructions", help="render, check, or safely apply standing mcp.instructions in wgpt-daemon config.json")
+    pwg_sub = pwg.add_subparsers(dest="wgpt_cmd", required=True)
+    for wact in ("render", "check", "apply"):
+        wsp = pwg_sub.add_parser(wact, help=f"{wact} Web GPT Agent mcp.instructions")
+        wsp.add_argument("--dot")
+        wsp.add_argument("--project")
+        wsp.add_argument("--ops-base", dest="ops_base")
+        wsp.add_argument("--role", default="worker")
+        wsp.add_argument("--dots-py", dest="dots_py")
+        if wact in ("check", "apply"):
+            wsp.add_argument("--config", required=True, help="path to wgpt-daemon data/config.json")
+        if wact == "apply":
+            wsp.add_argument("--dry-run", action="store_true")
+        wsp.add_argument("--json", action="store_true")
+
+    pvm = sub.add_parser("vm-backup", help="inspect pinned recovery ledger, sync external backup anchor, and print safe restore steps")
+    pvm_sub = pvm.add_subparsers(dest="vm_cmd", required=True)
+    for vact in ("status", "sync-anchor", "restore-cmd"):
+        vsp = pvm_sub.add_parser(vact, help=f"{vact} for VM watchdog recovery ledger & external anchor")
+        vsp.add_argument("--dot")
+        vsp.add_argument("--ops-base", dest="ops_base")
+        vsp.add_argument("--recovery-script", dest="recovery_script")
+        vsp.add_argument("--recovery-sha256", dest="recovery_sha256")
+        vsp.add_argument("--ledger-dir", dest="ledger_dir")
+        vsp.add_argument("--anchor-dir", dest="anchor_dir")
+        if vact == "restore-cmd":
+            vsp.add_argument("--job", required=True)
+            vsp.add_argument("--preview-name", dest="preview_name")
+        vsp.add_argument("--json", action="store_true")
+
     return p
 
 
@@ -2102,6 +2771,8 @@ def main(argv=None):
         "brief": cmd_brief,
         "doctor": cmd_doctor,
         "render-service": cmd_render_service,
+        "wgpt-instructions": cmd_wgpt_instructions,
+        "vm-backup": cmd_vm_backup,
     }
     return dispatch[args.cmd](args)
 

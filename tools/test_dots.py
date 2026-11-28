@@ -3680,6 +3680,210 @@ class LoopTests(Base):
         self.assertEqual(run(["loop", "pause", "DOT-G", "gate-t", "--contract", alt_p, "--contract-sha256", alt_sha], self.base).returncode, 0)
         self.assertEqual(run(["loop", "resume", "DOT-G", "gate-t", "--contract", alt_p, "--contract-sha256", alt_sha], self.base).returncode, 0)
 
+    def test_v140_retired_roster_vm_aliases_anchor_watchdog_keep_full_and_wgpt_prompt(self):
+        # 1) _is_vm_host detects VM aliases without matching 'jvm' or non-VM hosts
+        for h in ("vm", "VM", "Dots VM (local record)", "managed-vm"):
+            self.assertTrue(d._is_vm_host(h), h)
+        for h in ("jvm", "mini", "linux-box", "vm2", None, ""):
+            self.assertFalse(d._is_vm_host(h), repr(h))
+
+        # 2) Retired roster suppression with anti-forgery guards + board --active
+        self.make_dot("DOT-R")
+        self.make_project("rproj", "rproj-main")
+        roster_r = os.path.join(self.base, "live", "DOT-R", "roster.json")
+        d.write_atomic(roster_r, json.dumps({
+            "coordinator": "lead-r",
+            "updated_at": d.iso_after(-60 * 60),
+            "slots": [
+                {"agent": "ret-stale", "state": "closed_obsolete"},
+                {"agent": "ret-forged", "state": "closed_obsolete"},
+                {"agent": "ret-forged-old-but-newer-roster", "state": "closed_obsolete"},
+                {"agent": "ret-mailed", "state": "historical_unconfirmed"},
+                {"agent": "ret-done-old", "state": "closed_merged_1"},
+                {"agent": "done-old-mailed", "state": "done"},
+                {"agent": "act-done", "state": "done"},
+            ],
+        }) + "\n")
+        for ag, st_val, age_m in (
+            ("ret-stale", "blocked", 120),
+            ("ret-forged", "start", 5),
+            ("ret-forged-old-but-newer-roster", "start", 45),
+            ("ret-mailed", "start", 120),
+            ("ret-done-old", "done", 2000),
+            ("done-old-mailed", "done", 2000),
+            ("act-done", "done", 15),
+        ):
+            d.append_line(os.path.join(self.base, "live", "DOT-R", f"{ag}.jsonl"), {
+                "t": d.iso_after(-age_m * 60),
+                "agent": ag, "role": "worker", "model": "m", "project": "rproj",
+                "task": f"t-{ag}", "state": st_val, "host": "local", "note": "n", "evidence": "ok",
+            })
+        # Mail waiting for ret-mailed & done-old-mailed keeps them actionable
+        run(["send", "rproj", "ret-mailed", "task", "T-MAIL"], self.base, stdin="Still needs answer\n")
+        run(["send", "rproj", "done-old-mailed", "task", "T-MAIL-DONE"], self.base, stdin="Needs answer on done agent\n")
+
+        b_all = json.loads(run(["board", "DOT-R", "--json"], self.base).stdout)
+        by_ag = {r["agent"]: r for r in b_all["agents"]}
+        self.assertIn("RETIRED", by_ag["ret-stale"]["flags"])
+        self.assertNotIn("BLOCKED", by_ag["ret-stale"]["flags"])
+        self.assertNotIn("RETIRED", by_ag["ret-forged"]["flags"])
+        self.assertNotIn("RETIRED", by_ag["ret-forged-old-but-newer-roster"]["flags"])
+        self.assertIn("STALLED", by_ag["ret-forged-old-but-newer-roster"]["flags"])
+        self.assertIn("MAIL_WAITING", by_ag["ret-mailed"]["flags"])
+        self.assertNotIn("RETIRED", by_ag["ret-mailed"]["flags"])
+
+        b_act = json.loads(run(["board", "DOT-R", "--active", "--json"], self.base).stdout)
+        act_names = {r["agent"] for r in b_act["agents"]}
+        self.assertNotIn("ret-stale", act_names)
+        self.assertNotIn("ret-done-old", act_names)
+        self.assertIn("done-old-mailed", act_names)
+        self.assertIn("ret-forged", act_names)
+        self.assertIn("ret-forged-old-but-newer-roster", act_names)
+        self.assertIn("act-done", act_names)
+
+        idle_log = os.path.join(self.base, "idle_r.log")
+        idle_cmd = [sys.executable, "-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text((p.read_text() if p.exists() else '') + sys.argv[2] + '\\n')", idle_log, "{agent}:{why}"]
+        w_ret = run(["watch", "--dot", "DOT-R", "--idle-cmd", json.dumps(idle_cmd), "--rewake-min", "0"], self.base)
+        self.assertEqual(w_ret.returncode, 0, w_ret.stderr)
+        ringed = read(idle_log)
+        self.assertNotIn("ret-stale", ringed)
+        self.assertIn("ret-mailed:", ringed)
+
+        # 3) --anchor-dir external backup watchdog: missing -> drift -> synced clear -> symlink refusal
+        with tempfile.TemporaryDirectory() as outer:
+            rec_dir = os.path.join(outer, "rec")
+            os.makedirs(rec_dir, mode=0o700, exist_ok=True)
+            rec_script = os.path.join(rec_dir, "rec.py")
+            rec_body = "import json\ndef inspect(root):\n    return json.loads((root / 'jobs.json').read_text())\n"
+            pathlib.Path(rec_script).write_text(rec_body, encoding="utf-8")
+            rec_sha = hashlib.sha256(rec_body.encode("utf-8")).hexdigest()
+            jobs_p = os.path.join(rec_dir, "jobs.json")
+            pathlib.Path(jobs_p).write_text(json.dumps({"vm-job-1": {"phase": "ACTIVE", "rev": 3, "head": "sha333"}}), encoding="utf-8")
+            anchor_dir = os.path.join(outer, "anchors")
+            os.makedirs(os.path.join(anchor_dir, "DOT-R"), mode=0o700, exist_ok=True)
+
+            base_rec_flags = [
+                "watch", "--dot", "DOT-R",
+                "--recovery-script", rec_script, "--recovery-sha256", rec_sha,
+                "--ledger", f"DOT-R={rec_dir}", "--anchor-dir", f"DOT-R={anchor_dir}",
+            ]
+            w_miss = run(base_rec_flags, self.base)
+            self.assertEqual(w_miss.returncode, 0, w_miss.stderr)
+            self.assertIn("WATCH_VM_ANCHOR_MISSING DOT-R vm-job-1 rev=3 head=sha333", w_miss.stdout)
+            # Deduplicated on repeat
+            self.assertNotIn("WATCH_VM_ANCHOR_MISSING", run(base_rec_flags, self.base).stdout)
+
+            # Write drifted rev anchor
+            anchor_file = os.path.join(anchor_dir, "DOT-R", "anchor.json")
+            pathlib.Path(anchor_file).write_text(json.dumps({"schema": 1, "jobs": {"vm-job-1": {"phase": "ACTIVE", "rev": 2, "head": "sha222"}}}), encoding="utf-8")
+            w_drift = run(base_rec_flags, self.base)
+            self.assertIn("WATCH_VM_ANCHOR_DRIFT DOT-R vm-job-1 ledger_rev=3 anchor_rev=2", w_drift.stdout)
+
+            # Sync matching anchor -> clears WATCH_VM_ANCHOR_* and prunes st["vm"] key
+            pathlib.Path(anchor_file).write_text(json.dumps({"schema": 1, "jobs": {"vm-job-1": {"phase": "ACTIVE", "rev": 3, "head": "sha333"}}}), encoding="utf-8")
+            w_sync = run(base_rec_flags, self.base)
+            self.assertNotIn("WATCH_VM_ANCHOR_", w_sync.stdout)
+            st_vm = d.load_json(os.path.join(self.base, "watch", "state.json"))["vm"]
+            self.assertNotIn("anchor:DOT-R/vm-job-1", st_vm)
+
+            # WATCH_VM_UNREGISTERED triggers for 'Dots VM (...)' host alias when ledger has no active job
+            d.append_line(os.path.join(self.base, "live", "DOT-R", "vm-alias-worker.jsonl"), {
+                "t": d.iso_after(-60), "agent": "vm-alias-worker", "role": "worker", "model": "m",
+                "project": "rproj", "task": "vm-tk", "state": "start", "host": "Dots VM (alias test)",
+                "note": "n", "evidence": "ok",
+            })
+            pathlib.Path(jobs_p).write_text(json.dumps({}), encoding="utf-8")
+            w_alias = run(base_rec_flags, self.base)
+            self.assertIn("WATCH_VM_UNREGISTERED DOT-R vm-alias-worker", w_alias.stdout)
+            # Also support recovery.py inspect() returning "revision" key (watchdog-v1 schema)
+            pathlib.Path(jobs_p).write_text(json.dumps({"vm-job-rev": {"phase": "ACTIVE", "revision": 5, "head": "sha555"}}), encoding="utf-8")
+            w_rev_alias = run(base_rec_flags, self.base)
+            self.assertIn("WATCH_VM_ANCHOR_MISSING DOT-R vm-job-rev rev=5 head=sha555", w_rev_alias.stdout)
+            pathlib.Path(jobs_p).write_text(json.dumps({"vm-job-1": {"phase": "ACTIVE", "rev": 3, "head": "sha333"}}), encoding="utf-8")
+
+            # Symlinked anchor_dir and symlinked/hardlinked JSON files inside anchor_dir are rejected
+            sym_anc = os.path.join(outer, "sym_anc")
+            os.symlink(anchor_dir, sym_anc)
+            w_sym_anc = run([
+                "watch", "--dot", "DOT-R",
+                "--recovery-script", rec_script, "--recovery-sha256", rec_sha,
+                "--ledger", f"DOT-R={rec_dir}", "--anchor-dir", f"DOT-R={sym_anc}",
+            ], self.base)
+            self.assertIn("WATCH_ERROR recovery DOT-R anchor_dir symlink rejected", w_sym_anc.stdout)
+
+            # Hardlink / symlink JSON inside anchor_dir must be ignored so anchor stays MISSING
+            target_outside = os.path.join(outer, "outside.json")
+            pathlib.Path(target_outside).write_text(json.dumps({"schema": 1, "jobs": {"vm-job-2": {"phase": "ACTIVE", "rev": 1, "head": "h1"}}}), encoding="utf-8")
+            hl_anchor = os.path.join(anchor_dir, "DOT-R", "hl.json")
+            os.link(target_outside, hl_anchor)
+            pathlib.Path(jobs_p).write_text(json.dumps({"vm-job-2": {"phase": "ACTIVE", "rev": 1, "head": "h1"}}), encoding="utf-8")
+            w_hl = run(base_rec_flags, self.base)
+            self.assertIn("WATCH_VM_ANCHOR_MISSING DOT-R vm-job-2", w_hl.stdout)
+            os.unlink(hl_anchor)
+
+        # 4) Fresh roster keep-full surfaces unlisted recently-done live workers in empty_lanes (capped at total)
+        self.make_dot("DOT-K")
+        d.write_atomic(os.path.join(self.base, "live", "DOT-K", "roster.json"), json.dumps({
+            "coordinator": "coord-k",
+            "updated_at": d.iso_after(-5 * 60),
+            "slots_total": 2,
+            "slots_unassigned": 0,
+            "actors": [{"agent": "coord-k", "role": "coordinator", "occupies_slot": True, "slot_state": "working"}],
+        }) + "\n")
+        for u in ("unlisted-1", "unlisted-2", "unlisted-3"):
+            d.append_line(os.path.join(self.base, "live", "DOT-K", f"{u}.jsonl"), {
+                "t": d.iso_after(-20 * 60), "agent": u, "role": "worker", "model": "m",
+                "project": "rproj", "task": "tk", "state": "done", "host": "local", "note": "n", "evidence": "ok",
+            })
+        d.append_line(os.path.join(self.base, "live", "DOT-K", "too-young.jsonl"), {
+            "t": d.iso_after(-2 * 60), "agent": "too-young", "role": "worker", "model": "m",
+            "project": "rproj", "task": "tk", "state": "done", "host": "local", "note": "n", "evidence": "ok",
+        })
+        kf_flags = ["watch", "--dot", "DOT-K", "--keep-full", "DOT-K", "--fill-after-min", "10", "--fill-cmd", '["true"]']
+        w_grace = run(kf_flags, self.base)
+        self.assertIn("WATCH_SKIP DOT-K reason=fill_grace", w_grace.stdout)
+        st_k_path = os.path.join(self.base, "watch", "state.json")
+        st_k = d.load_json(st_k_path)
+        st_k["capacity"]["DOT-K"]["since"] = d.iso_after(-20 * 60)
+        d.write_atomic(st_k_path, json.dumps(st_k) + "\n")
+        w_kf = run(kf_flags, self.base)
+        self.assertEqual(w_kf.returncode, 0, w_kf.stderr)
+        self.assertIn("WATCH_UNDERFILLED DOT-K free=2 total=2", w_kf.stdout)
+        self.assertIn("empty_lanes=unlisted-1,unlisted-2,unlisted-3", w_kf.stdout)
+        self.assertNotIn("too-young", w_kf.stdout)
+
+        # 5) watch --dot filters cross-dot owed mail AND preserves cross-dot WATCH_RESOLVED records in shared state.json
+        self.make_dot("DOT-OTHER")
+        d.append_line(os.path.join(self.base, "live", "DOT-OTHER", "other-ag.jsonl"), {
+            "t": d.iso_after(-120 * 60), "agent": "other-ag", "role": "worker", "model": "m",
+            "project": "rproj", "task": "other-tk", "state": "done", "host": "local", "note": "n", "evidence": "ok",
+        })
+        other_mid = run(["send", "rproj", "other-ag", "task", "T-OTHER"], self.base, stdin="Other dot mail\n").stdout.split()[0]
+        # Seed shared watch/state.json with other-ag mail (with and without explicit "dot") BEFORE scoped watch --dot DOT-R
+        w_other_first = run(["watch", "--dot", "DOT-OTHER", "--wake-cmd", '["true"]', "--after-min", "0"], self.base)
+        self.assertIn(f"WATCH_WAKE rproj other-ag {other_mid}", w_other_first.stdout)
+        w_st_p = os.path.join(self.base, "watch", "state.json")
+        w_st_doc = d.load_json(w_st_p)
+        legacy_mid = "m-20260101T000000Z-leg1"
+        w_st_doc["messages"][legacy_mid] = {"project": "rproj", "agent": "other-ag", "seen_t": d.iso_after(-120)}
+        d.write_atomic(w_st_p, json.dumps(w_st_doc, indent=1) + "\n")
+
+        w_scoped = run(["watch", "--dot", "DOT-R", "--wake-cmd", '["true"]', "--after-min", "0"], self.base)
+        self.assertEqual(w_scoped.returncode, 0, w_scoped.stderr)
+        self.assertNotIn("other-ag", w_scoped.stdout)
+        w_st_after = d.load_json(w_st_p)
+        self.assertIn(other_mid, w_st_after["messages"])
+        self.assertIn(legacy_mid, w_st_after["messages"])
+
+        # 6) prompt --wgpt-connector stays strictly < 4000 chars and includes Astra v2 / Mode 1 autonomy
+        pr_res = run(["prompt", "--wgpt-connector", "--json"], self.base)
+        self.assertEqual(pr_res.returncode, 0, pr_res.stderr)
+        pr_doc = json.loads(pr_res.stdout)
+        self.assertLessEqual(pr_doc["chars"], 3800)
+        self.assertLess(pr_doc["chars"], 4000)
+        self.assertIn("0159023e", pr_doc["text"])
+        self.assertIn("separate GO", pr_doc["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

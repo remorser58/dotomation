@@ -3883,8 +3883,8 @@ class TestMode2AutonomyAndWatchdogV12(HubTestBase):
 
 class TestAstraSubagentHarnessV13(HubTestBase):
     def test_cross_tool_astra_parity_and_cli_prompt_and_provision_brief_redaction(self):
-        self.assertEqual(d.VERSION, "1.3.1")
-        self.assertEqual(sd.VERSION, "1.3.1")
+        self.assertEqual(d.VERSION, "1.4.0")
+        self.assertEqual(sd.VERSION, "1.4.0")
         self.assertEqual(sd.ASTRA_PROFILE_VERSION, "astra-v2")
         self.assertEqual(sd.ASTRA_SOURCE_PIN, "0159023e")
 
@@ -3913,6 +3913,7 @@ class TestAstraSubagentHarnessV13(HubTestBase):
         )
         self.assertEqual(br_redacted.returncode, 0, br_redacted.stderr)
         self.assertIn("--- [MODE_2_AGENT_BRIEF] ---", br_redacted.stdout)
+        self.assertIn("Dotomation Mode 2: sub-dots v1.4", br_redacted.stdout)
         self.assertIn("[ASTRA_HARNESS_PROFILE", br_redacted.stdout)
         self.assertIn("[REDACTED]", br_redacted.stdout)
 
@@ -4159,6 +4160,14 @@ class TestAstraSubagentHarnessV13(HubTestBase):
         doc_json = json.loads(doc_sh.stdout)
         self.assertEqual(doc_json["astra_profile_version"], "astra-v2")
         self.assertIn("reviewer", doc_json["astra_profile_shas"])
+
+        zero_arg_static = subprocess.run(
+            ["sh", hook_sh],
+            capture_output=True, text=True, check=False,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": self._tmp.name, "SUBDOTS_STATE_DIR": missing_dir},
+        )
+        self.assertEqual(zero_arg_static.returncode, 0, zero_arg_static.stderr)
+        self.assertEqual(json.loads(zero_arg_static.stdout)["astra_profile_version"], "astra-v2")
 
         start_sh = subprocess.run(
             [hook_sh, "subagent-start", "--role", "reviewer", "--mode", "dots-only", "--state-dir", missing_dir],
@@ -5007,6 +5016,167 @@ class TestAstraSubagentHarnessV13(HubTestBase):
         )
         self.assertNotEqual(cli_secret.returncode, 0)
         self.assertNotIn("sk-clierrorsecret123456", cli_secret.stderr)
+
+    def test_v140_install_host_hooks_antigravity_subagent_and_claude(self):
+        with tempfile.TemporaryDirectory() as outer:
+            ops_base = os.path.join(outer, "ops")
+            os.makedirs(ops_base, mode=0o700, exist_ok=True)
+            sub_plugin = os.path.join(outer, "subagent-plugin")
+
+            # 1) --dry-run creates nothing
+            r_dry = cli_run(
+                [
+                    "install-host-hooks", "--target", "antigravity-subagent", "--dest", sub_plugin,
+                    "--mode", "dots-only", "--dot", "DOT-H", "--ops-base", ops_base, "--role", "reviewer",
+                    "--dry-run", "--json", "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            )
+            self.assertEqual(r_dry.returncode, 0, r_dry.stderr)
+            self.assertTrue(json.loads(r_dry.stdout)["dry_run"])
+            self.assertFalse(os.path.exists(sub_plugin))
+
+            # 2) Install subagent plugin hooks and execute generated run-hook.sh live
+            r_sub = cli_run(
+                [
+                    "install-host-hooks", "--target", "antigravity-subagent", "--dest", sub_plugin,
+                    "--mode", "dots-only", "--dot", "DOT-H", "--ops-base", ops_base, "--role", "reviewer",
+                    "--json", "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            )
+            self.assertEqual(r_sub.returncode, 0, r_sub.stderr)
+            sub_out = json.loads(r_sub.stdout)
+            self.assertTrue(sub_out["ok"])
+            runner_sh = os.path.join(sub_plugin, "hooks", "run-hook.sh")
+            self.assertEqual(stat.S_IMODE(os.lstat(runner_sh).st_mode), 0o755)
+            hjson = json.loads(pathlib.Path(os.path.join(sub_plugin, "hooks.json")).read_text(encoding="utf-8"))
+            self.assertEqual(hjson["subdots-subagent-session"]["SessionStart"][0]["command"], "./hooks/run-hook.sh subagent-start")
+
+            hook_exec = subprocess.run(
+                [runner_sh, "subagent-start"],
+                input=json.dumps({"conversationId": "conv-h1"}),
+                capture_output=True, text=True, check=False, timeout=15.0,
+            )
+            self.assertEqual(hook_exec.returncode, 0, hook_exec.stderr)
+            inj = json.loads(hook_exec.stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+            self.assertIn('role="reviewer"', inj)
+            self.assertIn('mode="dots-only"', inj)
+            self.assertIn('read_only="true"', inj)
+
+            # 0-arg execution under POSIX sh must default cleanly to doctor without aborting on shift
+            hook_zero = subprocess.run(
+                ["sh", runner_sh],
+                capture_output=True, text=True, check=False, timeout=15.0,
+            )
+            self.assertEqual(hook_zero.returncode, 0, hook_zero.stderr)
+            self.assertEqual(json.loads(hook_zero.stdout)["astra_profile_version"], "astra-v2")
+
+            # 2b) Spaces & shell metacharacters in --state-dir / --ops-base must NOT break or execute in run-hook.sh
+            pwn_marker = os.path.join(outer, "pwned_marker")
+            sp_plugin = os.path.join(outer, "subagent space plugin")
+            sp_ops = os.path.join(outer, f"ops with spaces $(touch {pwn_marker})")
+            sp_state = os.path.join(outer, "state dir $(id)")
+            os.makedirs(sp_ops, mode=0o700, exist_ok=True)
+            os.makedirs(sp_state, mode=0o700, exist_ok=True)
+            r_sp = cli_run(
+                [
+                    "install-host-hooks", "--target", "antigravity-subagent", "--dest", sp_plugin,
+                    "--mode", "dots-only", "--dot", "DOT-H", "--ops-base", sp_ops, "--role", "worker",
+                    "--json", "--state-dir", sp_state,
+                ],
+                sp_state,
+            )
+            self.assertEqual(r_sp.returncode, 0, r_sp.stderr)
+            sp_runner = os.path.join(sp_plugin, "hooks", "run-hook.sh")
+            env_clean = {k: v for k, v in os.environ.items() if k not in ("SUBDOTS_STATE_DIR", "DOTS_OPS_BASE", "DOTS_MODE", "DOTS_DOT", "SUBDOTS_ASTRA_ROLE")}
+            sp_exec = subprocess.run(
+                [sp_runner, "subagent-start"],
+                input=json.dumps({"conversationId": "conv-sp1"}),
+                env=env_clean,
+                capture_output=True, text=True, check=False, timeout=15.0,
+            )
+            self.assertEqual(sp_exec.returncode, 0, sp_exec.stderr)
+            self.assertFalse(os.path.exists(pwn_marker))
+            sp_inj = json.loads(sp_exec.stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+            self.assertIn('role="worker"', sp_inj)
+            self.assertIn('mode="dots-only"', sp_inj)
+
+            # 2c) Existing hooks.json without dotomation marker refused unless --force (even in --dry-run)
+            foreign_dir = os.path.join(outer, "foreign-plugin")
+            os.makedirs(foreign_dir, mode=0o755, exist_ok=True)
+            pathlib.Path(os.path.join(foreign_dir, "hooks.json")).write_text('{"other": []}\n', encoding="utf-8")
+            self.assertNotEqual(
+                cli_run(["install-host-hooks", "--target", "antigravity", "--dest", foreign_dir, "--dry-run", "--state-dir", self.state_dir], self.state_dir).returncode,
+                0,
+            )
+            self.assertEqual(
+                cli_run(["install-host-hooks", "--target", "antigravity", "--dest", foreign_dir, "--force", "--state-dir", self.state_dir], self.state_dir).returncode,
+                0,
+            )
+
+            # Symlink parent & unsticky world-writable ancestor protection
+            sym_parent = os.path.join(outer, "sym_parent")
+            os.symlink(outer, sym_parent)
+            bad_dest = cli_run(
+                [
+                    "install-host-hooks", "--target", "antigravity",
+                    "--dest", os.path.join(sym_parent, "nested", "plug"), "--state-dir", self.state_dir,
+                ],
+                self.state_dir,
+            )
+            self.assertNotEqual(bad_dest.returncode, 0)
+            unsticky = os.path.join(outer, "world_unsticky")
+            os.makedirs(unsticky, mode=0o777, exist_ok=True)
+            os.chmod(unsticky, 0o777)
+            self.assertNotEqual(
+                cli_run(["install-host-hooks", "--target", "antigravity", "--dest", os.path.join(unsticky, "plug"), "--state-dir", self.state_dir], self.state_dir).returncode,
+                0,
+            )
+
+            # 3) Claude settings.json merge preserves unrelated keys, rejects non-dict hooks cleanly, accepts null hooks, writes 0600 .bak
+            bad_claude = os.path.join(outer, "bad_claude.json")
+            pathlib.Path(bad_claude).write_text(json.dumps({"hooks": 123}), encoding="utf-8")
+            r_bad_cl = cli_run(
+                ["install-host-hooks", "--target", "claude", "--dest", bad_claude, "--state-dir", self.state_dir],
+                self.state_dir,
+            )
+            self.assertEqual(r_bad_cl.returncode, 2)
+            self.assertNotIn("Traceback", r_bad_cl.stderr)
+
+            null_claude = os.path.join(outer, "null_claude.json")
+            pathlib.Path(null_claude).write_text(json.dumps({"hooks": None}), encoding="utf-8")
+            r_null_cl = cli_run(
+                ["install-host-hooks", "--target", "claude", "--dest", null_claude, "--json", "--state-dir", self.state_dir],
+                self.state_dir,
+            )
+            self.assertEqual(r_null_cl.returncode, 0, r_null_cl.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(json.loads(r_null_cl.stdout)["backup"]).st_mode), 0o600)
+
+            claude_cfg = os.path.join(outer, "claude_settings.json")
+            pathlib.Path(claude_cfg).write_text(json.dumps({
+                "theme": "dark",
+                "hooks": {
+                    "Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/other-stop-hook"}]}],
+                },
+            }), encoding="utf-8")
+            r_cl1 = cli_run(
+                ["install-host-hooks", "--target", "claude", "--dest", claude_cfg, "--mode", "sub-dots", "--json", "--state-dir", self.state_dir],
+                self.state_dir,
+            )
+            self.assertEqual(r_cl1.returncode, 0, r_cl1.stderr)
+            self.assertEqual(stat.S_IMODE(os.lstat(json.loads(r_cl1.stdout)["backup"]).st_mode), 0o600)
+            r_cl2 = cli_run(
+                ["install-host-hooks", "--target", "claude", "--dest", claude_cfg, "--mode", "sub-dots", "--json", "--state-dir", self.state_dir],
+                self.state_dir,
+            )
+            self.assertEqual(r_cl2.returncode, 0, r_cl2.stderr)
+            merged = json.loads(pathlib.Path(claude_cfg).read_text(encoding="utf-8"))
+            self.assertEqual(merged["theme"], "dark")
+            stop_hooks = merged["hooks"]["Stop"]
+            self.assertEqual(len(stop_hooks), 2)
+            self.assertEqual(stop_hooks[0]["hooks"][0]["command"], "/usr/bin/other-stop-hook")
+            self.assertIn("subdots.py hook stop", stop_hooks[1]["hooks"][0]["command"])
 
 
 if __name__ == "__main__":

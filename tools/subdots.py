@@ -75,7 +75,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 PROTOCOL_VERSION = 1
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -11315,7 +11315,7 @@ def cmd_local_provision(a: argparse.Namespace) -> int:
                     [
                         "",
                         "--- [MODE_2_AGENT_BRIEF] ---",
-                        f"Dotomation Mode 2: sub-dots v1.3 (Enforced Reverse Bridge + Astra v2 Harness)",
+                        f"Dotomation Mode 2: sub-dots v{'.'.join(VERSION.split('.')[:2])} (Enforced Reverse Bridge + Astra v2 Harness)",
                         f"Agent ID: {a.agent}",
                         f"Dot / Project / Role: {a.dot} / {a.project} / {astra_prof['role']} ({astra_prof['effort']}, read_only={astra_ro})",
                         f"Profile SHA: {astra_prof['sha256']}",
@@ -11731,6 +11731,345 @@ def cmd_install_git_hooks(a: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "hooks_dir": hooks_dir, "installed": installed}, ensure_ascii=False))
     else:
         print(f"GIT_HOOKS_INSTALLED dir={hooks_dir} hooks={','.join(installed)}")
+    return 0
+
+
+def _atomic_write_host_file(path: str, content: str, mode: int, backup: bool = False) -> Optional[str]:
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(abs_path)
+    base_name = os.path.basename(abs_path)
+    if os.path.islink(parent):
+        raise OSError(f"refusing symlinked parent directory {parent!r}")
+    if os.path.islink(abs_path):
+        raise OSError(f"refusing symlinked target file {abs_path!r}")
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    o_nb = getattr(os, "O_NONBLOCK", 0)
+    dir_fd = os.open(parent, os.O_RDONLY | o_dir | nofollow | o_nb)
+    bak_path = None
+    try:
+        st_p = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st_p.st_mode):
+            raise OSError(f"{parent} is not a directory")
+        if hasattr(os, "geteuid") and st_p.st_uid != os.geteuid():
+            raise OSError(f"{parent} owner mismatch")
+        existing_bytes: Optional[bytes] = None
+        try:
+            st_cur = os.lstat(base_name, dir_fd=dir_fd)
+            if stat.S_ISLNK(st_cur.st_mode) or not stat.S_ISREG(st_cur.st_mode) or st_cur.st_nlink != 1:
+                raise OSError(f"{abs_path} must be a regular unlinked file")
+            if hasattr(os, "geteuid") and st_cur.st_uid != os.geteuid():
+                raise OSError(f"{abs_path} owner mismatch")
+            if backup:
+                rfd = os.open(base_name, os.O_RDONLY | nofollow | o_nb, dir_fd=dir_fd)
+                opened_r = False
+                try:
+                    with os.fdopen(rfd, "rb") as rfh:
+                        opened_r = True
+                        existing_bytes = rfh.read(MAX_HTTP_BODY_BYTES + 1)
+                    if len(existing_bytes) > MAX_HTTP_BODY_BYTES:
+                        raise OSError(f"{abs_path} exceeds max bytes")
+                finally:
+                    if not opened_r:
+                        with contextlib.suppress(OSError):
+                            os.close(rfd)
+        except FileNotFoundError:
+            pass
+        if backup and existing_bytes is not None:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            bak_name = f"{base_name}.bak-dotomation-{ts}"
+            if os.path.lexists(os.path.join(parent, bak_name)):
+                bak_name = f"{bak_name}-{secrets.token_hex(3)}"
+            bfd = os.open(bak_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | o_nb, mode, dir_fd=dir_fd)
+            opened_b = False
+            try:
+                with os.fdopen(bfd, "wb") as bfh:
+                    opened_b = True
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(bfh.fileno(), mode)
+                    bfh.write(existing_bytes)
+                    bfh.flush()
+                    os.fsync(bfh.fileno())
+            except BaseException:
+                if not opened_b:
+                    with contextlib.suppress(OSError):
+                        os.close(bfd)
+                raise
+            bak_path = os.path.join(parent, bak_name)
+
+        tmp_name = f".{base_name}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+        tfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | o_nb, mode, dir_fd=dir_fd)
+        opened_t = False
+        try:
+            with os.fdopen(tfd, "w", encoding="utf-8") as tfh:
+                opened_t = True
+                if hasattr(os, "fchmod"):
+                    os.fchmod(tfh.fileno(), mode)
+                tfh.write(content)
+                tfh.flush()
+                os.fsync(tfh.fileno())
+            try:
+                st_cur = os.lstat(base_name, dir_fd=dir_fd)
+                if stat.S_ISLNK(st_cur.st_mode) or not stat.S_ISREG(st_cur.st_mode) or st_cur.st_nlink != 1:
+                    raise OSError(f"{abs_path} must be a regular unlinked file")
+                if hasattr(os, "geteuid") and st_cur.st_uid != os.geteuid():
+                    raise OSError(f"{abs_path} owner mismatch")
+            except FileNotFoundError:
+                pass
+            os.replace(tmp_name, base_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            if not opened_t:
+                with contextlib.suppress(OSError):
+                    os.close(tfd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dir_fd)
+    return bak_path
+
+
+def _sh_default_export(name: str, value: str) -> str:
+    return f'if [ -z "${{{name}:-}}" ]; then {name}={shlex.quote(value)}; fi; export {name}'
+
+
+def _check_clean_dest_tree(root_path: str, is_file_target: bool = False) -> str:
+    if any(ch in root_path for ch in ("\n", "\r", "\x00")):
+        raise ValueError("destination path must not contain newlines or NUL bytes")
+    abs_root = os.path.abspath(os.path.expanduser(root_path))
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    cur = abs_root
+    while True:
+        try:
+            st = os.lstat(cur)
+            if stat.S_ISLNK(st.st_mode):
+                is_os_root_ancestor = cur != abs_root and euid is not None and st.st_uid == 0 and st.st_uid != euid
+                if not is_os_root_ancestor:
+                    raise ValueError(f"refusing symlink path component {cur!r}")
+                st_chk = os.stat(cur)
+            else:
+                st_chk = st
+            if cur == abs_root and is_file_target:
+                if not stat.S_ISREG(st_chk.st_mode) or st_chk.st_nlink != 1:
+                    raise ValueError(f"target file must be a regular unlinked file: {cur!r}")
+                if euid is not None and st_chk.st_uid != euid:
+                    raise ValueError(f"target file owner mismatch: {cur!r}")
+            else:
+                if not stat.S_ISDIR(st_chk.st_mode):
+                    raise ValueError(f"ancestor must be a directory: {cur!r}")
+                if euid is not None and st_chk.st_uid not in (0, euid):
+                    raise ValueError(f"untrusted directory owner for {cur!r}")
+                if (st_chk.st_mode & 0o002) and not (st_chk.st_mode & stat.S_ISVTX):
+                    raise ValueError(f"refusing unsticky world-writable directory {cur!r}")
+        except FileNotFoundError:
+            pass
+        nxt = os.path.dirname(cur)
+        if not nxt or nxt == cur:
+            break
+        cur = nxt
+    resolved = os.path.realpath(abs_root)
+    if os.path.islink(resolved):
+        raise ValueError(f"refusing symlink path component {resolved!r}")
+    return resolved
+
+
+def cmd_install_host_hooks(a: argparse.Namespace) -> int:
+    state_dir = resolve_state_dir(a.state_dir)
+    target = a.target
+    subdots_abs = os.path.abspath(__file__)
+    py_abs = sys.executable
+    for label, v in (("subdots_py", subdots_abs), ("python", py_abs), ("state_dir", state_dir)):
+        if any(ch in v for ch in ("\n", "\r", "\x00")):
+            raise ValueError(f"invalid {label} path")
+
+    mode_val = getattr(a, "mode", None)
+    dot_val = validate_token("dot", a.dot) if getattr(a, "dot", None) else None
+    ops_raw = getattr(a, "ops_base", None)
+    ops_val = _check_clean_dest_tree(ops_raw) if ops_raw else None
+    role_raw = getattr(a, "role", None)
+    role_val = normalize_astra_role(role_raw) if role_raw else None
+    dry_run = bool(getattr(a, "dry_run", False))
+    force = bool(getattr(a, "force", False))
+
+    if target == "claude":
+        dest = _check_clean_dest_tree(
+            a.dest or os.path.expanduser("~/.claude/settings.json"),
+            is_file_target=True,
+        )
+        doc: Dict[str, Any] = {}
+        if os.path.exists(dest):
+            raw_cur = read_regular_text(dest, max_bytes=MAX_HTTP_BODY_BYTES)
+            if raw_cur and raw_cur.strip():
+                try:
+                    loaded = json.loads(raw_cur)
+                except (ValueError, RecursionError) as exc:
+                    raise ValueError(f"invalid JSON in {dest!r}: {exc}") from exc
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"{dest!r} must contain a JSON object")
+                doc = loaded
+        raw_hooks = doc.get("hooks")
+        if raw_hooks is not None and not isinstance(raw_hooks, dict):
+            raise ValueError(f"{dest!r} 'hooks' field must be an object")
+        hooks_map = dict(raw_hooks or {})
+        env_prefix_parts = [f"SUBDOTS_STATE_DIR={shlex.quote(state_dir)}"]
+        if mode_val:
+            env_prefix_parts.append(f"DOTS_MODE={shlex.quote(mode_val)}")
+        if dot_val:
+            env_prefix_parts.append(f"DOTS_DOT={shlex.quote(dot_val)}")
+        if ops_val:
+            env_prefix_parts.append(f"DOTS_OPS_BASE={shlex.quote(ops_val)}")
+        env_prefix = " ".join(env_prefix_parts)
+        py_q = shlex.quote(py_abs)
+        sd_q = shlex.quote(subdots_abs)
+        st_q = shlex.quote(state_dir)
+        mapping = {
+            "SessionStart": f"{env_prefix} {py_q} -B {sd_q} hook session-start --state-dir {st_q}",
+            "UserPromptSubmit": f"{env_prefix} {py_q} -B {sd_q} hook pre-invocation --state-dir {st_q}",
+            "Stop": f"{env_prefix} {py_q} -B {sd_q} hook stop --state-dir {st_q}",
+        }
+        for ev_name, cmd_str in mapping.items():
+            cur_list = hooks_map.get(ev_name)
+            cleaned: List[Any] = []
+            if isinstance(cur_list, list):
+                for entry in cur_list:
+                    if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                        is_ours = any(
+                            isinstance(h, dict)
+                            and "subdots.py" in str(h.get("command") or "")
+                            and " hook " in str(h.get("command") or "")
+                            for h in entry["hooks"]
+                        )
+                        if is_ours:
+                            continue
+                    cleaned.append(entry)
+            cleaned.append({"hooks": [{"type": "command", "command": cmd_str}]})
+            hooks_map[ev_name] = cleaned
+        doc["hooks"] = hooks_map
+        rendered = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+        backup_path = None
+        if not dry_run:
+            backup_path = _atomic_write_host_file(dest, rendered, mode=0o600, backup=os.path.exists(dest))
+        if a.json:
+            print(json.dumps({
+                "ok": True, "target": target, "dest": dest, "dry_run": dry_run, "backup": backup_path,
+            }, ensure_ascii=False))
+        else:
+            tag = "DRY_RUN" if dry_run else "INSTALLED"
+            print(f"HOST_HOOKS_{tag} target={target} dest={dest}")
+        return 0
+
+    # antigravity or antigravity-subagent plugin directory
+    is_sub = target == "antigravity-subagent"
+    default_dir = "~/.gemini/config/plugins/" + ("dotomation-subagent-hooks" if is_sub else "dotomation-hooks")
+    plugin_dir = _check_clean_dest_tree(a.dest or default_dir)
+    hooks_subdir = os.path.join(plugin_dir, "hooks")
+    plugin_json_path = os.path.join(plugin_dir, "plugin.json")
+    hooks_json_path = os.path.join(plugin_dir, "hooks.json")
+    runner_sh_path = os.path.join(hooks_subdir, "run-hook.sh")
+    for pchk in (plugin_json_path, hooks_json_path, hooks_subdir, runner_sh_path):
+        if os.path.islink(pchk):
+            raise ValueError(f"refusing symlink in plugin target {pchk!r}")
+
+    plugin_name = "dotomation-subagent-hooks" if is_sub else "dotomation-hooks"
+    plugin_doc = {
+        "name": plugin_name,
+        "displayName": "Dotomation Subagent Harness Hooks" if is_sub else "Dotomation Host Harness Hooks",
+        "version": VERSION,
+        "description": "Mechanically inject Astra v2 specialist harness & steering gates via tools/subdots.py.",
+        "managedBy": "dotomation-subdots",
+    }
+    if is_sub:
+        hooks_doc = {
+            "subdots-subagent-session": {
+                "SessionStart": [{"type": "command", "command": "./hooks/run-hook.sh subagent-start", "timeout": 10}]
+            },
+            "subdots-subagent-invocation": {
+                "PreInvocation": [{"type": "command", "command": "./hooks/run-hook.sh subagent-pre-invocation", "timeout": 10}]
+            },
+            "subdots-subagent-continuation": {
+                "Stop": [{"type": "command", "command": "./hooks/run-hook.sh subagent-stop", "timeout": 10}]
+            },
+        }
+    else:
+        hooks_doc = {
+            "subdots-session": {
+                "SessionStart": [{"type": "command", "command": "./hooks/run-hook.sh session-start", "timeout": 10}]
+            },
+            "subdots-invocation": {
+                "PreInvocation": [{"type": "command", "command": "./hooks/run-hook.sh pre-invocation", "timeout": 10}]
+            },
+            "subdots-continuation": {
+                "Stop": [{"type": "command", "command": "./hooks/run-hook.sh stop", "timeout": 10}]
+            },
+        }
+
+    env_exports = [_sh_default_export("SUBDOTS_STATE_DIR", state_dir)]
+    if mode_val:
+        env_exports.append(_sh_default_export("DOTS_MODE", mode_val))
+    if dot_val:
+        env_exports.append(_sh_default_export("DOTS_DOT", dot_val))
+    if ops_val:
+        env_exports.append(_sh_default_export("DOTS_OPS_BASE", ops_val))
+    if role_val and is_sub:
+        env_exports.append(_sh_default_export("SUBDOTS_ASTRA_ROLE", role_val))
+
+    runner_lines = [
+        "#!/usr/bin/env sh",
+        "# subdots-managed-host-hook",
+        "set -eu",
+        f"PY_BIN={shlex.quote(py_abs)}",
+        f"SUBDOTS_PY={shlex.quote(subdots_abs)}",
+        'if [ ! -f "${SUBDOTS_PY}" ] || [ ! -x "${PY_BIN}" ]; then',
+        "  printf '{}\\n'",
+        "  exit 0",
+        "fi",
+        *env_exports,
+        'MODE="${1:-doctor}"',
+        'if [ "$#" -gt 0 ]; then shift; fi',
+        'if ! out=$("${PY_BIN}" -B "${SUBDOTS_PY}" hook "${MODE}" "$@" 2>/dev/null); then',
+        "  printf '{}\\n'",
+        "  exit 0",
+        "fi",
+        'if [ -n "${out}" ]; then',
+        "  printf '%s\\n' \"${out}\"",
+        "else",
+        "  printf '{}\\n'",
+        "fi",
+    ]
+    runner_sh = "\n".join(runner_lines) + "\n"
+
+    if os.path.lexists(runner_sh_path):
+        existing_sh = read_regular_text(runner_sh_path, max_bytes=65536) or ""
+        if "# subdots-managed-host-hook" not in existing_sh and not force:
+            raise ValueError(f"hook runner {runner_sh_path!r} already exists; pass --force to replace")
+    if os.path.lexists(plugin_json_path):
+        existing_pj = read_regular_text(plugin_json_path, max_bytes=65536) or ""
+        if '"dotomation-subdots"' not in existing_pj and not force:
+            raise ValueError(f"plugin {plugin_json_path!r} already exists; pass --force to replace")
+    if os.path.lexists(hooks_json_path):
+        existing_hj = read_regular_text(hooks_json_path, max_bytes=65536) or ""
+        if ("./hooks/run-hook.sh" not in existing_hj or "subdots-" not in existing_hj) and not force:
+            raise ValueError(f"hooks manifest {hooks_json_path!r} already exists; pass --force to replace")
+
+    if not dry_run:
+        _atomic_write_host_file(plugin_json_path, json.dumps(plugin_doc, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+        _atomic_write_host_file(hooks_json_path, json.dumps(hooks_doc, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+        _atomic_write_host_file(runner_sh_path, runner_sh, mode=0o755)
+
+    files_written = [plugin_json_path, hooks_json_path, runner_sh_path]
+    if a.json:
+        print(json.dumps({
+            "ok": True,
+            "target": target,
+            "dest": plugin_dir,
+            "dry_run": dry_run,
+            "files": files_written,
+        }, ensure_ascii=False))
+    else:
+        tag = "DRY_RUN" if dry_run else "INSTALLED"
+        print(f"HOST_HOOKS_{tag} target={target} dest={plugin_dir} files={len(files_written)}")
     return 0
 
 
@@ -12896,6 +13235,17 @@ def build_parser() -> argparse.ArgumentParser:
     igh.add_argument("--force", action="store_true")
     igh.add_argument("--uninstall", action="store_true")
 
+    ihh = sub.add_parser("install-host-hooks", help="install Antigravity or Claude host/subagent hook bindings")
+    add_state_flags(ihh)
+    ihh.add_argument("--target", required=True, choices=("antigravity", "antigravity-subagent", "claude"))
+    ihh.add_argument("--dest", help="target plugin directory or Claude settings JSON path")
+    ihh.add_argument("--mode", choices=("sub-dots", "dots-only"))
+    ihh.add_argument("--dot")
+    ihh.add_argument("--ops-base", dest="ops_base")
+    ihh.add_argument("--role")
+    ihh.add_argument("--dry-run", dest="dry_run", action="store_true")
+    ihh.add_argument("--force", action="store_true")
+
     hk = sub.add_parser("hook", help="Antigravity local host & subagent hook handler (fail-open)")
     hk_sub = hk.add_subparsers(dest="hook_cmd", required=True)
     for hmode in (
@@ -13111,6 +13461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "await-any": cmd_local_await_any,
             "brief": cmd_local_brief,
             "install-git-hooks": cmd_install_git_hooks,
+            "install-host-hooks": cmd_install_host_hooks,
             "hook": cmd_hook,
             "prompt": cmd_prompt,
         }

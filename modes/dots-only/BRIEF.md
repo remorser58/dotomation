@@ -1,4 +1,4 @@
-# Mode 1: `dots-only` Brief Template (`v1.3`)
+# Mode 1: `dots-only` Brief Template (`v1.4`)
 
 Dots 루트 또는 작업 에이전트에 바로 붙여넣는 **1번 모드 (`dots-only`)** 브리핑 템플릿입니다. `<...>` 자리만 채워 전달하세요.
 

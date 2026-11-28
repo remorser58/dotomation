@@ -3,7 +3,7 @@ name: dotomation
 description: "Route approved Dots goal, SUPER/ULW/WISH, Superstack, plan, run, loop, research and specialist work through compiled Astra v2 harness enforcement, pinned peer handoffs, live records and checked evidence."
 ---
 
-# Dotomation (닷동화) · handoff-v1 (`v1.3`)
+# Dotomation (닷동화) · handoff-v1 (`v1.4`)
 
 ## Mode selection (1: `dots-only` vs 2: `sub-dots`)
 

