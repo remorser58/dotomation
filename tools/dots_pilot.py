@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 UNIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -55,17 +55,29 @@ PLACEHOLDER_RE = re.compile(r"\{(dot|agent|project|id|why|lanes|track|task|age|t
 _TERM_CTRL_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b]"
 )
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]{0,40}(?:PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----")
+_PEM_HEADER_LINE_RE = re.compile(r"^[ \t]*[A-Za-z0-9-]+:[ \t][^\r\n]*[ \t]*$")
+_PEM_B64_LINE_RE = re.compile(r"^[ \t]*[A-Za-z0-9+/=]{8,}[ \t]*$")
+_PEM_BODY_LINE_RE = re.compile(r"^[ \t]*(?:[A-Za-z0-9+/=]{8,}|[A-Za-z0-9-]+:[ \t][^\r\n]*)[ \t]*$")
+_PGP_CRC24_LINE_RE = re.compile(r"^[ \t]*=[A-Za-z0-9+/]{4}[ \t]*$")
+_PEM_PADDED_TAIL_RE = re.compile(r"^[ \t]*[A-Za-z0-9+/]{1,7}={1,2}[ \t]*$")
+_PEM_SHORT_B64_LINE_RE = re.compile(r"^[ \t]*[A-Za-z0-9+/]{1,7}[ \t]*$")
+
 _SECRET_RE = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{10,}"
     r"|xox[abps]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}"
-    r"|-----BEGIN (?:[A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?(?:-----END (?:[A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|\Z)"
+    r"|-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+    r"|-----END [A-Z0-9 ]{0,40}(?:PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+    r"|(?:(?<=http://)|(?<=https://))(?:[^/\s:@]{1,128}:[^/\s@]{1,128}@)"
+    r"|(?<=/)(?:a/)?[0-9a-f]{48}(?=/|$|[\s?#\"'\),;])"
     r"|(?i:\bBearer\s+[A-Za-z0-9._~+/-]{16,}|Authorization:\s*Basic\s+[A-Za-z0-9._+/=-]{8,})"
     r"|\b(?i:Basic)\s+(?=[A-Za-z0-9+/=]{8,}\b)(?:(?=[A-Za-z0-9+/=]*[0-9+/=])|(?=[A-Za-z0-9+/=]{12,}\b)(?=[A-Za-z0-9+/=]*[A-Z])(?=[A-Za-z0-9+/=]*[a-z]))[A-Za-z0-9+/=]{8,}"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
-    r"|https?://[^/\s:@]+:[^/\s@]+@"
     r"|https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{10,}"
     r"|https://(?:discord\.com|discordapp\.com)/api/webhooks/[A-Za-z0-9/_-]{10,}"
-    r"|(?i:\b(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|webhook[_-]?url)\s*[:=]\s*(?:\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|[^\s\"',;]{6,}))"
+    r"|(?i:\"(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|token|access[_-]?token|auth[_-]?token|refresh[_-]?token|session[_-]?token|agent[_-]?token|webhook[_-]?url|credential)\"\s*:\s*\"(?:\\[^\r\n]|[^\"\\\r\n]){1,4096}\")"
+    r"|(?i:\b(?:[a-z0-9_]+_)?(?:api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|password|passwd|secret|token|access[_-]?token|auth[_-]?token|refresh[_-]?token|session[_-]?token|agent[_-]?token|webhook[_-]?url|credential)\s*[:=]\s*(?:\"(?:\\[^\r\n]|[^\"\\\r\n]){1,4096}\"|'(?:\\[^\r\n]|[^'\\\r\n]){1,4096}'|[^\s\"',;]{6,4096}))"
     r"|(?i:[?&](?:token|key|api_key|access_token|secret|password|auth|sig|signature)=[^&\s]+))"
 )
 
@@ -188,8 +200,82 @@ def _clean_oneline(value):
     return re.sub(r"[\r\n\t]+", " ", _clean_term(value)).strip()
 
 
+def _redact_pem_keys(value):
+    if "PRIVATE KEY-----" not in value and "PGP PRIVATE KEY BLOCK-----" not in value:
+        return value
+    lines = value.splitlines(keepends=True)
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.rstrip("\r\n")
+        if _PEM_BEGIN_RE.search(stripped):
+            end_idx = None
+            char_budget = 65536
+            j = i + 1
+            while j < n and char_budget > 0:
+                stripped_j = lines[j].rstrip("\r\n")
+                char_budget -= len(lines[j])
+                if _PEM_END_RE.search(stripped_j):
+                    end_idx = j
+                    break
+                if _PEM_BEGIN_RE.search(stripped_j):
+                    break
+                j += 1
+            if end_idx is not None:
+                eol = "\n" if lines[end_idx].endswith("\n") else ""
+                out.append("[REDACTED]" + eol)
+                i = end_idx + 1
+                continue
+            eol = "\n" if line.endswith("\n") else ""
+            j = i + 1
+            saw_header = False
+            while j < n:
+                sj = lines[j].rstrip("\r\n")
+                if _PEM_HEADER_LINE_RE.match(sj):
+                    saw_header = True
+                    eol = "\n" if lines[j].endswith("\n") else eol
+                    j += 1
+                    continue
+                if sj.strip() == "" and saw_header and j + 1 < n and _PEM_B64_LINE_RE.match(lines[j + 1].rstrip("\r\n")):
+                    saw_header = False
+                    eol = "\n" if lines[j].endswith("\n") else eol
+                    j += 1
+                    continue
+                if _PEM_B64_LINE_RE.match(sj):
+                    saw_header = False
+                    eol = "\n" if lines[j].endswith("\n") else eol
+                    j += 1
+                    continue
+                break
+            out.append("[REDACTED]" + eol)
+            i = j
+            continue
+        if _PEM_END_RE.search(stripped):
+            if out and _PGP_CRC24_LINE_RE.match(out[-1].rstrip("\r\n")):
+                out.pop()
+            if out and _PEM_PADDED_TAIL_RE.match(out[-1].rstrip("\r\n")):
+                out.pop()
+            elif (
+                len(out) >= 2
+                and _PEM_SHORT_B64_LINE_RE.match(out[-1].rstrip("\r\n"))
+                and (_PEM_BODY_LINE_RE.match(out[-2].rstrip("\r\n")) or out[-2].rstrip("\r\n") == "[REDACTED]")
+            ):
+                out.pop()
+            while out and _PEM_BODY_LINE_RE.match(out[-1].rstrip("\r\n")):
+                out.pop()
+            eol = "\n" if line.endswith("\n") else ""
+            out.append("[REDACTED]" + eol)
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "".join(out)
+
+
 def _redact_text(value):
-    return _SECRET_RE.sub("[REDACTED]", _clean_term(value))
+    return _SECRET_RE.sub("[REDACTED]", _redact_pem_keys(_clean_term(value)))
 
 
 def _redact_tree(value):
@@ -967,7 +1053,10 @@ def _cooldown_active(ledger_bucket, key, cooldown_min, current=None):
 
 
 def _verify_dots_pin(cfg):
-    dots_py = os.path.abspath(os.path.expanduser(cfg.get("dots_py") or os.path.join(_TOOL_DIR, "dots.py")))
+    raw_dots = cfg.get("dots_py")
+    if raw_dots is not None and not isinstance(raw_dots, str):
+        return False, None, None, "dots_py must be a string"
+    dots_py = os.path.abspath(os.path.expanduser(raw_dots or os.path.join(_TOOL_DIR, "dots.py")))
     expected = cfg.get("dots_sha256")
     try:
         actual = _sha256_file(dots_py)
@@ -984,6 +1073,8 @@ def _verify_monitor_pin(cfg):
     mon_py = cfg.get("dots_monitor_py")
     if not mon_py:
         return False, None, None, "dots_monitor_py not configured"
+    if not isinstance(mon_py, str):
+        return False, None, None, "dots_monitor_py must be a string"
     mon_abs = os.path.abspath(os.path.expanduser(mon_py))
     expected = cfg.get("monitor_sha256")
     try:
@@ -1090,15 +1181,22 @@ def _apply_tracks_to_ops(cfg, dots_py, force=False, dots_sha256=None):
             "init", "--mode", "dots-only", "--dot", dot, "--project", f"{project}={project}-main", "--yes"
         ], check=True, expected_sha256=sha)
     for t in tracks:
+        if not isinstance(t, dict) or not t.get("track"):
+            continue
         tname = _validate_token("track", t.get("track"))
-        role = str(t.get("role") or "worker")
+        role = str(t.get("role") or "").strip()
         obj = str(t.get("objective") or f"Execute {tname} track continuously.")
         cmd = [
             "loop", "init", dot, tname,
             "--project", project,
             f"--objective={obj}",
-            f"--role={role}",
         ]
+        if role:
+            cmd.append(f"--role={role}")
+        if t.get("astra_role"):
+            cmd.extend(["--astra-role", str(t["astra_role"])])
+        if cfg.get("require_astra_ack") or t.get("require_astra_ack"):
+            cmd.append("--require-astra-ack")
         if t.get("continuous", True):
             cmd.append("--continuous")
         for ft in t.get("feeds_to") or []:
@@ -1280,6 +1378,7 @@ def cmd_init(args):
         "dot": dot,
         "project": project,
         "preset": preset,
+        "require_astra_ack": bool(getattr(args, "require_astra_ack", False) or base_cfg.get("require_astra_ack", False)),
         "keep_full": bool(base_cfg.get("keep_full", True)),
         "interval_sec": _safe_int(args.interval, _safe_int(base_cfg.get("interval_sec"), 180, 15), 15),
         "cooldown_min": _safe_int(args.cooldown_min, _safe_int(base_cfg.get("cooldown_min"), 10, 1), 1),
@@ -1783,6 +1882,80 @@ def _systemd_quote(value):
     return f'"{escaped}"'
 
 
+def cmd_brief(args):
+    pilot_dir = _resolve_safe_pilot_path(args.pilot_dir)
+    cfg = _load_private_json_safe(os.path.join(pilot_dir, "config.json"), pilot_dir, default=None)
+    if not isinstance(cfg, dict):
+        _die("pilot config.json missing; run dots_pilot.py init first")
+    ok_pin, dots_py, actual_sha, pin_err = _verify_dots_pin(cfg)
+    if not ok_pin:
+        _die(pin_err)
+    dot = _validate_token("dot", cfg.get("dot") or "DOT-A")
+    project = _validate_token("project", cfg.get("project") or "default")
+    raw_ops = cfg.get("ops_base")
+    ops_base = os.path.abspath(
+        os.path.expanduser(raw_ops if isinstance(raw_ops, str) and raw_ops.strip() else DEFAULT_OPS_BASE)
+    )
+    tracks = _resolve_tracks_from_cfg(cfg)
+    if args.track:
+        want = _validate_token("track", args.track)
+        tracks = [t for t in tracks if isinstance(t, dict) and t.get("track") == want]
+        if not tracks:
+            _die(f"track {want!r} not found in pilot config")
+
+    items = []
+    for t in tracks:
+        if not isinstance(t, dict) or not t.get("track"):
+            continue
+        tname = _validate_token("track", t.get("track"))
+        role_in = str(t.get("astra_role") or t.get("role") or tname)
+        p_proc = _run_dots(
+            dots_py,
+            ops_base,
+            ["prompt", "--role", role_in, "--mode", "dots-only", "--json"],
+            check=True,
+            expected_sha256=actual_sha,
+        )
+        bundle = json.loads(p_proc.stdout)
+        req_ack = bool(cfg.get("require_astra_ack") or t.get("require_astra_ack"))
+        claim_cmd = f"DOTS_OPS_BASE={shlex.quote(ops_base)} python3 {shlex.quote(dots_py)} loop claim {dot} {tname} --agent <agentId>"
+        ack_cmd = (
+            f"DOTS_OPS_BASE={shlex.quote(ops_base)} python3 {shlex.quote(dots_py)} loop ack {dot} {tname} --agent <agentId> --profile-sha {bundle['sha256']}"
+            if req_ack
+            else None
+        )
+        brief_lines = [
+            f"Track `{tname}` ({dot}/{project}) — Astra {bundle['role']} ({bundle['effort']})",
+            f"Objective: {_clean_oneline(_redact_text(t.get('objective') or '-'))}",
+            f"Claim loop: {claim_cmd}",
+        ]
+        if ack_cmd:
+            brief_lines.append(f"Ack required: {ack_cmd}")
+        brief_lines.append(bundle["full"])
+        items.append({
+            "dot": dot,
+            "project": project,
+            "track": tname,
+            "role": bundle["role"],
+            "effort": bundle["effort"],
+            "sha256": bundle["sha256"],
+            "require_astra_ack": req_ack,
+            "claim_cmd": claim_cmd,
+            "ack_cmd": ack_cmd,
+            "profile": bundle,
+            "brief_text": "\n".join(brief_lines),
+        })
+
+    if args.json:
+        print(json.dumps({"v": 1, "dot": dot, "project": project, "ops_base": ops_base, "tracks": items}, ensure_ascii=False, indent=1), flush=True)
+        return 0
+    for idx, it in enumerate(items):
+        if idx > 0:
+            print("=" * 60, flush=True)
+        print(it["brief_text"], flush=True)
+    return 0
+
+
 def cmd_render_service(args):
     pilot_dir = _resolve_safe_pilot_path(args.pilot_dir)
     cfg = _load_private_json_safe(os.path.join(pilot_dir, "config.json"), pilot_dir, default={})
@@ -1870,6 +2043,7 @@ def build_parser():
     pi.add_argument("--unit-label", dest="unit_label")
     pi.add_argument("--interval", type=int)
     pi.add_argument("--cooldown-min", dest="cooldown_min", type=int)
+    pi.add_argument("--require-astra-ack", dest="require_astra_ack", action="store_true")
     pi.add_argument("--force", action="store_true")
 
     pa = sub.add_parser("apply-tracks", help="apply configured preset/tracks into ops_base via dots.py loop init")
@@ -1901,6 +2075,10 @@ def build_parser():
     pst = sub.add_parser("status", help="show pilot pin, heartbeat, and loop track states")
     pst.add_argument("--json", action="store_true")
 
+    pbr = sub.add_parser("brief", help="print role-bound Astra v2 Mode 1 subagent briefs for configured tracks")
+    pbr.add_argument("--track")
+    pbr.add_argument("--json", action="store_true")
+
     pdoc = sub.add_parser("doctor", help="validate environment, private permissions, pins, and transports")
     pdoc.add_argument("--json", action="store_true")
 
@@ -1921,6 +2099,7 @@ def main(argv=None):
         "sentinel": cmd_sentinel,
         "say": cmd_say,
         "status": cmd_status,
+        "brief": cmd_brief,
         "doctor": cmd_doctor,
         "render-service": cmd_render_service,
     }
