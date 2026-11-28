@@ -97,10 +97,12 @@ class HubTestBase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         return json.loads(res.stdout)
 
-    def register_agent(self, agent="worker-1", dot="DOT-A", project="proj", lease_ttl=None):
+    def register_agent(self, agent="worker-1", dot="DOT-A", project="proj", lease_ttl=None, role=None):
         args = ["agent", "register", agent, "--dot", dot, "--project", project, "--state-dir", self.state_dir, "--json"]
         if lease_ttl is not None:
             args += ["--lease-ttl", str(lease_ttl)]
+        if role is not None:
+            args += ["--role", str(role)]
         res = cli_run(args, self.state_dir)
         self.assertEqual(res.returncode, 0, res.stderr)
         return json.loads(res.stdout)
@@ -3808,6 +3810,1134 @@ class TestMode2AutonomyAndWatchdogV12(HubTestBase):
         })
         self.assertIn("reserved", skip_msg)
         self.assertFalse(os.path.exists(os.path.join(mirror_ops, "loops")))
+
+
+class TestAstraSubagentHarnessV13(HubTestBase):
+    def test_cross_tool_astra_parity_and_cli_prompt_and_provision_brief_redaction(self):
+        self.assertEqual(d.VERSION, "1.3.0")
+        self.assertEqual(sd.VERSION, "1.3.0")
+        self.assertEqual(sd.ASTRA_PROFILE_VERSION, "astra-v2")
+        self.assertEqual(sd.ASTRA_SOURCE_PIN, "0159023e")
+
+        for role in ("worker", "reviewer", "coordinator", None, "구현", "감사"):
+            for mode in ("sub-dots", "dots-only"):
+                self.assertEqual(
+                    d.astra_profile_bundle(role, mode=mode),
+                    sd.astra_profile_bundle(role, mode=mode),
+                )
+
+        # CLI prompt works with no Hub running
+        p_res = cli_run(
+            ["prompt", "--role", "reviewer", "--mode", "sub-dots", "--json"],
+            os.path.join(self._tmp.name, "no-hub-state"),
+        )
+        self.assertEqual(p_res.returncode, 0, p_res.stderr)
+        p_doc = json.loads(p_res.stdout)
+        self.assertEqual(p_doc["role"], "reviewer")
+        self.assertTrue(p_doc["read_only"])
+
+        # provision --brief redacts tokens unless --show-token is passed
+        self.start_hub()
+        br_redacted = cli_run(
+            ["provision", "br-w", "--dot", "DOT-A", "--project", "proj", "--role", "worker", "--brief", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(br_redacted.returncode, 0, br_redacted.stderr)
+        self.assertIn("--- [MODE_2_AGENT_BRIEF] ---", br_redacted.stdout)
+        self.assertIn("[ASTRA_HARNESS_PROFILE", br_redacted.stdout)
+        self.assertIn("[REDACTED]", br_redacted.stdout)
+
+        br_shown = cli_run(
+            ["provision", "br-w2", "--dot", "DOT-A", "--project", "proj", "--role", "reviewer", "--brief", "--show-token", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(br_shown.returncode, 0, br_shown.stderr)
+        self.assertIn("/a/", br_shown.stdout)
+        self.assertNotIn("<redacted; pass --show-token", br_shown.stdout)
+
+    def test_mcp_initialize_instructions_and_hubless_stdio_profile(self):
+        # 1) Stdio MCP works cleanly even without a running Hub for subdots_astra_profile
+        absent_state = os.path.join(self._tmp.name, "absent-state")
+        reqs = "\n".join([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "subdots_astra_profile", "arguments": {"role": "reviewer", "mode": "dots-only"}}}),
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "subdots_astra_profile", "arguments": {"role": "worker", "compact": True}}}),
+            json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "subdots_astra_profile", "arguments": {"mode": "invalid-mode"}}}),
+        ]) + "\n"
+        stdio = cli_run(["mcp-stdio", "--state-dir", absent_state], absent_state, stdin_text=reqs)
+        self.assertEqual(stdio.returncode, 0, stdio.stderr)
+        resps = [json.loads(line) for line in stdio.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(resps), 5)
+        self.assertEqual(
+            resps[0]["result"]["instructions"],
+            sd.astra_profile_bundle("coordinator", mode="sub-dots")["full"],
+        )
+        tools = {t["name"]: t for t in resps[1]["result"]["tools"]}
+        self.assertEqual(len(tools), 15)
+        self.assertIn("subdots_astra_profile", tools)
+        c_props = tools["subdots_set_contract"]["inputSchema"]["properties"]
+        for k in ("require_astra_ack", "read_only", "astra_role"):
+            self.assertIn(k, c_props)
+        prof_full = json.loads(resps[2]["result"]["content"][0]["text"])
+        self.assertTrue(prof_full["ok"])
+        self.assertEqual(prof_full["role"], "reviewer")
+        self.assertEqual(prof_full["mode"], "dots-only")
+        prof_cmp = json.loads(resps[3]["result"]["content"][0]["text"])
+        self.assertTrue(prof_cmp["prompt"].startswith("ASTRA_PROFILE:"))
+        self.assertTrue(resps[4]["result"]["isError"])
+
+        # 2) Reverse MCP initialize returns default worker profile unbound, and reviewer on bound scoped endpoint
+        self.start_hub()
+        rt = sd.read_runtime(self.state_dir)
+        prov = cli_run(
+            ["provision", "mcp-rev", "--dot", "DOT-A", "--project", "proj", "--role", "worker", "--show-token", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(prov.returncode, 0, prov.stderr)
+        pdoc = json.loads(prov.stdout)
+        self.assertEqual(
+            cli_run(["contract", "set", "mcp-rev", "--astra-role", "reviewer", "--read-only", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+
+        c_glob, b_glob = http_raw(
+            rt["mcp_url"],
+            method="POST",
+            body={"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+        )
+        self.assertEqual(c_glob, 200, b_glob)
+        self.assertEqual(
+            json.loads(b_glob)["result"]["instructions"],
+            sd.astra_profile_bundle("worker", mode="sub-dots")["full"],
+        )
+
+        c_sc, b_sc = http_raw(
+            pdoc["agent_mcp_url"],
+            method="POST",
+            body={"jsonrpc": "2.0", "id": 11, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+        )
+        self.assertEqual(c_sc, 200, b_sc)
+        self.assertEqual(
+            json.loads(b_sc)["result"]["instructions"],
+            sd.astra_profile_bundle("reviewer", mode="sub-dots")["full"],
+        )
+
+    def test_require_astra_ack_gate_single_exec_event_and_epoch_rollover_relock(self):
+        self.start_hub(extra_args=["--require-astra-ack"])
+        rt = sd.read_runtime(self.state_dir)
+        reg = cli_run(
+            ["agent", "register", "ack-w", "--dot", "DOT-A", "--project", "proj", "--role", "worker", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(reg.returncode, 0, reg.stderr)
+        rdoc = json.loads(reg.stdout)
+        sha = rdoc["astra_profile"]["sha256"]
+        self.assertIn("[ASTRA_HARNESS_PROFILE", rdoc["astra_profile_text"])
+        ep1 = rdoc["epoch"]
+        tok1 = rdoc["session_token"]
+
+        # Mutating calls blocked with 409 ASTRA_PROFILE_ACK_REQUIRED before ACK
+        c_step, b_step = http_raw(
+            f"{rt['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "ack-w", "epoch": ep1, "session_token": tok1, "state": "start", "task": "T1", "note": "n", "evidence": "e"},
+        )
+        self.assertEqual(c_step, 409, b_step)
+        err_doc = json.loads(b_step)
+        self.assertEqual(err_doc["code"], "ASTRA_PROFILE_ACK_REQUIRED")
+        self.assertIn("[ASTRA_HARNESS_PROFILE", err_doc["astra_profile_text"])
+        self.assertIn("PENDING_ASTRA_PROFILE_ACK:", err_doc["steering_footer"])
+
+        # Wrong SHA rejected with 400 ASTRA_PROFILE_MISMATCH
+        c_bad, b_bad = http_raw(
+            f"{rt['http_url']}/agent/ack",
+            method="POST",
+            body={"agent_id": "ack-w", "epoch": ep1, "session_token": tok1, "profile_sha": "00000000deadbeef"},
+        )
+        self.assertEqual(c_bad, 400, b_bad)
+        self.assertEqual(json.loads(b_bad)["code"], "ASTRA_PROFILE_MISMATCH")
+
+        # Inline profile_sha on exec/start unlocks and emits exactly ONE astra_profile_acked event
+        c_ex, b_ex = http_raw(
+            f"{rt['http_url']}/agent/exec/start",
+            method="POST",
+            body={"agent_id": "ack-w", "epoch": ep1, "session_token": tok1, "cmd": "echo ok", "cwd": self._tmp.name, "profile_sha": sha},
+        )
+        self.assertEqual(c_ex, 200, b_ex)
+        ex_id = json.loads(b_ex)["exec_id"]
+        http_raw(
+            f"{rt['http_url']}/agent/exec/finish",
+            method="POST",
+            body={"agent_id": "ack-w", "epoch": ep1, "session_token": tok1, "exec_id": ex_id, "status": "completed", "exit_code": 0},
+        )
+        ev_res = cli_run(["events", "ack-w", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        ack_evs = [e for e in json.loads(ev_res.stdout)["events"] if e["event_type"] == "astra_profile_acked"]
+        self.assertEqual(len(ack_evs), 1)
+        self.assertEqual(ack_evs[0]["payload"]["epoch"], ep1)
+
+        # Phoenix rollover increments epoch -> Astra ACK re-locks automatically
+        res2 = cli_run(["agent", "resume", "ack-w", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        ep2 = json.loads(res2.stdout)["epoch"]
+        self.assertGreater(ep2, ep1)
+        blocked_ep2 = cli_run(
+            ["agent", "step", "ack-w", "start", "--task", "T2", "--note", "n", "--evidence", "e", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(blocked_ep2.returncode, 2)
+        self.assertIn("ASTRA_PROFILE_ACK_REQUIRED", blocked_ep2.stderr)
+
+        ack_cli = cli_run(
+            ["agent", "ack", "ack-w", "--profile-sha", sha, "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(ack_cli.returncode, 0, ack_cli.stderr)
+        ok_ep2 = cli_run(
+            ["agent", "step", "ack-w", "start", "--task", "T2", "--note", "ok", "--evidence", "ev:1", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(ok_ep2.returncode, 0, ok_ep2.stderr)
+
+    def test_reviewer_read_only_override_blocks_writes_and_dirty_done_allows_reads(self):
+        ws = os.path.join(self._tmp.name, "ro-repo")
+        _init_git_repo(ws, {"src/app.py": "VAL = 1\n"})
+        self.start_hub(extra_args=["--enable-tool-proxy", "--capsule-every", "1"])
+        rt = sd.read_runtime(self.state_dir)
+
+        reg = self.register_agent("ro-1", dot="DOT-A")
+        ep = reg["epoch"]
+        tok = reg["session_token"]
+        self.assertEqual(
+            cli_run([
+                "contract", "set", "ro-1", "--astra-role", "reviewer", "--read-only",
+                "--workspace", ws, "--enable-tools", "--state-dir", self.state_dir,
+            ], self.state_dir).returncode,
+            0,
+        )
+
+        # Resume & brief surface overridden reviewer role + read_only=true
+        res2 = cli_run(["agent", "resume", "ro-1", "--role", "worker", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        r2doc = json.loads(res2.stdout)
+        ep = r2doc["epoch"]
+        tok = r2doc["session_token"]
+        self.assertEqual(r2doc["astra_profile"]["role"], "reviewer")
+        self.assertTrue(r2doc["astra_profile"]["read_only"])
+        self.assertIn("role=reviewer", r2doc["capsule_text"])
+
+        br = cli_run(["brief", "ro-1", "--state-dir", self.state_dir], self.state_dir)
+        self.assertIn("role=reviewer | read_only=true", br.stdout)
+
+        def mcp(tool, args):
+            return http_raw(
+                rt["mcp_url"],
+                method="POST",
+                body={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}},
+            )
+
+        # Read & git_status allowed; patch & commit/write gate-check denied
+        rc, rb = mcp("subdots_read", {"agent_id": "ro-1", "epoch": ep, "session_token": tok, "path": "src/app.py"})
+        self.assertEqual(rc, 200, rb)
+        self.assertFalse(json.loads(rb)["result"]["isError"])
+
+        gc, gb = mcp("subdots_git_status", {"agent_id": "ro-1", "epoch": ep, "session_token": tok})
+        self.assertEqual(gc, 200, gb)
+        self.assertFalse(json.loads(gb)["result"]["isError"])
+
+        pc, pb = mcp("subdots_patch", {"agent_id": "ro-1", "epoch": ep, "session_token": tok, "path": "src/app.py", "target": "VAL = 1", "replacement": "VAL = 2"})
+        self.assertTrue(json.loads(pb)["result"]["isError"])
+        self.assertIn("SCOPE_VIOLATION", pb)
+
+        for action in ("commit", "tool_write"):
+            chk_c, chk_b = http_raw(
+                f"{rt['http_url']}/agent/gate-check",
+                method="POST",
+                body={"agent_id": "ro-1", "epoch": ep, "session_token": tok, "action": action, "paths": ["src/app.py"], "cwd": ws},
+            )
+            self.assertEqual(chk_c, 403, chk_b)
+            self.assertEqual(json.loads(chk_b)["code"], "SCOPE_VIOLATION")
+
+        # Dirty worktree blocks step done for read-only reviewer; cleaning allows done
+        pathlib.Path(os.path.join(ws, "src", "app.py")).write_text("VAL = 999\n", encoding="utf-8")
+        c_dirty, b_dirty = http_raw(
+            f"{rt['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "ro-1", "epoch": ep, "session_token": tok, "state": "done", "task": "Review", "note": "n", "evidence": "src/app.py:1", "goal": "g", "doing": "d", "next_step": "n"},
+        )
+        self.assertEqual(c_dirty, 409, b_dirty)
+        self.assertEqual(json.loads(b_dirty)["code"], "SCOPE_VIOLATION")
+
+        pathlib.Path(os.path.join(ws, "src", "app.py")).write_text("VAL = 1\n", encoding="utf-8")
+        c_clean, b_clean = http_raw(
+            f"{rt['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "ro-1", "epoch": ep, "session_token": tok, "state": "done", "task": "Review", "note": "clean", "evidence": "src/app.py:1", "goal": "g", "doing": "d", "next_step": "n"},
+        )
+        self.assertEqual(c_clean, 200, b_clean)
+
+    def test_subagent_hooks_mode2_mode1_dedup_stop_and_symlink_guards(self):
+        hook_sh = os.path.join(os.path.dirname(TOOLS_DIR), "modes", "sub-dots", "hooks", "run-hook.sh")
+        missing_dir = os.path.join(self._tmp.name, "mode1-missing-state")
+
+        # 1) Hub stopped: doctor + subagent-start via run-hook.sh both succeed cleanly
+        doc_sh = subprocess.run(
+            [hook_sh, "doctor", "--state-dir", missing_dir],
+            capture_output=True, text=True, check=False,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": self._tmp.name, "SUBDOTS_STATE_DIR": missing_dir},
+        )
+        self.assertEqual(doc_sh.returncode, 0, doc_sh.stderr)
+        doc_json = json.loads(doc_sh.stdout)
+        self.assertEqual(doc_json["astra_profile_version"], "astra-v2")
+        self.assertIn("reviewer", doc_json["astra_profile_shas"])
+
+        start_sh = subprocess.run(
+            [hook_sh, "subagent-start", "--role", "reviewer", "--mode", "dots-only", "--state-dir", missing_dir],
+            capture_output=True, text=True, check=False,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": self._tmp.name, "SUBDOTS_STATE_DIR": missing_dir},
+        )
+        self.assertEqual(start_sh.returncode, 0, start_sh.stderr)
+        start_msg = json.loads(start_sh.stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn('role="reviewer"', start_msg)
+        self.assertIn('read_only="true"', start_msg)
+        self.assertIn('mode="dots-only"', start_msg)
+
+        # 2) Mode 1 loop track + missing state_dir creation + pre-invocation dedup/reminder + stop continuation
+        m1_ops = os.path.join(self._tmp.name, "m1-ops")
+        m1_env = {"DOTS_OPS_BASE": m1_ops, "DOTS_AUTO_UPDATE": "0", "PYTHONDONTWRITEBYTECODE": "1"}
+        self.assertEqual(subprocess.run(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "dots.py"), "loop", "init", "DOT-M1", "rev-t",
+             "--project", "kice", "--objective", "Analyze items", "--astra-role", "reviewer",
+             "--require-astra-ack", "--continuous"],
+            env=dict(os.environ, **m1_env), capture_output=True, text=True, check=False,
+        ).returncode, 0)
+        self.assertEqual(subprocess.run(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "dots.py"), "loop", "enqueue", "DOT-M1", "rev-t", "--title", "Item 1"],
+            env=dict(os.environ, **m1_env), capture_output=True, text=True, check=False,
+        ).returncode, 0)
+
+        st_m1 = cli_run(
+            ["hook", "subagent-start", "--ops-base", m1_ops, "--dot", "DOT-M1", "--track", "rev-t", "--agent", "r-m1", "--state-dir", missing_dir],
+            missing_dir, stdin_text=json.dumps({"conversationId": "m1-conv"}),
+        )
+        m1_msg = json.loads(st_m1.stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn('mode="dots-only"', m1_msg)
+        self.assertIn("<dots-loop-status", m1_msg)
+        self.assertIn(d.astra_profile_bundle("reviewer", "dots-only")["sha256"], m1_msg)
+
+        # Pre-invocation creates missing_dir, emits full first, {} second, reminder on delta third
+        pre_args = ["hook", "subagent-pre-invocation", "--ops-base", m1_ops, "--dot", "DOT-M1", "--track", "rev-t", "--agent", "r-m1", "--state-dir", missing_dir]
+        p1 = json.loads(cli_run(pre_args, missing_dir, stdin_text=json.dumps({"conversationId": "m1-c", "lastUserInput": "go"})).stdout)
+        self.assertIn("<astra-subagent-profile", p1["injectSteps"][0]["systemMessage"]["systemMessage"])
+        self.assertTrue(os.path.isdir(missing_dir))
+        p2 = json.loads(cli_run(pre_args, missing_dir, stdin_text=json.dumps({"conversationId": "m1-c", "lastUserInput": "go"})).stdout)
+        self.assertEqual(p2, {})
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "dots.py"), "loop", "claim", "DOT-M1", "rev-t", "--agent", "r-m1"],
+            env=dict(os.environ, **m1_env), capture_output=True, text=True, check=False,
+        )
+        p3 = json.loads(cli_run(pre_args, missing_dir, stdin_text=json.dumps({"conversationId": "m1-c", "lastUserInput": "go"})).stdout)
+        self.assertIn("<astra-subagent-reminder", p3["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+        # Mode 1 subagent-stop continues while active/queued/continuous, stops when paused
+        stop_args = ["hook", "subagent-stop", "--ops-base", m1_ops, "--dot", "DOT-M1", "--track", "rev-t", "--agent", "r-m1", "--state-dir", missing_dir]
+        s_cont = json.loads(cli_run(stop_args, missing_dir, stdin_text=json.dumps({"conversationId": "m1-c"})).stdout)
+        self.assertEqual(s_cont["decision"], "continue")
+        self.assertIn("loop_active=", s_cont["reason"])
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "dots.py"), "loop", "pause", "DOT-M1", "rev-t", "--reason", "done"],
+            env=dict(os.environ, **m1_env), capture_output=True, text=True, check=False,
+        )
+        s_paused = json.loads(cli_run(stop_args, missing_dir, stdin_text=json.dumps({"conversationId": "m1-c"})).stdout)
+        self.assertEqual(s_paused, {})
+
+        # Symlink trap on ops_base/loops/<DOT> never follows symlink or leaks external file
+        outside = os.path.join(self._tmp.name, "outside_track.json")
+        pathlib.Path(outside).write_text('{"active":{"id":"SYMLINK_LEAK"}}\n', encoding="utf-8")
+        sym_loops = os.path.join(m1_ops, "loops", "DOT-SYM")
+        os.makedirs(sym_loops, exist_ok=True)
+        os.symlink(outside, os.path.join(sym_loops, "bad.state.json"))
+        self.assertIsNone(sd._hook_read_loop_track(m1_ops, "DOT-SYM", "bad"))
+
+        # 3) Mode 2 subagent-stop continues for completed agent with queued steering & caps at MAX_HOOK_CONTINUATIONS
+        self.start_hub(extra_args=["--require-astra-ack"])
+        reg = self.register_agent("m2-w")
+        sha_w = reg["astra_profile"]["sha256"]
+        self.assertEqual(
+            cli_run(["agent", "ack", "m2-w", "--profile-sha", sha_w, "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        done_m2 = cli_run(
+            ["agent", "step", "m2-w", "done", "--task", "T1", "--note", "ok", "--evidence", "rev/1", "--goal", "g", "--doing", "d", "--next", "n", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertEqual(done_m2.returncode, 0, done_m2.stderr)
+        # Clean completed agent stops cleanly
+        s_clean = json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "m2c"})).stdout)
+        self.assertEqual(s_clean, {})
+        # Send new steering to completed agent -> stop continues!
+        self.assertEqual(
+            cli_run(["send", "m2-w", "task", "T2", "--text", "follow-up task", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        s_steered = json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "m2c"})).stdout)
+        self.assertEqual(s_steered["decision"], "continue")
+        self.assertIn("pending_steering=", s_steered["reason"])
+
+        # Guarded skips & continuation cap & symlink state_dir fail-open
+        self.assertEqual(json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "m2c", "continuationActive": True})).stdout), {})
+        self.assertEqual(json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "m2c", "terminationReason": "MAX_TOKENS"})).stdout), {})
+        last_cap = None
+        for _ in range(sd.MAX_HOOK_CONTINUATIONS + 2):
+            last_cap = json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"conversationId": "m2-cap"})).stdout)
+        self.assertEqual(last_cap, {})
+
+        sym_state = os.path.join(self._tmp.name, "sym-state")
+        os.symlink(self.state_dir, sym_state)
+        self.assertEqual(json.loads(cli_run(["hook", "subagent-stop", "--agent", "m2-w", "--state-dir", sym_state], self.state_dir, stdin_text=json.dumps({"conversationId": "symc"})).stdout), {})
+
+    def test_pre_v13_sqlite_hook_read_and_online_migration(self):
+        leg_dir = os.path.join(self._tmp.name, "legacy-v12-state")
+        os.makedirs(leg_dir, mode=0o700, exist_ok=True)
+        db_path = os.path.join(leg_dir, "subdots.sqlite")
+        conn = sqlite3.connect(db_path)
+        now = sd.utc_now_ts()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE agents (
+                    agent_id TEXT PRIMARY KEY,
+                    dot TEXT NOT NULL DEFAULT 'DOT',
+                    project TEXT NOT NULL DEFAULT 'default',
+                    role TEXT NOT NULL DEFAULT '구현',
+                    host TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    epoch INTEGER NOT NULL DEFAULT 1,
+                    session_token TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'working',
+                    task TEXT NOT NULL DEFAULT '',
+                    goal TEXT NOT NULL DEFAULT '',
+                    doing TEXT NOT NULL DEFAULT '',
+                    next_step TEXT NOT NULL DEFAULT '',
+                    decisions_json TEXT NOT NULL DEFAULT '[]',
+                    blockers_json TEXT NOT NULL DEFAULT '[]',
+                    lease_ttl_s REAL NOT NULL DEFAULT 45.0,
+                    last_seen_at REAL NOT NULL,
+                    lease_expires_at REAL NOT NULL,
+                    active_poll_count INTEGER NOT NULL DEFAULT 0,
+                    wake_count INTEGER NOT NULL DEFAULT 0,
+                    last_wake_at REAL,
+                    stalled_since REAL,
+                    notified_dead_at REAL,
+                    spin_strikes INTEGER NOT NULL DEFAULT 0,
+                    spin_reason TEXT NOT NULL DEFAULT '',
+                    recent_steps_json TEXT NOT NULL DEFAULT '[]',
+                    recent_execs_json TEXT NOT NULL DEFAULT '[]',
+                    poll_timestamps_json TEXT NOT NULL DEFAULT '[]',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE contracts (
+                    agent_id TEXT PRIMARY KEY,
+                    goal TEXT NOT NULL DEFAULT '',
+                    workspace_root TEXT NOT NULL DEFAULT '',
+                    allowed_paths_json TEXT NOT NULL DEFAULT '[]',
+                    forbidden_paths_json TEXT NOT NULL DEFAULT '[]',
+                    forbidden_cmds_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_cmd_prefixes_json TEXT NOT NULL DEFAULT '[]',
+                    required_checks_json TEXT NOT NULL DEFAULT '[]',
+                    strict_steering INTEGER NOT NULL DEFAULT 1,
+                    enable_tools INTEGER NOT NULL DEFAULT 0,
+                    capsule_every_n INTEGER NOT NULL DEFAULT 8,
+                    rollover_max_calls INTEGER NOT NULL DEFAULT 40,
+                    rollover_max_bytes INTEGER NOT NULL DEFAULT 200000,
+                    rollover_max_age_s REAL NOT NULL DEFAULT 2700.0,
+                    idle_hibernate_s REAL NOT NULL DEFAULT 0.0,
+                    base_git_head TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    request_id TEXT UNIQUE,
+                    payload_hash TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    project TEXT NOT NULL DEFAULT 'default',
+                    task TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 1,
+                    interrupt INTEGER NOT NULL DEFAULT 0,
+                    re_id TEXT,
+                    text TEXT NOT NULL,
+                    refs_json TEXT NOT NULL DEFAULT '[]',
+                    delivery_state TEXT NOT NULL,
+                    offer_count INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    created_at_iso TEXT NOT NULL,
+                    first_offered_at REAL,
+                    last_offered_at REAL,
+                    acked_at REAL,
+                    answered_at REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO agents(agent_id, dot, project, role, epoch, session_token, state, last_seen_at, lease_expires_at, created_at, updated_at) "
+                "VALUES ('leg-w', 'DOT-L', 'proj', 'reviewer', 1, 'tok1', 'working', ?, ?, ?, ?)",
+                (now, now + 60.0, now, now),
+            )
+            conn.execute(
+                "INSERT INTO contracts(agent_id, goal, updated_at) VALUES ('leg-w', 'Legacy review', ?)",
+                (now,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(db_path, 0o600)
+
+        # Read-only hook helper works cleanly against pre-v1.3 columns
+        hs = sd._hook_read_subagent_hub(leg_dir, agent_id="leg-w")
+        self.assertTrue(hs["db_exists"])
+        self.assertEqual(hs["agent"]["agent_id"], "leg-w")
+        self.assertEqual(hs["contract"]["goal"], "Legacy review")
+
+        # Online v1.3 Hub start migrates columns cleanly and preserves legacy contract/agent
+        self.assertEqual(
+            cli_run(["hub", "start", "--state-dir", leg_dir, "--json"], leg_dir).returncode,
+            0,
+        )
+        try:
+            st = cli_run(["contract", "get", "leg-w", "--state-dir", leg_dir, "--json"], leg_dir)
+            self.assertEqual(st.returncode, 0, st.stderr)
+            cdoc = json.loads(st.stdout)["contract"]
+            self.assertEqual(cdoc["goal"], "Legacy review")
+            self.assertFalse(cdoc["require_astra_ack"])
+            self.assertFalse(cdoc["read_only"])
+        finally:
+            cli_run(["hub", "stop", "--state-dir", leg_dir], leg_dir)
+
+    def test_audit_hardening_exec_read_only_reply_ack_resume_preservation_and_redaction(self):
+        ws = os.path.join(self._tmp.name, "audit-repo")
+        _init_git_repo(ws, {"src/mod.py": "A = 1\n"})
+        self.start_hub(extra_args=["--enable-tool-proxy"])
+        rt = sd.read_runtime(self.state_dir)
+
+        # 1) contract set --astra-role reviewer (WITHOUT --read-only) implies read_only & blocks unallowlisted exec
+        self.register_agent("aud-ro", dot="DOT-A")
+        c_res = cli_run(
+            ["contract", "set", "aud-ro", "--astra-role", "reviewer", "--workspace", ws, "--enable-tools", "--state-dir", self.state_dir, "--json"],
+            self.state_dir,
+        )
+        self.assertEqual(c_res.returncode, 0, c_res.stderr)
+        self.assertTrue(json.loads(c_res.stdout)["contract"]["read_only"])
+
+        res_ro = cli_run(["agent", "resume", "aud-ro", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        ro_doc = json.loads(res_ro.stdout)
+        ep_ro = ro_doc["epoch"]
+        tok_ro = ro_doc["session_token"]
+        self.assertEqual(ro_doc["astra_profile"]["role"], "reviewer")
+        self.assertTrue(ro_doc["astra_profile"]["read_only"])
+
+        c_patch, b_patch = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "path": "src/mod.py", "target": "A = 1", "replacement": "A = 2"},
+        )
+        self.assertEqual(c_patch, 403, b_patch)
+        self.assertEqual(json.loads(b_patch)["code"], "SCOPE_VIOLATION")
+
+        for ep_url, body in (
+            (f"{rt['http_url']}/agent/tool/exec", {"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "argv": ["echo", "hi"]}),
+            (f"{rt['http_url']}/agent/exec/start", {"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "cmd": "echo hi", "cwd": ws}),
+            (f"{rt['http_url']}/agent/gate-check", {"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "action": "exec", "cmd": "echo hi", "cwd": ws}),
+        ):
+            code, resp = http_raw(ep_url, method="POST", body=body)
+            self.assertEqual(code, 403, (ep_url, resp))
+            self.assertEqual(json.loads(resp)["code"], "SCOPE_VIOLATION")
+
+        # Allowing explicit prefix permits allowlisted read-only exec while still blocking python3 & patch
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "aud-ro", "--astra-role", "reviewer", "--workspace", ws, "--enable-tools", "--allow-cmd-prefix", "echo", "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        c_ok, b_ok = http_raw(
+            f"{rt['http_url']}/agent/tool/exec",
+            method="POST",
+            body={"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "argv": ["echo", "ro-ok"]},
+        )
+        self.assertEqual(c_ok, 200, b_ok)
+        c_no, b_no = http_raw(
+            f"{rt['http_url']}/agent/tool/exec",
+            method="POST",
+            body={"agent_id": "aud-ro", "epoch": ep_ro, "session_token": tok_ro, "argv": ["python3", "-c", "print(1)"]},
+        )
+        self.assertEqual(c_no, 403, b_no)
+
+        # 2) Non-check tool_exec updates last_mutation_at so stale check cannot satisfy done
+        self.register_agent("aud-w", dot="DOT-A")
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "aud-w", "--workspace", ws, "--enable-tools", "--require-check", f"{sys.executable} -B -c pass", "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        rw = cli_run(["agent", "resume", "aud-w", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        wdoc = json.loads(rw.stdout)
+        ep_w, tok_w = wdoc["epoch"], wdoc["session_token"]
+        self.assertEqual(
+            http_raw(
+                f"{rt['http_url']}/agent/tool/exec",
+                method="POST",
+                body={"agent_id": "aud-w", "epoch": ep_w, "session_token": tok_w, "argv": [sys.executable, "-B", "-c", "pass"]},
+            )[0],
+            200,
+        )
+        c_mut, b_mut = http_raw(
+            f"{rt['http_url']}/agent/tool/exec",
+            method="POST",
+            body={"agent_id": "aud-w", "epoch": ep_w, "session_token": tok_w, "argv": [sys.executable, "-B", "-c", "print('after')"]},
+        )
+        self.assertEqual(c_mut, 200, b_mut)
+        st_w = json.loads(cli_run(["status", "aud-w", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)["agent"]
+        self.assertGreater(float(st_w["last_mutation_at"]), float(st_w["observed_checks"][f"{sys.executable} -B -c pass"]["passed_at"]))
+
+        # 3) provision/register reviewer preserves role/dot/project across CLI resume & MCP resume and blocks scoped downgrade
+        prov_rev = json.loads(
+            cli_run(["provision", "rev-p", "--dot", "DOT-REV", "--project", "myproj", "--role", "reviewer", "--show-token", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout
+        )
+        # Register via CLI without flags -> keeps reviewer / DOT-REV / myproj
+        reg_p = cli_run(["agent", "register", "rev-p", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(reg_p.returncode, 0, reg_p.stderr)
+        rp_doc = json.loads(reg_p.stdout)
+        self.assertEqual(rp_doc["agent"]["role"], "reviewer")
+        self.assertEqual(rp_doc["agent"]["dot"], "DOT-REV")
+        self.assertEqual(rp_doc["agent"]["project"], "myproj")
+        self.assertEqual(rp_doc["astra_profile"]["role"], "reviewer")
+        # Resume via CLI without flags -> still keeps reviewer / DOT-REV / myproj
+        res_p = cli_run(["agent", "resume", "rev-p", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertEqual(res_p.returncode, 0, res_p.stderr)
+        self.assertEqual(json.loads(res_p.stdout)["agent"]["role"], "reviewer")
+        # Scoped agent cannot downgrade its own role via Reverse MCP/HTTP register/resume
+        c_sc, b_sc = http_raw(
+            f"{prov_rev['agent_http_url']}/agent/register",
+            method="POST",
+            body={"agent_id": "rev-p", "role": "worker"},
+        )
+        self.assertEqual(c_sc, 200, b_sc)
+        self.assertEqual(json.loads(b_sc)["agent"]["role"], "reviewer")
+
+        # 4) --require-astra-ack enforced on reply, checkpoint, hibernate; inline profile_sha unlocks
+        self.register_agent("ack-r", dot="DOT-A")
+        self.assertEqual(
+            cli_run(["contract", "set", "ack-r", "--require-astra-ack", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        rr = json.loads(cli_run(["agent", "resume", "ack-r", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        ep_a, tok_a = rr["epoch"], rr["session_token"]
+        sha_a = rr["astra_profile"]["sha256"]
+        for path, body in (
+            ("/agent/reply", {"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "kind": "result", "task": "T", "text": "ok", "refs": ["src/mod.py:1"]}),
+            ("/agent/checkpoint", {"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "phase": "p1"}),
+            ("/agent/hibernate", {"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "summary": "s"}),
+        ):
+            code, resp = http_raw(f"{rt['http_url']}{path}", method="POST", body=body)
+            self.assertEqual(code, 409, (path, resp))
+            self.assertEqual(json.loads(resp)["code"], "ASTRA_PROFILE_ACK_REQUIRED")
+        c_rep_ok, b_rep_ok = http_raw(
+            f"{rt['http_url']}/agent/reply",
+            method="POST",
+            body={"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "kind": "result", "task": "T", "text": "ok", "refs": ["src/mod.py:1"], "profile_sha": sha_a},
+        )
+        self.assertEqual(c_rep_ok, 200, b_rep_ok)
+        self.assertEqual(
+            http_raw(f"{rt['http_url']}/agent/checkpoint", method="POST", body={"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "phase": "p2"})[0],
+            200,
+        )
+        self.assertEqual(
+            http_raw(f"{rt['http_url']}/agent/hibernate", method="POST", body={"agent_id": "ack-r", "epoch": ep_a, "session_token": tok_a, "summary": "done"})[0],
+            200,
+        )
+
+        # 5) local_brief & HTTP error responses redact secrets
+        self.register_agent("sec-w", dot="DOT-A")
+        self.assertEqual(
+            cli_run(["send", "sec-w", "task", "T-SEC sk-mysecretapikey123456", "--text", "Bearer secretbearertoken123456", "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        brief_res = cli_run(["brief", "sec-w", "--state-dir", self.state_dir, "--json"], self.state_dir)
+        self.assertNotIn("sk-mysecretapikey123456", brief_res.stdout)
+        c_err, b_err = http_raw(
+            f"{rt['http_url']}/agent/register",
+            method="POST",
+            body={"agent_id": "bad agent sk-leaktestvalue123456"},
+        )
+        self.assertEqual(c_err, 400)
+        self.assertNotIn("sk-leaktestvalue123456", b_err)
+
+        # 6) normalize_astra_role boundary checks
+        for name in ("vqa-training", "square", "coordinate-solver", "discord"):
+            self.assertEqual(sd.normalize_astra_role(name), "worker", name)
+        for name in ("visual-qa", "code-reviewer", "감사담당"):
+            self.assertEqual(sd.normalize_astra_role(name), "reviewer", name)
+
+    def test_hook_pause_rollover_unwritable_dir_wal_guard_xml_quote_and_pre_v12_db(self):
+        # 1) Mode 2 subagent-stop stops cleanly on paused and rollover_ready, and never loops on 0o500 dir or symlinked hook_state
+        self.start_hub()
+        reg = self.register_agent("hk-w")
+        ep, tok = reg["epoch"], reg["session_token"]
+        self.assertEqual(cli_run(["send", "hk-w", "task", "T1", "--text", "work", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        self.assertEqual(cli_run(["pause", "hk-w", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        s_paused = json.loads(cli_run(["hook", "subagent-stop", "--agent", "hk-w", "--state-dir", self.state_dir], self.state_dir, stdin_text="{}").stdout)
+        self.assertEqual(s_paused, {})
+
+        self.assertEqual(cli_run(["resume", "hk-w", "--state-dir", self.state_dir], self.state_dir).returncode, 0)
+        self.assertEqual(
+            http_raw(
+                f"{sd.read_runtime(self.state_dir)['http_url']}/agent/checkpoint",
+                method="POST",
+                body={"agent_id": "hk-w", "epoch": ep, "session_token": tok, "phase": "handoff", "next_action": "resume", "ready_for_rollover": True},
+            )[0],
+            200,
+        )
+        s_ro = json.loads(cli_run(["hook", "subagent-stop", "--agent", "hk-w", "--state-dir", self.state_dir], self.state_dir, stdin_text="{}").stdout)
+        self.assertEqual(s_ro, {})
+
+        # Unwritable 0o500 state_dir or symlinked hook_state.json never emits continue
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        ro_ops = os.path.join(self._tmp.name, "ro-ops")
+        ro_dir = os.path.join(ro_ops, "loops", "DOT-RO")
+        os.makedirs(ro_dir, exist_ok=True)
+        d.write_atomic(os.path.join(ro_dir, "t.state.json"), json.dumps({"v": 1, "active": {"id": 'a"quote'}}) + "\n")
+        d.write_atomic(os.path.join(ro_dir, "t.contract.json"), json.dumps({"v": 1, "dot": "DOT-RO", "track": "t", "project": "p", "continuous": True}) + "\n")
+
+        # Attribute quote escaped + stdin opsBase ignored + stdin role cannot override loop role
+        st_quote = json.loads(
+            cli_run(
+                ["hook", "subagent-start", "--ops-base", ro_ops, "--dot", "DOT-RO", "--track", "t", "--state-dir", self.state_dir],
+                self.state_dir,
+                stdin_text=json.dumps({"opsBase": "/tmp/evil", "role": "worker"}),
+            ).stdout
+        )["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("active=\"a'quote\"", st_quote)
+
+        unwritable_state = os.path.join(self._tmp.name, "unwritable-state")
+        os.makedirs(unwritable_state, mode=0o700, exist_ok=True)
+        os.chmod(unwritable_state, 0o500)
+        try:
+            s_unw = json.loads(
+                cli_run(
+                    ["hook", "subagent-stop", "--ops-base", ro_ops, "--dot", "DOT-RO", "--track", "t", "--state-dir", unwritable_state],
+                    unwritable_state,
+                    stdin_text="{}",
+                ).stdout
+            )
+            self.assertEqual(s_unw, {})
+        finally:
+            os.chmod(unwritable_state, 0o700)
+
+        sym_hs_dir = os.path.join(self._tmp.name, "sym-hs-state")
+        os.makedirs(sym_hs_dir, mode=0o700, exist_ok=True)
+        os.symlink(os.path.join(self._tmp.name, "elsewhere.json"), os.path.join(sym_hs_dir, "hook_state.json"))
+        s_sym = json.loads(
+            cli_run(
+                ["hook", "subagent-stop", "--ops-base", ro_ops, "--dot", "DOT-RO", "--track", "t", "--state-dir", sym_hs_dir],
+                sym_hs_dir,
+                stdin_text="{}",
+            ).stdout
+        )
+        self.assertEqual(s_sym, {})
+
+        # 2) Pre-v1.2 DB (no rollover_requested_at in agents, no require_readback in messages) + symlinked -wal guard
+        pre12_dir = os.path.join(self._tmp.name, "pre12-state")
+        os.makedirs(pre12_dir, mode=0o700, exist_ok=True)
+        pre12_db = os.path.join(pre12_dir, "subdots.sqlite")
+        conn = sqlite3.connect(pre12_db)
+        now = sd.utc_now_ts()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE agents (agent_id TEXT PRIMARY KEY, dot TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, task TEXT NOT NULL, epoch INTEGER NOT NULL, spin_strikes INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL);
+                CREATE TABLE contracts (agent_id TEXT PRIMARY KEY, goal TEXT NOT NULL);
+                CREATE TABLE messages (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, direction TEXT NOT NULL, delivery_state TEXT NOT NULL, kind TEXT NOT NULL, task TEXT NOT NULL, created_at REAL NOT NULL);
+                """
+            )
+            conn.execute("INSERT INTO agents VALUES ('old-w', 'DOT', 'worker', 'working', 't', 1, 0, ?)", (now,))
+            conn.execute("INSERT INTO messages VALUES ('m-old-1', 'old-w', 'to_agent', 'queued', 'steer', 'fix', ?)", (now,))
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(pre12_db, 0o600)
+
+        snap12 = sd._hook_read_snapshot(pre12_dir)
+        self.assertTrue(snap12["db_exists"])
+        self.assertEqual(len(snap12["agents"]), 1)
+        hs12 = sd._hook_read_subagent_hub(pre12_dir, agent_id="old-w")
+        self.assertTrue(hs12["db_exists"])
+        self.assertEqual(len(hs12["pending_to_agent"]), 1)
+
+        os.symlink(os.path.join(self._tmp.name, "wal_target"), pre12_db + "-wal")
+        self.assertFalse(sd._hook_read_snapshot(pre12_dir)["db_exists"])
+        self.assertFalse(sd._hook_read_subagent_hub(pre12_dir, agent_id="old-w")["db_exists"])
+
+    def test_round2_security_containment_redaction_and_hook_guards(self):
+        # H-1: contractless --role reviewer & contract omitting --astra-role enforce read-only
+        ws_git = os.path.join(self._tmp.name, "r2-git-ws")
+        _init_git_repo(ws_git, {"src/a.py": "X = 1\n"})
+        self.start_hub(extra_args=["--enable-tool-proxy"])
+        rt = sd.read_runtime(self.state_dir)
+
+        rev_less = self.register_agent("r2-contractless", role="reviewer")
+        ep0, tok0 = rev_less["epoch"], rev_less["session_token"]
+        c_ex0, b_ex0 = http_raw(
+            f"{rt['http_url']}/agent/exec/start",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "cmd": "echo hi", "cwd": ws_git},
+        )
+        self.assertEqual(c_ex0, 403, b_ex0)
+        self.assertEqual(json.loads(b_ex0)["code"], "SCOPE_VIOLATION")
+
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "r2-contractless", "--workspace", ws_git, "--enable-tools", "--allow-cmd-prefix", "git diff", "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        c_p0, b_p0 = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "path": "src/a.py", "target": "X = 1", "replacement": "X = 2"},
+        )
+        self.assertEqual(c_p0, 403, b_p0)
+
+        # H-2: read-only allowed_cmd_prefixes blocks dangerous flags, bundled interp flags, attached paths, symlink escapes, and git mutators
+        esc_link = os.path.join(ws_git, "escape_dir")
+        os.symlink("/etc", esc_link)
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "r2-contractless", "--workspace", ws_git, "--enable-tools",
+                 "--allow-cmd-prefix", "git", "--allow-cmd-prefix", "grep", "--allow-cmd-prefix", sys.executable,
+                 "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        for ro_bad in (
+            ["node", "-pe", "process.exit(1)"],
+            ["awk", "BEGIN{system(\"id\")}", "src/a.py"],
+        ):
+            self.assertIsNotNone(
+                sd.check_cmd_policy(
+                    " ".join(ro_bad),
+                    ws_git,
+                    {"workspace_root": ws_git, "allowed_cmd_prefixes": [ro_bad[0]]},
+                    read_only=True,
+                    argv=ro_bad,
+                )
+            )
+        for bad_argv in (
+            ["git", "diff", "--output=/tmp/evil.txt"],
+            ["git", "diff", "--no-index", "/dev/null", "/etc/hosts"],
+            ["git", "diff", ".."],
+            ["git", "bundle", "create", "out.bundle", "HEAD"],
+            ["git", "update-ref", "refs/heads/pwn", "HEAD"],
+            ["grep", "-f/etc/passwd", "x"],
+            ["grep", "x", "escape_dir/nonexistent_target"],
+            [sys.executable, "-Bm", "venv", "evil_venv"],
+            [sys.executable, "-Bc", "print(1)"],
+        ):
+            c_bad, b_bad = http_raw(
+                f"{rt['http_url']}/agent/tool/exec",
+                method="POST",
+                body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "argv": bad_argv},
+            )
+            self.assertEqual(c_bad, 403, (bad_argv, b_bad))
+        os.unlink(esc_link)
+        c_gbad, b_gbad = http_raw(
+            f"{rt['http_url']}/agent/gate-check",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "action": "exec", "cmd": "git diff --output=src/out.txt", "cwd": ws_git},
+        )
+        self.assertEqual(c_gbad, 403, b_gbad)
+        c_gmissing, _ = http_raw(
+            f"{rt['http_url']}/agent/gate-check",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "action": "exec", "cwd": ws_git},
+        )
+        self.assertEqual(c_gmissing, 403)
+        c_gok, b_gok = http_raw(
+            f"{rt['http_url']}/agent/tool/exec",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "argv": ["git", "diff", "--stat", "src/a.py"]},
+        )
+        self.assertEqual(c_gok, 200, b_gok)
+
+        # H-2 non-git workspace: regular file & dir symlink creation during allowlisted tool_exec flags observed_dirty_json and blocks read-only done
+        ws_nongit = os.path.join(self._tmp.name, "r2-nongit")
+        os.makedirs(ws_nongit, exist_ok=True)
+        pathlib.Path(os.path.join(ws_nongit, "mod.py")).write_text(
+            "import os, pathlib; pathlib.Path('created.txt').write_text('dirty'); os.symlink('/tmp', 'dlink')\n", encoding="utf-8"
+        )
+        self.register_agent("r2-nongit-ro", role="reviewer")
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "r2-nongit-ro", "--astra-role", "reviewer", "--workspace", ws_nongit, "--enable-tools", "--allow-cmd-prefix", f"{sys.executable} -B mod.py", "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        rn = json.loads(cli_run(["agent", "resume", "r2-nongit-ro", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        ep_n, tok_n = rn["epoch"], rn["session_token"]
+        self.assertEqual(
+            http_raw(
+                f"{rt['http_url']}/agent/tool/exec",
+                method="POST",
+                body={"agent_id": "r2-nongit-ro", "epoch": ep_n, "session_token": tok_n, "argv": [sys.executable, "-B", "mod.py"]},
+            )[0],
+            200,
+        )
+        c_done_ng, b_done_ng = http_raw(
+            f"{rt['http_url']}/agent/step",
+            method="POST",
+            body={"agent_id": "r2-nongit-ro", "epoch": ep_n, "session_token": tok_n, "state": "done", "task": "T1", "note": "n", "evidence": "e", "goal": "g", "doing": "d", "next_step": "n"},
+        )
+        self.assertEqual(c_done_ng, 409, b_done_ng)
+        self.assertIn("created.txt", b_done_ng)
+        self.assertIn("dlink", b_done_ng)
+
+        # M-1/M-2: Front-truncated PGP/PEM in subdots + HubError / 404 / ControlSocket / mcp-stdio redaction
+        self.assertNotIn("=AbCd", sd.redact("ABCDEFGH12345678\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\n"))
+        self.assertNotIn("sk-ctrlsecret123456", sd._redact_obj({"msg": "sk-ctrlsecret123456"})["msg"])
+        c404, b404 = http_raw(f"{rt['http_url']}/agent/sk-secretroute123456", method="POST", body={})
+        self.assertEqual(c404, 404)
+        self.assertNotIn("sk-secretroute123456", b404)
+        c_hberr, b_hberr = http_raw(
+            f"{rt['http_url']}/agent/tool/patch",
+            method="POST",
+            body={"agent_id": "r2-contractless", "epoch": ep0, "session_token": tok0, "path": "sk-secretpath123456", "target": "a", "replacement": "b"},
+        )
+        self.assertEqual(c_hberr, 403)
+        self.assertNotIn("sk-secretpath123456", b_hberr)
+        try:
+            sd.control_rpc(self.state_dir, "agent.get", {"agent_id": "sk-ctrlsecret123456"})
+        except sd.HubError as exc:
+            self.assertNotIn("sk-ctrlsecret123456", exc.message)
+        mcp_err = subprocess.run(
+            [sys.executable, "-B", os.path.join(TOOLS_DIR, "subdots.py"), "mcp-stdio", "--state-dir", os.path.join(self._tmp.name, "no-such-hub")],
+            input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "subdots_astra_profile", "arguments": {"role": "sk-mcpsecret123456"}}}) + "\n",
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotIn("sk-mcpsecret123456", mcp_err.stdout)
+
+        # M-4: Scoped /a/<token> cannot overwrite dot/project/role, reserved project rejected, stdin mode ignored
+        prov = json.loads(cli_run(["provision", "r2-sc", "--dot", "DOT-LOCK", "--project", "projlock", "--role", "reviewer", "--show-token", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        c_sc, b_sc = http_raw(
+            f"{prov['agent_http_url']}/agent/register",
+            method="POST",
+            body={"agent_id": "r2-sc", "dot": "DOT-EVIL", "project": "projevil", "role": "worker"},
+        )
+        self.assertEqual(c_sc, 200, b_sc)
+        sc_doc = json.loads(b_sc)["agent"]
+        self.assertEqual(sc_doc["dot"], "DOT-LOCK")
+        self.assertEqual(sc_doc["project"], "projlock")
+        self.assertEqual(sc_doc["role"], "reviewer")
+        c_resv, _ = http_raw(
+            f"{rt['http_url']}/agent/register",
+            method="POST",
+            body={"agent_id": "r2-badproj", "project": "live"},
+        )
+        self.assertEqual(c_resv, 400)
+
+        st_mode = json.loads(
+            cli_run(["hook", "subagent-start", "--agent", "r2-sc", "--state-dir", self.state_dir], self.state_dir, stdin_text=json.dumps({"mode": "dots-only"})).stdout
+        )["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn('mode="sub-dots"', st_mode)
+
+        # M-3 & rollover message suppression: 0o755 untrusted state_dir never gets hook_state.lock on pre-invocation; rollover_ready hides ROLLOVER_PREPARE
+        ep_s = json.loads(b_sc)["epoch"]
+        tok_s = json.loads(b_sc)["session_token"]
+        self.assertEqual(
+            http_raw(
+                f"{rt['http_url']}/agent/checkpoint",
+                method="POST",
+                body={"agent_id": "r2-sc", "epoch": ep_s, "session_token": tok_s, "phase": "handoff", "next_action": "rollover", "ready_for_rollover": True},
+            )[0],
+            200,
+        )
+        st_ro_msg = json.loads(
+            cli_run(["hook", "subagent-start", "--agent", "r2-sc", "--state-dir", self.state_dir], self.state_dir, stdin_text="{}").stdout
+        )["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertNotIn("ROLLOVER_PREPARE", st_ro_msg)
+
+        untrusted_dir = os.path.join(self._tmp.name, "untrusted-0755")
+        os.makedirs(untrusted_dir, mode=0o755, exist_ok=True)
+        os.chmod(untrusted_dir, 0o755)
+        pre_u = cli_run(
+            ["hook", "subagent-pre-invocation", "--state-dir", untrusted_dir],
+            untrusted_dir,
+            stdin_text=json.dumps({"conversationId": "c-unt"}),
+        )
+        self.assertEqual(pre_u.returncode, 0, pre_u.stderr)
+        self.assertFalse(os.path.exists(os.path.join(untrusted_dir, "hook_state.lock")))
+
+        # Round-4 closures:
+        # 1) --read-only + --astra-role worker aligns Hub AND Hook on reviewer/read_only and accepts reviewer ACK
+        cli_run(["hub", "stop", "--state-dir", self.state_dir], self.state_dir)
+        self.start_hub(extra_args=["--enable-tool-proxy", "--require-astra-ack"])
+        rt2 = sd.read_runtime(self.state_dir)
+        rev_mix = self.register_agent("r4-mix", dot="DOT-MIX")
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "r4-mix", "--astra-role", "worker", "--read-only", "--require-astra-ack",
+                 "--workspace", ws_git, "--enable-tools", "--allow-cmd-prefix", "grep", "--allow-cmd-prefix", "awk",
+                 "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        res_mix = json.loads(cli_run(["agent", "resume", "r4-mix", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        ep_m, tok_m = res_mix["epoch"], res_mix["session_token"]
+        self.assertEqual(res_mix["astra_profile"]["role"], "reviewer")
+        self.assertTrue(res_mix["astra_profile"]["read_only"])
+        st_mix = json.loads(
+            cli_run(
+                ["hook", "subagent-start", "--agent", "r4-mix", "--state-dir", self.state_dir],
+                self.state_dir,
+                stdin_text=json.dumps({"track": "evil-track"}),
+            ).stdout
+        )["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn('mode="sub-dots"', st_mix)
+        self.assertIn('role="reviewer"', st_mix)
+        self.assertIn('read_only="true"', st_mix)
+        self.assertIn(res_mix["astra_profile"]["sha256"], st_mix)
+        self.assertEqual(
+            cli_run(["agent", "ack", "r4-mix", "--profile-sha", res_mix["astra_profile"]["sha256"], "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        st_stop_mix = json.loads(
+            cli_run(["hook", "subagent-stop", "--agent", "r4-mix", "--state-dir", self.state_dir], self.state_dir, stdin_text="{}").stdout
+        )
+        self.assertNotIn("astra_profile_ack_required", st_stop_mix.get("reason", ""))
+
+        # 2) awk 'system ("id")', awk -f, grep -nf/etc/passwd, and cwd="sub" relative symlink escapes blocked
+        sub_dir = os.path.join(ws_git, "sub")
+        os.makedirs(sub_dir, exist_ok=True)
+        os.symlink("/etc", os.path.join(sub_dir, "sub_esc"))
+        os.symlink("/etc/passwd", os.path.join(sub_dir, "secret_link"))
+        for r4_cwd, r4_argv in (
+            (ws_git, ["awk", 'BEGIN { system ("id") }', "src/a.py"]),
+            (ws_git, ["awk", "-f", "prog.awk", "src/a.py"]),
+            (ws_git, ["awk", "-v", "p=/etc/passwd", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "--assign=p=/etc/passwd", "BEGIN{print p}1", "src/a.py"]),
+            (ws_git, ["awk", 'BEGIN{ARGV[ARGC++]="/etc/passwd"}1']),
+            (ws_git, ["awk", "--profile", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "-d", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "--dump-variables", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "--pretty-print", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "-W", "exec=prog.awk", "src/a.py"]),
+            (ws_git, ["awk", "--lo=inplace", "{print}", "src/a.py"]),
+            (ws_git, ["awk", "--fi=src/a.py", "src/a.py"]),
+            (ws_git, ["grep", "-nf/etc/passwd", "x"]),
+            (ws_git, ["grep", "-e", "pat 'x", "/etc/passwd", "y'"]),
+            ("sub", ["grep", "root", "sub_esc/passwd"]),
+            ("sub", ["grep", "root", "secret_link"]),
+        ):
+            c_r4, b_r4 = http_raw(
+                f"{rt2['http_url']}/agent/tool/exec",
+                method="POST",
+                body={"agent_id": "r4-mix", "epoch": ep_m, "session_token": tok_m, "cwd": r4_cwd, "argv": r4_argv},
+            )
+            self.assertEqual(c_r4, 403, (r4_cwd, r4_argv, b_r4))
+        for raw_cmd_str in (
+            "grep -e pat 'x /etc/passwd y'",
+            "grep pat token=/etc/passwd",
+            "grep -e 'pat -f/etc/passwd'",
+            "grep -e 'pat v=/etc/passwd'",
+            'grep -e "pat \'/etc/passwd\'"',
+        ):
+            c_es, b_es = http_raw(
+                f"{rt2['http_url']}/agent/exec/start",
+                method="POST",
+                body={"agent_id": "r4-mix", "epoch": ep_m, "session_token": tok_m, "cmd": raw_cmd_str, "cwd": ws_git},
+            )
+            self.assertEqual(c_es, 403, (raw_cmd_str, b_es))
+        ex_cli_q = cli_run(
+            ["agent", "exec", "r4-mix", "--cwd", ws_git, "--state-dir", self.state_dir, "--", "grep", "-e", "pat 'x", "/etc/passwd", "y'"],
+            self.state_dir,
+        )
+        self.assertEqual(ex_cli_q.returncode, 2, ex_cli_q.stderr)
+        self.assertIn("CWD_OUTSIDE_WORKSPACE", ex_cli_q.stderr)
+
+        # 3) forbidden_cmds-only gate-check(action=exec) without cmd rejected; unpadded short tail & >64KiB PEM & footer pause + CLI redaction
+        self.register_agent("r4-forb")
+        self.assertEqual(
+            cli_run(
+                ["contract", "set", "r4-forb", "--workspace", ws_git, "--forbid-cmd", "rm", "--state-dir", self.state_dir],
+                self.state_dir,
+            ).returncode,
+            0,
+        )
+        res_f = json.loads(cli_run(["agent", "resume", "r4-forb", "--state-dir", self.state_dir, "--json"], self.state_dir).stdout)
+        self.assertEqual(
+            cli_run(["agent", "ack", "r4-forb", "--profile-sha", res_f["astra_profile"]["sha256"], "--state-dir", self.state_dir], self.state_dir).returncode,
+            0,
+        )
+        c_forb, b_forb = http_raw(
+            f"{rt2['http_url']}/agent/gate-check",
+            method="POST",
+            body={"agent_id": "r4-forb", "epoch": res_f["epoch"], "session_token": res_f["session_token"], "action": "exec", "cwd": ws_git},
+        )
+        self.assertEqual(c_forb, 403, b_forb)
+        self.assertNotIn("ABCD\n", sd.redact("HEAD_KEEP\nABCDEFGH12345678\nABCD\n-----END PRIVATE KEY-----\nTAIL_KEEP"))
+        self.assertIn("TAIL_KEEP", sd.redact("HEAD_KEEP\nABCDEFGH12345678\nABCD\n-----END PRIVATE KEY-----\nTAIL_KEEP"))
+        aq_red = sd.redact("ABCDEFGH12345678\nAQ==\n-----END PRIVATE KEY-----\nAFTER_AQ")
+        self.assertIn("[REDACTED_PRIVATE_KEY]", aq_red)
+        self.assertNotIn("AQ==", aq_red)
+        self.assertNotIn("ABCDEFGH12345678", aq_red)
+        self.assertIn("AFTER_AQ", aq_red)
+        over64k = "-----BEGIN PRIVATE KEY-----\n" + (("A" * 64 + "\n") * 1100) + "ABCD\n-----END PRIVATE KEY-----\nTAIL_64K"
+        red_64k = sd.redact(over64k)
+        self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", red_64k)
+        self.assertNotIn("\nABCD\n", red_64k)
+        self.assertIn("TAIL_64K", red_64k)
+        front_pgp_unp = "PRE_PGP\n" + ("ABCDEFGH12345678\n" * 2) + "ABCD\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST_PGP"
+        red_fpu = sd.redact(front_pgp_unp)
+        self.assertNotIn("ABCDEFGH12345678", red_fpu)
+        self.assertNotIn("\nABCD\n", red_fpu)
+        self.assertNotIn("=AbCd", red_fpu)
+        self.assertIn("PRE_PGP", red_fpu)
+        self.assertIn("POST_PGP", red_fpu)
+        over64_pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + (("A" * 64 + "\n") * 1100) + "ABCD\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_PGP64"
+        red_64p = sd.redact(over64_pgp)
+        self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", red_64p)
+        self.assertNotIn("\nABCD\n", red_64p)
+        self.assertNotIn("=AbCd", red_64p)
+        self.assertIn("TAIL_PGP64", red_64p)
+        front_pgp_pad = "PRE_PGP\n" + ("MIIEowIBAAKCAQEA\n" * 2) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST_PGP"
+        red_fpp = sd.redact(front_pgp_pad)
+        self.assertNotIn("MIIEowIBAAKCAQEA", red_fpp)
+        self.assertNotIn("AQ==", red_fpp)
+        self.assertNotIn("=AbCd", red_fpp)
+        self.assertIn("PRE_PGP", red_fpp)
+        self.assertIn("POST_PGP", red_fpp)
+        over64_pad = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + (("A" * 64 + "\n") * 1100) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_64PAD"
+        red_64pad = sd.redact(over64_pad)
+        self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", red_64pad)
+        self.assertNotIn("AQ==", red_64pad)
+        self.assertNotIn("=AbCd", red_64pad)
+        self.assertIn("TAIL_64PAD", red_64pad)
+        self.assertEqual(sd.format_steering_footer([], {"state": "paused", "rollover_requested_at": 1.0}, ""), "")
+        cli_secret = cli_run(
+            ["agent", "step", "sk-clierrorsecret123456", "doing", "--task", "T", "--state-dir", self.state_dir],
+            self.state_dir,
+        )
+        self.assertNotEqual(cli_secret.returncode, 0)
+        self.assertNotIn("sk-clierrorsecret123456", cli_secret.stderr)
 
 
 if __name__ == "__main__":

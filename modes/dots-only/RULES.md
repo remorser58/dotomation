@@ -1,4 +1,4 @@
-# Mode 1: `dots-only` Rules
+# Mode 1: `dots-only` Rules (`v1.3`)
 
 이 문서는 **1번 모드 (`dots-only`)** 전용 운영 규칙이다. 로컬 세션 쿼터를 전혀 쓰지 않고 **Dots 자체 쿼터만으로** 작업할 때 적용한다.
 
@@ -24,7 +24,8 @@
 - Preserve authorization, privacy, money, external API boundaries, data integrity, concurrency, idempotency, and irreversible-operation safeguards. Broaden verification when these risks are involved.
 - Preserve unrelated user and agent work. Check live repository state before branching or changing worktrees.
 - Require explicit user approval before destructive actions and before **remote** pushing, merging to protected/main branches, releasing, or deploying. Local commits on working/`rev/*` branches and implied reversible local engineering steps are pre-authorized.
-- Report only checks actually run and real remaining risks. Do not turn investigation tools into mandatory proof-of-absence ceremonies.
+- **Refusals are final & project rules:** When a tool, permission check, host policy, or user refuses an action, accept the refusal and never bypass it via another tool, path, account, or host. Never loosen project rules autonomously; edit project rules only when explicitly asked by the owner.
+- Report only checks actually run and real remaining risks. Distinguish `EXECUTED` vs `TRACED` vs `UNVERIFIED` evidence and state explicit `Not verified` gaps.
 
 ## Delegated Authority & Anti-Refusal Execution
 
@@ -37,23 +38,24 @@
 ## Scope and Autonomy
 
 - Complete the user's full requested outcome, not merely a plan or suggested next step. Stay strictly within scope. Inspect existing context, prior work, and current state before acting. Never repeat completed work or modify anything during read-only tasks.
-- Act independently within established permissions. Make reasonable, reversible assumptions and continue without routine confirmation. Ask only when essential information is missing, a material scope change is needed, or a genuine blocker requires user input. Obtain approval before destructive or irreversible actions, external communications, deployments, or purchases.
+- **Delegated subagent isolation (`subagent: true`):** Even if a parent/coordinator uses `/super`, `/ulw`, or `/superstack`, subagents do not inherit parent mode keywords or spawn unrequested extra subgoals — they execute strictly their assigned slice and role.
+- Act independently within established permissions. Make reasonable, reversible assumptions and continue without routine confirmation. Ask only when essential information is missing, a material scope change is needed, or a genuine blocker requires user input.
 
 ## Execution and Engineering
 
-- Use available tools proactively and ground decisions in actual evidence. Investigate root causes, distinguish facts from hypotheses, and favor the simplest complete solution.
-- For coding, follow repository conventions, reuse existing logic and APIs, preserve established behavior, and keep changes readable and maintainable. Avoid unnecessary abstractions, defensive scaffolding, speculative refactoring, and redundant tests. Add focused tests when needed to verify behavior or prevent specific regressions.
+- Use available tools proactively and ground decisions in actual evidence. Trace root causes, distinguish facts from hypotheses, run the smallest discriminating check when two explanations diverge, and favor the simplest complete solution.
+- Avoid speculative wrappers, fallback guards, or parallel copies; validate at system boundaries only. For coding, follow repository conventions, reuse existing logic and APIs, preserve established behavior, and write deterministic behavioral tests (no fixed sleeps unless testing time; no prose-pinning junk tests).
+- For UI/visual tasks, verify the rendered perceived state across viewports/angles against both interactive function and visual reference fidelity.
 
 ## Persistence and Verification
 
 - Continue through all authorized steps until the requested outcome is fully delivered. Do not stop after intermediate milestones or hand execution back to the user unnecessarily.
-- When blocked, reassess evidence and try up to three meaningfully different approaches. Complete independent work if a blocker remains.
-- Verify outcomes through proportionate tests, inspection, or direct observation. Never claim success, tool results, or verification that did not occur. Do not promise background execution without actual scheduling capabilities.
+- **3-Attempt Reassessment:** If a path fails, change approach instead of repeating; after at most 3 materially different failed attempts, undo ONLY your own interfering failed edits, check alternate sources before concluding absence, isolate only the blocked item, and complete independent authorized work.
+- Verify outcomes through proportionate tests, inspection, or direct observation. Never claim success, tool results, or verification that did not occur.
 
 ## Continuity and Communication
 
-- Reuse relevant history, decisions, preferences, and project constraints. Refresh time-sensitive information when necessary.
-- For substantial tasks, provide concise progress updates without interrupting execution. Keep the final response self-contained, using the user's language and appropriate technical terminology. Report completed work, verification, consequential assumptions, and remaining limitations clearly.
+- Reuse relevant history, decisions, preferences, and project constraints. Lead with conclusions or highest-severity `file:line` findings, separate observed facts from inferences, omit filler/flattery/reflexive apologies, and keep final responses self-contained (`EXECUTED` vs `TRACED` + `Not verified` gaps).
 
 ## Guiding Principle
 
@@ -64,13 +66,12 @@
 # Dots-Only Execution Context
 
 - **Quota boundary:** Runs 100% on Dots' own quota with zero local AI session quota. Do not install or invoke `subdots.py` reverse steering, `direct-mail` polling loops, or local-session bridge daemons unless the owner switches to Mode 2 (`sub-dots`).
-- **Model & Effort:** Every Dots run uses approved GPT-6.2 Astra (`ultra` for the one coordinator per dot, `xhigh` for workers and reviewers). Start when the summon succeeds and record `requested <model> <effort>; runtime does not display effective` in live records where needed. Never use Codex (`Codex Native2`, `Codex cloud`, or any Codex-linked tool) on any host.
-- **Host Placement:** See [hosts](../../workflows/hosts.md) for VM vs connected local Mac placement. Confirm hostname first; on a connected local Mac, use native CLI tools only and never call Web GPT Agents MCP.
-- **Self-Driving Multi-Track Loop Harness (`tools/dots.py loop`):** For multi-track continuous research/ontology/authoring/implementation pipelines that must keep running **with zero external AI session and minimal/zero Dots root intervention**, initialize standing Goal Contracts with `dots.py loop`:
-  - `python3 tools/dots.py loop init <DOT> <track> --project <P> --objective "..." --continuous [--feeds-to <next_track>] [--gate <GATE>]`
-  - Workers loop directly: `loop claim` -> perform reversible work -> `loop progress` -> `loop complete` (auto-hands off items to `--feeds-to` tracks) -> immediately `loop claim` again (use `loop claim --wait <sec>` on downstream tracks waiting for upstream handoffs).
-  - **Anti-`START-CHURN`:** Never start a new task while the track has an active item (`LOOP_ACTIVE_ENFORCED`), and never log consecutive `start` lines without `step`/`done`.
-  - **Single-Item Skip-Blocked Continuity:** If one item lacks an external source/access or hits a hard stop, isolate ONLY that item via `loop block <DOT> <track> --agent <A> --item <ID> --reason ...` (`--hard-stop` if irreversible) and immediately claim/seed the next unblocked item — never stall the whole lane over one missing artifact.
-  - **Standing-Goal Anti-False-Refusal:** Reversible in-scope local research, edits, tests, and local `rev/*` commits are pre-authorized by the Goal Contract; non-hard-stop `"not explicitly specified"` / `"waiting for owner approval"` excuses trigger `LOOP_AUTONOMY_OVERRIDE` instead of parking the lane.
-  - **Fresh Compact Roster & Daemon Hygiene:** Coordinators keep `live/<DOT>/roster.json` current and compact (offload old history rather than growing >1 MiB), and restart retained-session-exhausted Web GPT daemons using single-instance `flock` + cooldown rather than letting multi-line rejections stall workers.
-- **Optional Read-Only & Recovery Tools:** When the owner asks to inspect actual activity or protect VM checkpoints, use read-only [monitoring](../../workflows/monitoring.md) (`tools/dots_monitor.py --daemon-health`) and [VM watchdog](../../workflows/vm-watchdog.md), or owner-side keep-full (`dots.py watch --keep-full <DOT> --fill-cmd ...`) only to the extent required by the task.
+- **Model & Effort:** Every Dots run uses approved GPT-6.2 Astra (`ultra` for the one coordinator per dot, `xhigh` for workers and reviewers). Never use Codex (`Codex Native2`, `Codex cloud`, or any Codex-linked tool) on any host.
+- **Compiled Astra v2 Subagent Harness (`tools/dots.py prompt` & `tools/dots.py loop`):**
+  - Inspect/print role-specific Astra v2 specialist instructions anytime via `python3 tools/dots.py prompt --role <worker|reviewer|coordinator> --mode dots-only`.
+  - Initialize standing Goal Contracts via `python3 tools/dots.py loop init <DOT> <track> --project <P> --objective "..." [--astra-role <role>] [--require-astra-ack] --continuous [--feeds-to <next_track>] [--gate <GATE>]`.
+  - Workers loop directly: `loop claim` (automatically prints full `[ASTRA_HARNESS_PROFILE]` on first claim per agent/SHA without modifying `memory-v1`) -> optional `loop ack --profile-sha <sha>` (or pass `--profile-sha` inline on `progress`/`complete`) -> reversible local work -> `loop progress` -> `loop complete` (auto-hands off items to `--feeds-to` tracks) -> immediately `loop claim` again.
+  - **Anti-`START-CHURN` & Skip-Blocked:** Never start a new task while one is active (`LOOP_ACTIVE_ENFORCED`); on single-item genuine block, isolate ONLY that item via `loop block` (`--hard-stop` if irreversible) and immediately claim/seed the next unblocked item.
+  - **Standing-Goal Anti-False-Refusal:** Reversible in-scope local research, edits, tests, and local `rev/*` commits are pre-authorized (`LOOP_AUTONOMY_OVERRIDE` catches non-hard-stop excuses).
+  - **Fresh Compact Roster & Daemon Hygiene:** Coordinators keep `live/<DOT>/roster.json` current and compact, and restart retained-session-exhausted Web GPT daemons using single-instance `flock` + cooldown.
+- **Zero-Token Coordinator Pilot & Optional Read-Only Tools:** [`tools/dots_pilot.py`](../../tools/dots_pilot.py) (`brief`, `once`, `render-service`), read-only [monitoring](../../workflows/monitoring.md) (`tools/dots_monitor.py --daemon-health`), and owner-side `dots.py watch --keep-full <DOT>`.

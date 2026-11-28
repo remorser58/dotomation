@@ -573,7 +573,7 @@ class DotsPilotTests(unittest.TestCase):
 
             # Version alignment, ANSI/quoted/PGP redaction, systemd escaping & injection block,
             # non-dict/corrupt JSON guards, and read-only status
-            self.assertEqual(dp.VERSION, "1.2.1")
+            self.assertEqual(dp.VERSION, "1.3.0")
             self.assertEqual(dp._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
             self.assertEqual(dp._redact_text('API_KEY="tok part2 secret"'), "[REDACTED]")
             self.assertEqual(
@@ -678,6 +678,146 @@ class DotsPilotTests(unittest.TestCase):
         finally:
             if tmp_pilot_ctx is not None:
                 tmp_pilot_ctx.cleanup()
+
+    def test_astra_brief_require_ack_propagation_and_pin_type_guards(self):
+        res = run_pilot([
+            "init", "--dot", "DOT-P", "--project", "kice",
+            "--ops-base", self.ops_base, "--preset", "research-3track",
+            "--require-astra-ack",
+        ], self.pilot_dir)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        cfg = _read_json(os.path.join(self.pilot_dir, "config.json"))
+        self.assertTrue(cfg["require_astra_ack"])
+
+        for tr, expected_role in (("research", "worker"), ("ontology", "worker"), ("authoring", "worker")):
+            cpath = os.path.join(self.ops_base, "loops", "DOT-P", f"{tr}.contract.json")
+            cdoc = _read_json(cpath)
+            self.assertTrue(cdoc["require_astra_ack"], tr)
+            self.assertEqual(cdoc["astra_role"], expected_role, tr)
+            self.assertTrue(cdoc.get("astra_profile_sha"), tr)
+
+        br_txt = run_pilot(["brief"], self.pilot_dir)
+        self.assertEqual(br_txt.returncode, 0, br_txt.stderr)
+        self.assertIn("Track `research` (DOT-P/kice)", br_txt.stdout)
+        self.assertIn("Ack required:", br_txt.stdout)
+        self.assertIn("[ASTRA_HARNESS_PROFILE v2", br_txt.stdout)
+
+        br_json = run_pilot(["brief", "--track", "research", "--json"], self.pilot_dir)
+        self.assertEqual(br_json.returncode, 0, br_json.stderr)
+        bdoc = json.loads(br_json.stdout)
+        self.assertEqual(bdoc["dot"], "DOT-P")
+        self.assertEqual(len(bdoc["tracks"]), 1)
+        t0 = bdoc["tracks"][0]
+        self.assertEqual(t0["track"], "research")
+        self.assertTrue(t0["require_astra_ack"])
+        self.assertIsNotNone(t0["ack_cmd"])
+        self.assertIn("--profile-sha", t0["ack_cmd"])
+        self.assertEqual(t0["sha256"], t0["profile"]["sha256"])
+        self.assertEqual(t0["profile"]["version"], "astra-v2")
+
+        bad_tr = run_pilot(["brief", "--track", "missing"], self.pilot_dir)
+        self.assertEqual(bad_tr.returncode, 2)
+
+        ok1, _, _, err1 = dp._verify_dots_pin({"dots_py": 123, "dots_sha256": "0" * 64})
+        self.assertFalse(ok1)
+        self.assertIn("string", err1)
+        ok2, _, _, err2 = dp._verify_dots_pin({
+            "dots_py": os.path.join(TOOLS_DIR, "dots.py"),
+            "dots_sha256": {"not": "str"},
+        })
+        self.assertFalse(ok2)
+        self.assertIn("dots_sha256", err2)
+
+        ok3, _, _, err3 = dp._verify_monitor_pin({"dots_monitor_py": ["bad"], "monitor_sha256": "0" * 64})
+        self.assertFalse(ok3)
+        self.assertIn("string", err3)
+        ok4, _, _, err4 = dp._verify_monitor_pin({
+            "dots_monitor_py": os.path.join(TOOLS_DIR, "dots_monitor.py"),
+            "monitor_sha256": 999,
+        })
+        self.assertFalse(ok4)
+        self.assertIn("monitor_sha256", err4)
+
+        # JSON secret, 48-hex Hub URL, and PGP block redaction + reviewer astra_role brief
+        red_json = dp._redact_text('{"api_key": "mytopsecret123", "session_token": "tok999"}')
+        self.assertNotIn("mytopsecret123", red_json)
+        self.assertNotIn("tok999", red_json)
+        red_url = dp._redact_text("http://127.0.0.1:9000/a/" + ("ab" * 24) + "/mcp")
+        self.assertNotIn("ab" * 24, red_url)
+        self.assertTrue(red_url.endswith("/mcp"))
+
+        cfg_rev = dict(cfg)
+        cfg_rev["tracks"] = [
+            {"track": "audit-t", "astra_role": "reviewer", "role": "reviewer", "objective": "Audit cleanly", "continuous": True}
+        ]
+        _write_json(os.path.join(self.pilot_dir, "config.json"), cfg_rev)
+        os.chmod(os.path.join(self.pilot_dir, "config.json"), 0o600)
+        br_rev = run_pilot(["brief", "--track", "audit-t", "--json"], self.pilot_dir)
+        self.assertEqual(br_rev.returncode, 0, br_rev.stderr)
+        t_rev = json.loads(br_rev.stdout)["tracks"][0]
+        self.assertEqual(t_rev["role"], "reviewer")
+        self.assertTrue(t_rev["profile"]["read_only"])
+
+        # Custom track omitting both role and astra_role aligns loop init contract with brief SHA
+        esc_json = dp._redact_text('{"api_key": "part1\\"part2secret"}')
+        self.assertNotIn("part2secret", esc_json)
+        large_pem = "-----BEGIN PRIVATE KEY-----\n" + (("B" * 64 + "\n") * 1100) + "ABCD\n-----END PRIVATE KEY-----\nAFTER_PEM"
+        self.assertIn("AFTER_PEM", dp._redact_text(large_pem))
+        self.assertNotIn("BBBBBBBB", dp._redact_text(large_pem))
+        self.assertNotIn("\nABCD\n", dp._redact_text(large_pem))
+        aq_pilot = dp._redact_text("ABCDEFGH12345678\nAQ==\n-----END PRIVATE KEY-----\nKEEP_PILOT")
+        self.assertNotIn("AQ==", aq_pilot)
+        self.assertNotIn("ABCDEFGH12345678", aq_pilot)
+        self.assertIn("KEEP_PILOT", aq_pilot)
+        front_pgp = "PRE\n" + ("ABCDEFGH12345678\n" * 2) + "=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST"
+        red_fpgp = dp._redact_text(front_pgp)
+        self.assertNotIn("ABCDEFGH12345678", red_fpgp)
+        self.assertNotIn("=AbCd", red_fpgp)
+        self.assertIn("POST", red_fpgp)
+        front_unp = "PRE\n" + ("ABCDEFGH12345678\n" * 2) + "ABCD\n-----END PRIVATE KEY-----\nPOST"
+        red_funp = dp._redact_text(front_unp)
+        self.assertNotIn("ABCDEFGH12345678", red_funp)
+        self.assertNotIn("\nABCD\n", red_funp)
+        self.assertIn("POST", red_funp)
+        over64_pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + (("B" * 64 + "\n") * 1100) + "ABCD\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_64P"
+        red_64p = dp._redact_text(over64_pgp)
+        self.assertNotIn("BBBBBBBB", red_64p)
+        self.assertNotIn("\nABCD\n", red_64p)
+        self.assertNotIn("=AbCd", red_64p)
+        self.assertIn("TAIL_64P", red_64p)
+        front_pgp_pad = "PRE_PGP\n" + ("MIIEowIBAAKCAQEA\n" * 2) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST_PGP"
+        red_fpp = dp._redact_text(front_pgp_pad)
+        self.assertNotIn("MIIEowIBAAKCAQEA", red_fpp)
+        self.assertNotIn("AQ==", red_fpp)
+        self.assertNotIn("=AbCd", red_fpp)
+        self.assertIn("POST_PGP", red_fpp)
+        over64_pgp_pad = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + (("B" * 64 + "\n") * 1100) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_64PAD"
+        red_64pad = dp._redact_text(over64_pgp_pad)
+        self.assertNotIn("BBBBBBBB", red_64pad)
+        self.assertNotIn("AQ==", red_64pad)
+        self.assertNotIn("=AbCd", red_64pad)
+        self.assertIn("TAIL_64PAD", red_64pad)
+
+        custom_cfg = dict(cfg)
+        custom_cfg["require_astra_ack"] = True
+        custom_cfg["tracks"] = [{"track": "review", "objective": "Review custom track"}]
+        _write_json(os.path.join(self.pilot_dir, "config.json"), custom_cfg)
+        os.chmod(os.path.join(self.pilot_dir, "config.json"), 0o600)
+        dp._apply_tracks_to_ops(custom_cfg, os.path.join(TOOLS_DIR, "dots.py"), force=True)
+        cdoc_rev = json.loads(pathlib.Path(os.path.join(self.ops_base, "loops", cfg["dot"], "review.contract.json")).read_text(encoding="utf-8"))
+        self.assertEqual(cdoc_rev["astra_role"], "reviewer")
+        br_cust = json.loads(run_pilot(["brief", "--track", "review", "--json"], self.pilot_dir).stdout)["tracks"][0]
+        self.assertEqual(br_cust["role"], "reviewer")
+        ack_res = subprocess.run(
+            [
+                sys.executable, "-B", os.path.join(TOOLS_DIR, "dots.py"),
+                "loop", "ack", cfg["dot"], "review", "--agent", "r-cust", "--profile-sha", br_cust["profile"]["sha256"],
+            ],
+            env=dict(os.environ, DOTS_OPS_BASE=self.ops_base, DOTS_AUTO_UPDATE="0"),
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(ack_res.returncode, 0, ack_res.stderr)
 
 
 if __name__ == "__main__":

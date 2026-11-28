@@ -3385,6 +3385,301 @@ class LoopTests(Base):
             tick_ok = run(["tick", "DOT-E", "w1", "done", "--project", "rem", "--host", "local", "--task", "t", "--note", "ok", "--evidence", "rev/1", "--goal", "g", "--doing", "d", "--next", "n"], self.base)
             self.assertEqual(tick_ok.returncode, 0, tick_ok.stderr)
 
+    def test_prompt_command_roles_modes_and_no_agent_rules(self):
+        expected = {
+            "worker": ("xhigh", False),
+            "reviewer": ("xhigh", True),
+            "coordinator": ("ultra", False),
+        }
+        for role, (effort, ro) in expected.items():
+            for mode in ("dots-only", "sub-dots"):
+                with self.subTest(role=role, mode=mode):
+                    rj = run(["prompt", "--role", role, "--mode", mode, "--json"], self.base)
+                    self.assertEqual(rj.returncode, 0, rj.stderr)
+                    doc = json.loads(rj.stdout)
+                    self.assertEqual(doc["version"], "astra-v2")
+                    self.assertEqual(doc["source_pin"], "0159023e")
+                    self.assertEqual(doc["role"], role)
+                    self.assertEqual(doc["mode"], mode)
+                    self.assertEqual(doc["effort"], effort)
+                    self.assertEqual(doc["read_only"], ro)
+                    self.assertRegex(doc["sha256"], r"^[0-9a-f]{16,64}$")
+                    self.assertIn("[ASTRA_HARNESS_PROFILE", doc["full"])
+                    self.assertTrue(doc["compact"].startswith("ASTRA_PROFILE:"))
+                    self.assertNotIn("AGENT_RULES", rj.stdout)
+
+        rc = run(["prompt", "--role", "reviewer", "--compact"], self.base)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        self.assertTrue(rc.stdout.strip().startswith("ASTRA_PROFILE:"))
+        self.assertIn("role=reviewer", rc.stdout)
+        self.assertNotIn("AGENT_RULES", rc.stdout)
+
+    def test_loop_astra_first_claim_full_profile_ack_gate_and_memory_schema(self):
+        bundle = d.astra_profile_bundle("reviewer", mode="dots-only")
+        init_res = run([
+            "loop", "init", "DOT-K", "rev-track",
+            "--project", "kice",
+            "--objective", "Audit KICE items",
+            "--astra-role", "reviewer",
+            "--require-astra-ack",
+        ], self.base)
+        self.assertEqual(init_res.returncode, 0, init_res.stderr)
+        cdoc = d.load_json(os.path.join(self.base, "loops", "DOT-K", "rev-track.contract.json"))
+        self.assertEqual(cdoc["astra_role"], "reviewer")
+        self.assertTrue(cdoc["require_astra_ack"])
+        self.assertEqual(cdoc["astra_profile_sha"], bundle["sha256"])
+
+        self.assertEqual(run(["loop", "enqueue", "DOT-K", "rev-track", "--title", "Item A"], self.base).returncode, 0)
+        self.assertEqual(run(["loop", "enqueue", "DOT-K", "rev-track", "--title", "Item B"], self.base).returncode, 0)
+
+        # First claim auto-prints full Astra profile + ACK hint, while keeping memory-v1 schema strict.
+        c1 = run(["loop", "claim", "DOT-K", "rev-track", "--agent", "r1"], self.base)
+        self.assertEqual(c1.returncode, 0, c1.stderr)
+        self.assertIn("[ASTRA_HARNESS_PROFILE", c1.stdout)
+        self.assertIn("LOOP_ASTRA_ACK_REQUIRED_HINT", c1.stdout)
+        item1_id = re.search(r"item_id=(l-\S+)", c1.stdout).group(1)
+
+        sdoc = d.load_json(os.path.join(self.base, "loops", "DOT-K", "rev-track.state.json"))
+        self.assertEqual(sdoc["agent_profile_seen"]["r1"], bundle["sha256"])
+        mem_r1 = d.load_json(os.path.join(self.base, "memory", "DOT-K", "r1.json"))
+        self.assertEqual(set(mem_r1.keys()), MEMORY_KEYS)
+
+        # Subsequent claim omits full profile unless --full-profile is requested.
+        c2 = run(["loop", "claim", "DOT-K", "rev-track", "--agent", "r1"], self.base)
+        self.assertEqual(c2.returncode, 0, c2.stderr)
+        self.assertIn(f"LOOP_ACTIVE_ENFORCED {item1_id}", c2.stdout)
+        self.assertNotIn("[ASTRA_HARNESS_PROFILE", c2.stdout)
+
+        c3 = run(["loop", "claim", "DOT-K", "rev-track", "--agent", "r1", "--full-profile"], self.base)
+        self.assertEqual(c3.returncode, 0, c3.stderr)
+        self.assertIn("[ASTRA_HARNESS_PROFILE", c3.stdout)
+
+        # Progress before ACK is blocked; mismatched SHA is rejected; explicit loop ack unlocks.
+        pre_prog = run([
+            "loop", "progress", "DOT-K", "rev-track", "--agent", "r1", "--item", item1_id,
+            "--note", "pre", "--evidence", "docs/check.md:1",
+        ], self.base)
+        self.assertEqual(pre_prog.returncode, 2)
+        self.assertIn("LOOP_ASTRA_ACK_REQUIRED", pre_prog.stderr)
+
+        bad_ack = run([
+            "loop", "ack", "DOT-K", "rev-track", "--agent", "r1", "--profile-sha", "00000000deadbeef",
+        ], self.base)
+        self.assertEqual(bad_ack.returncode, 2)
+        self.assertIn("LOOP_ASTRA_PROFILE_MISMATCH", bad_ack.stderr)
+
+        good_ack = run([
+            "loop", "ack", "DOT-K", "rev-track", "--agent", "r1", "--profile-sha", bundle["sha256"],
+        ], self.base)
+        self.assertEqual(good_ack.returncode, 0, good_ack.stderr)
+        self.assertIn("LOOP_ASTRA_ACKED", good_ack.stdout)
+
+        ok_prog = run([
+            "loop", "progress", "DOT-K", "rev-track", "--agent", "r1", "--item", item1_id,
+            "--note", "verified", "--evidence", "docs/check.md:10",
+        ], self.base)
+        self.assertEqual(ok_prog.returncode, 0, ok_prog.stderr)
+        ok_comp = run([
+            "loop", "complete", "DOT-K", "rev-track", "--agent", "r1", "--item", item1_id,
+            "--summary", "reviewed cleanly", "--evidence", "rev/10",
+        ], self.base)
+        self.assertEqual(ok_comp.returncode, 0, ok_comp.stderr)
+
+        # Inline --profile-sha on loop progress persists ACK for loop complete too.
+        c_r2 = run(["loop", "claim", "DOT-K", "rev-track", "--agent", "r2"], self.base)
+        self.assertEqual(c_r2.returncode, 0, c_r2.stderr)
+        item2_id = re.search(r"item_id=(l-\S+)", c_r2.stdout).group(1)
+        inline_prog = run([
+            "loop", "progress", "DOT-K", "rev-track", "--agent", "r2", "--item", item2_id,
+            "--note", "inline ack", "--evidence", "docs/b.md:2", "--profile-sha", bundle["sha256"],
+        ], self.base)
+        self.assertEqual(inline_prog.returncode, 0, inline_prog.stderr)
+        after_comp = run([
+            "loop", "complete", "DOT-K", "rev-track", "--agent", "r2", "--item", item2_id,
+            "--summary", "done via inline ack", "--evidence", "rev/11",
+        ], self.base)
+        self.assertEqual(after_comp.returncode, 0, after_comp.stderr)
+
+        st_json = run(["loop", "status", "DOT-K", "--json"], self.base)
+        self.assertEqual(st_json.returncode, 0, st_json.stderr)
+        tracks = json.loads(st_json.stdout)["tracks"]
+        t_rev = next(t for t in tracks if t["track"] == "rev-track")
+        self.assertEqual(t_rev["astra_role"], "reviewer")
+        self.assertEqual(t_rev["astra_effort"], "xhigh")
+        self.assertEqual(t_rev["astra_profile_sha"], bundle["sha256"])
+        self.assertTrue(t_rev["require_astra_ack"])
+
+    def test_secret_redaction_pgp_and_quoted_spaces(self):
+        pgp = (
+            "prefix -----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+            "lQOYBFtestsecretmaterialhere\n"
+            "-----END PGP PRIVATE KEY BLOCK----- suffix"
+        )
+        red_pgp = d._redact_text(pgp)
+        self.assertNotIn("lQOYBFtestsecretmaterialhere", red_pgp)
+        self.assertIn("[REDACTED]", red_pgp)
+
+        q_double = 'env api_key="my top secret value with spaces" ok'
+        red_double = d._redact_text(q_double)
+        self.assertNotIn("my top secret value with spaces", red_double)
+        self.assertIn("[REDACTED]", red_double)
+
+        q_single = "env password='secret pass phrase with spaces' ok"
+        red_single = d._redact_text(q_single)
+        self.assertNotIn("secret pass phrase with spaces", red_single)
+        self.assertIn("[REDACTED]", red_single)
+
+        # JSON secrets, 48-hex URLs, session_token, bounded unclosed PEM, and exact role matching
+        red_json = d._redact_text('{"api_key": "secret123", "session_token": "sess_abc99"}')
+        self.assertNotIn("secret123", red_json)
+        self.assertNotIn("sess_abc99", red_json)
+        tok48 = "cd" * 24
+        red_url = d._redact_text(f"http://127.0.0.1:8080/a/{tok48}/mcp")
+        self.assertNotIn(tok48, red_url)
+        self.assertTrue(red_url.endswith("/mcp"))
+        unclosed = "-----BEGIN PRIVATE KEY-----\n" + ("A" * 9000) + "\nTAIL_PRESERVED_MARKER"
+        red_unclosed = d._redact_text(unclosed)
+        self.assertIn("TAIL_PRESERVED_MARKER", red_unclosed)
+
+        self.assertEqual(d.normalize_astra_role("vqa-training"), "worker")
+        self.assertEqual(d.normalize_astra_role("coordinate-solver"), "worker")
+        self.assertEqual(d.normalize_astra_role("visual-qa"), "reviewer")
+        self.assertEqual(d.normalize_astra_role("rem-coord"), "coordinator")
+
+    def test_loop_contract_confinement_block_ack_role_sync_and_compact_json_parity(self):
+        # 1) prompt --compact --json matches 8-key compact bundle
+        rj = run(["prompt", "--role", "reviewer", "--compact", "--json"], self.base)
+        self.assertEqual(rj.returncode, 0, rj.stderr)
+        doc = json.loads(rj.stdout)
+        self.assertEqual(
+            set(doc.keys()),
+            {"version", "source_pin", "role", "effort", "mode", "read_only", "sha256", "compact"},
+        )
+
+        # 2) loop init --astra-role reviewer without --role records reviewer in contract & live
+        bundle = d.astra_profile_bundle("reviewer", mode="dots-only")
+        self.assertEqual(
+            run([
+                "loop", "init", "DOT-S", "sec-t", "--project", "kice",
+                "--objective", "Audit security", "--astra-role", "reviewer", "--require-astra-ack",
+            ], self.base).returncode,
+            0,
+        )
+        cdoc = d.load_json(os.path.join(self.base, "loops", "DOT-S", "sec-t.contract.json"))
+        self.assertEqual(cdoc["role"], "reviewer")
+        self.assertEqual(cdoc["astra_role"], "reviewer")
+
+        # 3) --contract override outside loops/<DOT>/ is rejected, and alt file without --contract-sha256 is rejected
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+            tf.write(json.dumps({"v": 1, "dot": "DOT-S", "track": "sec-t", "project": "kice"}) + "\n")
+            spoof_path = tf.name
+        try:
+            spoof_res = run(["loop", "enqueue", "DOT-S", "sec-t", "--title", "Evil", "--contract", spoof_path], self.base)
+            self.assertEqual(spoof_res.returncode, 2)
+            self.assertIn("escapes", spoof_res.stderr)
+        finally:
+            os.unlink(spoof_path)
+
+        alt_path = os.path.join(self.base, "loops", "DOT-S", "alt.contract.json")
+        d.write_atomic(alt_path, json.dumps({"v": 1, "dot": "DOT-S", "track": "sec-t", "project": "kice"}) + "\n")
+        alt_res = run(["loop", "enqueue", "DOT-S", "sec-t", "--title", "Alt", "--contract", alt_path], self.base)
+        self.assertEqual(alt_res.returncode, 2)
+        self.assertIn("--contract-sha256", alt_res.stderr)
+
+        # 4) loop block enforces --require-astra-ack and --profile-sha unlocks + records live role=reviewer
+        self.assertEqual(run(["loop", "enqueue", "DOT-S", "sec-t", "--title", "Item X"], self.base).returncode, 0)
+        c1 = run(["loop", "claim", "DOT-S", "sec-t", "--agent", "rev-s"], self.base)
+        self.assertEqual(c1.returncode, 0, c1.stderr)
+        iid = re.search(r"item_id=(l-\S+)", c1.stdout).group(1)
+        live_rows = lines(os.path.join(self.base, "live", "DOT-S", "rev-s.jsonl"))
+        self.assertEqual(live_rows[-1]["role"], "reviewer")
+
+        blk_pre = run([
+            "loop", "block", "DOT-S", "sec-t", "--agent", "rev-s", "--item", iid,
+            "--reason", "missing source dataset",
+        ], self.base)
+        self.assertEqual(blk_pre.returncode, 2)
+        self.assertIn("LOOP_ASTRA_ACK_REQUIRED", blk_pre.stderr)
+
+        blk_ok = run([
+            "loop", "block", "DOT-S", "sec-t", "--agent", "rev-s", "--item", iid,
+            "--reason", "missing source dataset", "--profile-sha", bundle["sha256"],
+        ], self.base)
+        self.assertEqual(blk_ok.returncode, 0, blk_ok.stderr)
+        self.assertIn(f"LOOP_BLOCKED {iid}", blk_ok.stdout)
+
+        # 5) JSON escaped quote & >8KiB PEM redaction + atomic ack event + pause/resume contract sha
+        self.assertIsNotNone(d.SECRET.search('{"api_key": "part1\\"part2secret"}'))
+        self.assertNotIn("part2secret", d._redact_text('{"api_key": "part1\\"part2secret"}'))
+        big_pem = "-----BEGIN PRIVATE KEY-----\n" + (("B" * 64 + "\n") * 1100) + "ABCD\n-----END PRIVATE KEY-----\nTAIL_OK"
+        self.assertIsNotNone(d.SECRET.search(big_pem))
+        self.assertNotIn("BBBBBBBB", d._redact_text(big_pem))
+        self.assertNotIn("\nABCD\n", d._redact_text(big_pem))
+        self.assertIn("TAIL_OK", d._redact_text(big_pem))
+        front_pgp = "PRE_KEEP\n" + ("MIIEowIBAAKCAQEA\n" * 3) + "=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST_KEEP"
+        red_fpgp = d._redact_text(front_pgp)
+        self.assertNotIn("MIIEowIBAAKCAQEA", red_fpgp)
+        self.assertNotIn("=AbCd", red_fpgp)
+        self.assertIn("PRE_KEEP", red_fpgp)
+        self.assertIn("POST_KEEP", red_fpgp)
+        front_short = ("ABCDEFGH\n" * 2) + "AQ==\n-----END PRIVATE KEY-----\n"
+        self.assertNotIn("ABCDEFGH", d._redact_text(front_short))
+        self.assertNotIn("AQ==", d._redact_text(front_short))
+        front_unpadded = "KEEP_HEAD\n" + ("ABCDEFGH12345678\n" * 2) + "ABCD\n-----END PRIVATE KEY-----\nKEEP_TAIL"
+        red_unp = d._redact_text(front_unpadded)
+        self.assertNotIn("ABCDEFGH12345678", red_unp)
+        self.assertNotIn("\nABCD\n", red_unp)
+        self.assertIn("KEEP_HEAD", red_unp)
+        self.assertIn("KEEP_TAIL", red_unp)
+        front_pgp_unp = "HEAD_PGP\n" + ("ABCDEFGH12345678\n" * 2) + "ABCD\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_PGP"
+        red_fpu = d._redact_text(front_pgp_unp)
+        self.assertNotIn("ABCDEFGH12345678", red_fpu)
+        self.assertNotIn("\nABCD\n", red_fpu)
+        self.assertNotIn("=AbCd", red_fpu)
+        self.assertIn("HEAD_PGP", red_fpu)
+        self.assertIn("TAIL_PGP", red_fpu)
+        front_pgp_pad = "PRE_PGP\n" + ("MIIEowIBAAKCAQEA\n" * 2) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nPOST_PGP"
+        red_fpp = d._redact_text(front_pgp_pad)
+        self.assertNotIn("MIIEowIBAAKCAQEA", red_fpp)
+        self.assertNotIn("AQ==", red_fpp)
+        self.assertNotIn("=AbCd", red_fpp)
+        self.assertIn("PRE_PGP", red_fpp)
+        self.assertIn("POST_PGP", red_fpp)
+        over64_pad = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + (("B" * 64 + "\n") * 1100) + "AQ==\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----\nTAIL_64PAD"
+        red_64pad = d._redact_text(over64_pad)
+        self.assertNotIn("BBBBBBBB", red_64pad)
+        self.assertNotIn("AQ==", red_64pad)
+        self.assertNotIn("=AbCd", red_64pad)
+        self.assertIn("TAIL_64PAD", red_64pad)
+
+        self.assertEqual(
+            run(["loop", "init", "DOT-G", "gate-t", "--project", "kice", "--objective", "Gated", "--gate", "qa", "--require-astra-ack"], self.base).returncode,
+            0,
+        )
+        g_bundle = d.astra_profile_bundle("worker", mode="dots-only")
+        self.assertEqual(run(["loop", "enqueue", "DOT-G", "gate-t", "--title", "Item G"], self.base).returncode, 0)
+        cg = run(["loop", "claim", "DOT-G", "gate-t", "--agent", "wg-1"], self.base)
+        ig = re.search(r"item_id=(l-\S+)", cg.stdout).group(1)
+        fail_comp = run([
+            "loop", "complete", "DOT-G", "gate-t", "--agent", "wg-1", "--item", ig,
+            "--summary", "tried without gate", "--evidence", "docs/g.md:1", "--profile-sha", g_bundle["sha256"],
+        ], self.base)
+        self.assertEqual(fail_comp.returncode, 2)
+        self.assertIn("missing required gate", fail_comp.stderr)
+        ev_rows = lines(os.path.join(self.base, "loops", "DOT-G", "gate-t.events.jsonl"))
+        self.assertFalse(any(e.get("event") == "astra_profile_acked" for e in ev_rows))
+        st_g = d.load_json(os.path.join(self.base, "loops", "DOT-G", "gate-t.state.json"))
+        self.assertNotIn("wg-1", st_g.get("agent_profile_acked", {}))
+
+        alt_p = os.path.join(self.base, "loops", "DOT-G", "custom.contract.json")
+        alt_blob = json.dumps({"v": 1, "dot": "DOT-G", "track": "gate-t", "project": "kice"}) + "\n"
+        d.write_atomic(alt_p, alt_blob)
+        alt_sha = hashlib.sha256(alt_blob.encode("utf-8")).hexdigest()
+        os.unlink(os.path.join(self.base, "loops", "DOT-G", "gate-t.contract.json"))
+        self.assertEqual(run(["loop", "pause", "DOT-G", "gate-t", "--contract", alt_p], self.base).returncode, 2)
+        self.assertEqual(run(["loop", "pause", "DOT-G", "gate-t", "--contract", alt_p, "--contract-sha256", alt_sha], self.base).returncode, 0)
+        self.assertEqual(run(["loop", "resume", "DOT-G", "gate-t", "--contract", alt_p, "--contract-sha256", alt_sha], self.base).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

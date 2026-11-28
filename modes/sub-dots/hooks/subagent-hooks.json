@@ -1,0 +1,29 @@
+{
+  "subdots-subagent-session": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh subagent-start",
+        "timeout": 10
+      }
+    ]
+  },
+  "subdots-subagent-invocation": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh subagent-pre-invocation",
+        "timeout": 10
+      }
+    ]
+  },
+  "subdots-subagent-continuation": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./run-hook.sh subagent-stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
