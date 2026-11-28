@@ -1,4 +1,4 @@
-# Mode 2: `sub-dots` (역방향 `web-gpt-agent` 직결 스티어링 + 강제 하네스 `v1.3`)
+# Mode 2: `sub-dots` (역방향 `web-gpt-agent` 직결 스티어링 + 강제 하네스 `v1.4`)
 
 **2번 모드 (`sub-dots`)** 는 원래 구조(`ChatGPT Web -> web-gpt-agent -> 내 로컬 맥 도구`)를 **정반대 방향**으로 뒤집어, **내 로컬 메인 세션 -> 로컬 역방향 브릿지 허브(`tools/subdots.py`) -> Dots 내부 서브에이전트**로 직접 연결합니다.
 
@@ -6,7 +6,7 @@ Dots 본체(루트 채팅)를 경유해 대화를 중계하지 않으며, **Astr
 
 ---
 
-## 아키텍처 (Enforced & Immortal Reverse Bridge v1.3)
+## 아키텍처 (Enforced & Immortal Reverse Bridge v1.4)
 
 ```text
 +---------------------------+        Unix Socket (0600)         +----------------------------------+
@@ -35,7 +35,7 @@ Dots 본체(루트 채팅)를 경유해 대화를 중계하지 않으며, **Astr
 
 ### 6계층 강제 · 역할 격리 · 장수 · 맥락 유지 메커니즘
 
-1. **Astra v2 서브에이전트 프롬프트 강제 하네스 (`omp-superkit@0159023e` 동기화, v1.3):**
+1. **Astra v2 서브에이전트 프롬프트 강제 하네스 (`omp-superkit@0159023e` 동기화, v1.4):**
    - **역할별 컴파일 및 다중 경로 자동 주입:** `subdots.py`와 `dots.py`가 동일한 `astra_profile_bundle(role, mode)` (`worker` xhigh, `reviewer` xhigh read-only, `coordinator` ultra)를 내장합니다.
      - Reverse MCP `initialize.instructions` (스코프 토큰 `/a/<agent_token>/mcp`에서는 오너 계약/등록 역할에 맞춤 자동 바인딩)
      - `agent register` / `agent resume` / `provision --brief` 자동 첨부 및 매 `capsule_every_n`회마다 `[CONTEXT_CAPSULE]` 내 `ASTRA_PROFILE:` 콤팩트 앵커 재주입
@@ -93,7 +93,15 @@ python3 tools/subdots.py install-git-hooks /path/to/repo --agent worker-1
 
 - **로컬 MCP (`python3 tools/subdots.py mcp-stdio`):** 15개 도구(`subdots_list_agents`, `subdots_agent_status`, `subdots_inbox`, `subdots_mark_read`, `subdots_send`, `subdots_steer`, `subdots_await_reply`, `subdots_events`, `subdots_control`, `subdots_set_contract`, `subdots_get_contract`, `subdots_clear_contract`, `subdots_brief`, `subdots_await_any`, `subdots_astra_profile`) + `initialize.instructions` 제공.
 - **역방향 HTTP MCP (`/<token>/mcp` 또는 `/a/<agent_token>/mcp`):** `initialize.instructions` + 13개 도구(`subdots_register`, `subdots_resume`, `subdots_wait`, `subdots_step`, `subdots_reply`, `subdots_ack`, `subdots_heartbeat`, `subdots_checkpoint`, `subdots_hibernate`, `subdots_read`, `subdots_patch`, `subdots_exec`, `subdots_git_status`, `--profile-sha` 지원) 제공.
-- **Antigravity / OMP 훅 연결:** [hooks/hooks.json](hooks/hooks.json) 및 [hooks/subagent-hooks.json](hooks/subagent-hooks.json) -> `subdots.py hook <session-start|pre-invocation|stop|subagent-start|subagent-pre-invocation|subagent-stop|doctor>`.
+- **Antigravity / Claude 훅 자동 설치 (`install-host-hooks`):**
+  ```bash
+  # Antigravity 메인 세션 / 서브에이전트 플러그인 훅 설치 (--dry-run 지원)
+  python3 tools/subdots.py install-host-hooks --target antigravity --mode sub-dots
+  python3 tools/subdots.py install-host-hooks --target antigravity-subagent --mode dots-only --dot DOT-A --ops-base ~/.dots-ops
+  # Claude Code settings.json 비파괴 병합 (.bak 백업 생성)
+  python3 tools/subdots.py install-host-hooks --target claude
+  ```
+- **수동 참조:** [hooks/hooks.json](hooks/hooks.json) 및 [hooks/subagent-hooks.json](hooks/subagent-hooks.json) -> `subdots.py hook <session-start|pre-invocation|stop|subagent-start|subagent-pre-invocation|subagent-stop|doctor>`.
 
 ### 3. Dots 서브에이전트 연결 및 작업
 서브에이전트에게는 [AGENT-BRIEF.md](AGENT-BRIEF.md)(또는 `subdots.py provision --brief`)를 붙입니다.

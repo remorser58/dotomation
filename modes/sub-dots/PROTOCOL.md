@@ -1,4 +1,4 @@
-# Mode 2: `sub-dots` Protocol & Contract (`tools/subdots.py` v1.3)
+# Mode 2: `sub-dots` Protocol & Contract (`tools/subdots.py` v1.4)
 
 ## 1. Storage & Security Boundary
 

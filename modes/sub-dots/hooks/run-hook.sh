@@ -7,7 +7,7 @@ if [ ! -f "${SUBDOTS_PY}" ]; then
   exit 0
 fi
 MODE="${1:-doctor}"
-shift || true
+if [ "$#" -gt 0 ]; then shift; fi
 if ! out=$(python3 -B "${SUBDOTS_PY}" hook "${MODE}" "$@" 2>/dev/null); then
   printf '{}\n'
   exit 0

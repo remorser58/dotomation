@@ -1,4 +1,4 @@
-# Mode 1: `dots-only` Rules (`v1.3`)
+# Mode 1: `dots-only` Rules (`v1.4`)
 
 이 문서는 **1번 모드 (`dots-only`)** 전용 운영 규칙이다. 로컬 세션 쿼터를 전혀 쓰지 않고 **Dots 자체 쿼터만으로** 작업할 때 적용한다.
 
@@ -68,7 +68,8 @@
 - **Quota boundary:** Runs 100% on Dots' own quota with zero local AI session quota. Do not install or invoke `subdots.py` reverse steering, `direct-mail` polling loops, or local-session bridge daemons unless the owner switches to Mode 2 (`sub-dots`).
 - **Model & Effort:** Every Dots run uses approved GPT-6.2 Astra (`ultra` for the one coordinator per dot, `xhigh` for workers and reviewers). Never use Codex (`Codex Native2`, `Codex cloud`, or any Codex-linked tool) on any host.
 - **Compiled Astra v2 Subagent Harness (`tools/dots.py prompt` & `tools/dots.py loop`):**
-  - Inspect/print role-specific Astra v2 specialist instructions anytime via `python3 tools/dots.py prompt --role <worker|reviewer|coordinator> --mode dots-only`.
+  - Inspect/print role-specific Astra v2 specialist instructions anytime via `python3 tools/dots.py prompt --role <worker|reviewer|coordinator> --mode dots-only`, or generate `< 3800`-char Web GPT Agent connector standing instructions via `python3 tools/dots.py prompt --wgpt-connector` / `dots_pilot.py wgpt-instructions apply --config <path>`.
+  - Inspect active workers without closed/retired legacy clutter via `python3 tools/dots.py board --active`.
   - Initialize standing Goal Contracts via `python3 tools/dots.py loop init <DOT> <track> --project <P> --objective "..." [--astra-role <role>] [--require-astra-ack] --continuous [--feeds-to <next_track>] [--gate <GATE>]`.
   - Workers loop directly: `loop claim` (automatically prints full `[ASTRA_HARNESS_PROFILE]` on first claim per agent/SHA without modifying `memory-v1`) -> optional `loop ack --profile-sha <sha>` (or pass `--profile-sha` inline on `progress`/`complete`) -> reversible local work -> `loop progress` -> `loop complete` (auto-hands off items to `--feeds-to` tracks) -> immediately `loop claim` again.
   - **Anti-`START-CHURN` & Skip-Blocked:** Never start a new task while one is active (`LOOP_ACTIVE_ENFORCED`); on single-item genuine block, isolate ONLY that item via `loop block` (`--hard-stop` if irreversible) and immediately claim/seed the next unblocked item.

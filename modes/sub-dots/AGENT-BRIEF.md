@@ -1,6 +1,6 @@
-# Mode 2: `sub-dots` Agent Brief Template (`v1.3`)
+# Mode 2: `sub-dots` Agent Brief Template (`v1.4`)
 
-Dots 서브에이전트(또는 서브에이전트를 띄우는 루트)에 붙여넣는 **2번 모드 (`sub-dots` v1.3 · Astra v2)** 브리핑 템플릿입니다. `subdots.py provision <agentId> --brief` 명령으로 역할/URL/SHA가 채워진 브리프를 자동 생성할 수 있습니다.
+Dots 서브에이전트(또는 서브에이전트를 띄우는 루트)에 붙여넣는 **2번 모드 (`sub-dots` v1.4 · Astra v2)** 브리핑 템플릿입니다. `subdots.py provision <agentId> --brief` 명령으로 역할/URL/SHA가 채워진 브리프를 자동 생성할 수 있습니다.
 
 ## Owner Authority Delegation & Default Local Execution Autonomy
 
@@ -20,7 +20,7 @@ Dots 서브에이전트(또는 서브에이전트를 띄우는 루트)에 붙여
 - **Self-Correction on `[AUTONOMY_DIRECTIVE]`:** If the Hub returns `[AUTONOMY_DIRECTIVE]` after a `block`/`question`/`blocked` report, it has verified no hard stop applies — immediately resume executing the reversible local work instead of repeating the refusal.
 
 ```text
-Dotomation Mode 2: sub-dots v1.3 (Enforced Reverse Bridge + Astra v2 Harness) @ <kit commit SHA>
+Dotomation Mode 2: sub-dots v1.4 (Enforced Reverse Bridge + Astra v2 Harness) @ <kit commit SHA>
 Agent ID: <agentId>
 Dot / Project / Role: <DOT> / <project> / <worker|reviewer|coordinator>
 Hub URL (or state dir on local): <SUBDOTS_HUB_URL or ~/.subdots>

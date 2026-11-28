@@ -1,6 +1,6 @@
-# Dotomation (닷동화) · `v1.3`
+# Dotomation (닷동화) · `v1.4`
 
-Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하나를 선택해 세팅하고, `dbc-hbin/omp-superkit@0159023e`의 **SUPER/Superstack 워크플로우**와 **역할별 GPT-6.2 Astra v2 서브에이전트 프롬프트**를 **코드·훅·하드 게이트 수준으로 강제**하는 키트다. `python3 tools/dots.py init`을 실행하거나 아래 모드 문서를 보고 **1번(`dots-only`)** 과 **2번(`sub-dots`)** 중 하나를 고른다.
+Dotomation은 사용자의 목적에 따라 **두 가지 운영 모드** 중 하나를 선택해 세팅하고, `dbc-hbin/omp-superkit@0159023e`의 **SUPER/Superstack 워크플로우**와 **역할별 GPT-6.2 Astra v2 서브에이전트 프롬프트**를 **코드·훅·커넥터 지침·VM 워치독 수준으로 강제**하는 키트다. `python3 tools/dots.py init`을 실행하거나 아래 모드 문서를 보고 **1번(`dots-only`)** 과 **2번(`sub-dots`)** 중 하나를 고른다.
 
 | 선택 | 모드 | 누구의 쿼터를 쓰나 | 핵심 목적 | 문서 / 도구 |
 |---|---|---|---|---|
@@ -50,12 +50,16 @@ Cataly 같은 외부 LLM 코디네이터나 개인 AI 토큰 없이 이 저장�
 
 ```bash
 python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset research-3track --require-astra-ack
-# 또는 UX -> UI -> 구현 3트랙:
-python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset ux-ui-impl-3track --require-astra-ack
+# 또는 UX -> UI -> 구현 3트랙 (+ VM watchdog/외부 앵커 연동 가능):
+python3 tools/dots_pilot.py init --dot REM17 --project myproj --preset ux-ui-impl-3track --require-astra-ack \
+  [--recovery-script /path/to/recovery.py --recovery-sha256 <sha256> --recovery-ledger /path/to/ledger --recovery-anchor-dir ~/.dots-recovery]
 python3 tools/dots_pilot.py brief          # 트랙별 Astra v2 서브에이전트 브리프 출력
+python3 tools/dots_pilot.py wgpt-instructions apply --config /path/to/wgpt-daemon/data/config.json  # Web GPT Agent mcp.instructions 주입
+python3 tools/dots_pilot.py vm-backup sync-anchor --json  # 읽기 전용 VM 원장 외장 앵커 이중검증 백업
 python3 tools/dots_pilot.py doctor
 python3 tools/dots_pilot.py once           # 1회 점검·깨우기(단일 인스턴스 flock + nonce 인증 sentinel)
 python3 tools/dots_pilot.py render-service --target launchd  # 서비스 파일 출력만 (자동 설치 없음)
+python3 tools/subdots.py install-host-hooks --target antigravity --mode dots-only  # 로컬 Antigravity/Claude 훅 설치
 ```
 
 ## 핵심 1: 본체 중계 없는 비실시간/역방향 스티어링

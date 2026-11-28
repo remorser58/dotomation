@@ -1,4 +1,4 @@
-# Maintainer notes (`v1.3`)
+# Maintainer notes (`v1.4`)
 
 This repository supports two user-selectable operating modes — **Mode 1 (`dots-only`)** in `modes/dots-only/` (Dots quota only, zero local quota) and **Mode 2 (`sub-dots`)** in `modes/sub-dots/` + `tools/subdots.py` (reverse `web-gpt-agent` local-to-subagent steering) — alongside the instruction/skill layer (aligned with `dbc-hbin/omp-superkit@0159023e` SUPER/Superstack/Astra-v2) and the four owner-requested Python 3.9+ stdlib tools below. The skill's entry point is [.agents/skills/dotomation/SKILL.md](.agents/skills/dotomation/SKILL.md); read it and [dispatch](workflows/dispatch.md) before editing the kit. Preserve strict schemas in `protocol/` (`memory-v1.schema.json` has `additionalProperties: false` — never add extra keys to `memory/<DOT>/<agent>.json`; store Mode 1 loop/Astra tracking in `loops/<DOT>/<track>.state.json`).
 
