@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 UNIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")

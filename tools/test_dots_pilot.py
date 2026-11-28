@@ -573,7 +573,7 @@ class DotsPilotTests(unittest.TestCase):
 
             # Version alignment, ANSI/quoted/PGP redaction, systemd escaping & injection block,
             # non-dict/corrupt JSON guards, and read-only status
-            self.assertEqual(dp.VERSION, "1.3.0")
+            self.assertEqual(dp.VERSION, "1.3.1")
             self.assertEqual(dp._redact_text("Bearer \x1b[31msecret1234567890abcdef\x1b[0m"), "[REDACTED]")
             self.assertEqual(dp._redact_text('API_KEY="tok part2 secret"'), "[REDACTED]")
             self.assertEqual(

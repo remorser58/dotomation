@@ -75,7 +75,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROTOCOL_VERSION = 1
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -610,6 +610,7 @@ def write_private_atomic(
     data: str,
     mode: int = 0o600,
     enforce_parent_dir: bool = True,
+    allow_sticky_parent: bool = False,
 ) -> None:
     abs_path = os.path.abspath(path)
     parent = os.path.dirname(abs_path)
@@ -617,6 +618,18 @@ def write_private_atomic(
     if enforce_parent_dir:
         parent = ensure_private_dir(parent)
     else:
+        if allow_sticky_parent:
+            try:
+                st_link = os.lstat(parent)
+            except OSError:
+                st_link = None
+            if (
+                st_link is not None
+                and stat.S_ISLNK(st_link.st_mode)
+                and hasattr(os, "geteuid")
+                and st_link.st_uid == 0
+            ):
+                parent = os.path.realpath(parent)
         os.makedirs(parent, mode=0o700, exist_ok=True)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     o_dir = getattr(os, "O_DIRECTORY", 0)
@@ -627,11 +640,19 @@ def write_private_atomic(
         if not stat.S_ISDIR(st_p.st_mode):
             raise OSError(f"{parent} is not a directory")
         if hasattr(os, "geteuid") and st_p.st_uid != os.geteuid():
-            raise OSError(f"{parent} owner mismatch")
+            if not (
+                allow_sticky_parent
+                and not enforce_parent_dir
+                and st_p.st_uid == 0
+                and bool(st_p.st_mode & stat.S_ISVTX)
+            ):
+                raise OSError(f"{parent} owner mismatch")
         try:
             st_cur = os.lstat(base_name, dir_fd=dir_fd)
             if stat.S_ISLNK(st_cur.st_mode) or not stat.S_ISREG(st_cur.st_mode) or st_cur.st_nlink != 1:
                 raise OSError(f"{abs_path} must be a regular unlinked file")
+            if hasattr(os, "geteuid") and st_cur.st_uid != os.geteuid():
+                raise OSError(f"{abs_path} owner mismatch")
         except FileNotFoundError:
             pass
         tmp_name = f"{base_name}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
@@ -652,6 +673,8 @@ def write_private_atomic(
                 st_cur = os.lstat(base_name, dir_fd=dir_fd)
                 if stat.S_ISLNK(st_cur.st_mode) or not stat.S_ISREG(st_cur.st_mode) or st_cur.st_nlink != 1:
                     raise OSError(f"{abs_path} must be a regular unlinked file")
+                if hasattr(os, "geteuid") and st_cur.st_uid != os.geteuid():
+                    raise OSError(f"{abs_path} owner mismatch")
             except FileNotFoundError:
                 pass
             os.replace(tmp_name, base_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -10184,6 +10207,7 @@ def save_agent_session(state_dir: str, agent_id: str, explicit_path: Optional[st
         path,
         json.dumps({"agent_id": agent_id, "epoch": epoch, "session_token": session_token}) + "\n",
         enforce_parent_dir=(explicit_path is None),
+        allow_sticky_parent=(explicit_path is not None),
     )
 
 

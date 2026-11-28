@@ -1028,6 +1028,75 @@ class TestAuditRegressionsAndHardening(HubTestBase):
                 os.unlink(sess_tmp)
         self.assertEqual(cli_run(["wake", "ch1", "--state-dir", self.state_dir], self.state_dir).returncode, 1)
 
+    def test_write_private_atomic_sticky_tmp_parent_and_owner_guards(self):
+        import types
+
+        self.start_hub()
+        uniq = f"subdots-sticky-sess-{os.getpid()}-{sd.secrets.token_hex(4)}.json"
+        if os.path.isdir("/tmp"):
+            sess_literal = os.path.join("/tmp", uniq)
+            try:
+                r_reg = cli_run(
+                    ["agent", "register", "sticky-w", "--session-file", sess_literal, "--state-dir", self.state_dir],
+                    self.state_dir,
+                )
+                self.assertEqual(r_reg.returncode, 0, r_reg.stderr)
+                st_mode = stat.S_IMODE(os.lstat(sess_literal).st_mode)
+                self.assertEqual(st_mode, 0o600)
+                r_hb = cli_run(
+                    ["agent", "heartbeat", "sticky-w", "--session-file", sess_literal, "--state-dir", self.state_dir],
+                    self.state_dir,
+                )
+                self.assertEqual(r_hb.returncode, 0, r_hb.stderr)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(sess_literal)
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0 and os.path.isdir("/tmp"):
+            real_tmp_file = os.path.join(os.path.realpath("/tmp"), f"subdots-nosticky-{sd.secrets.token_hex(4)}.json")
+            try:
+                with self.assertRaisesRegex(OSError, "owner mismatch"):
+                    sd.write_private_atomic(real_tmp_file, "x", enforce_parent_dir=False)
+                self.assertFalse(os.path.exists(real_tmp_file))
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(real_tmp_file)
+
+            with self.assertRaisesRegex(OSError, "owner mismatch"):
+                sd.write_private_atomic("/etc/" + uniq, "x", enforce_parent_dir=False, allow_sticky_parent=True)
+
+            link_dir = os.path.join(self._tmp.name, f"symtmp-{sd.secrets.token_hex(4)}")
+            os.symlink("/tmp", link_dir)
+            with self.assertRaises(OSError):
+                sd.write_private_atomic(
+                    os.path.join(link_dir, uniq),
+                    "x",
+                    enforce_parent_dir=False,
+                    allow_sticky_parent=True,
+                )
+
+            owned_dir = os.path.join(self._tmp.name, f"owned-{sd.secrets.token_hex(4)}")
+            os.makedirs(owned_dir, mode=0o700, exist_ok=True)
+            target = os.path.join(owned_dir, "sess.json")
+            sd.write_private_atomic(target, "original", enforce_parent_dir=False, allow_sticky_parent=True)
+            real_lstat = os.lstat
+
+            def _fake_lstat(p, *args, **kwargs):
+                dir_fd = kwargs.get("dir_fd")
+                st_res = real_lstat(p, *args, **kwargs)
+                if dir_fd is not None and p == os.path.basename(target):
+                    return types.SimpleNamespace(
+                        st_mode=st_res.st_mode,
+                        st_nlink=st_res.st_nlink,
+                        st_uid=os.geteuid() + 1,
+                    )
+                return st_res
+
+            with mock.patch.object(sd.os, "lstat", side_effect=_fake_lstat):
+                with self.assertRaisesRegex(OSError, "owner mismatch"):
+                    sd.write_private_atomic(target, "overwritten", enforce_parent_dir=False, allow_sticky_parent=True)
+            self.assertEqual(pathlib.Path(target).read_text(encoding="utf-8"), "original")
+
     def test_audit_part2_security_redos_smuggling_watchdog_and_exec_hardening(self):
         import http.client
 
@@ -3814,8 +3883,8 @@ class TestMode2AutonomyAndWatchdogV12(HubTestBase):
 
 class TestAstraSubagentHarnessV13(HubTestBase):
     def test_cross_tool_astra_parity_and_cli_prompt_and_provision_brief_redaction(self):
-        self.assertEqual(d.VERSION, "1.3.0")
-        self.assertEqual(sd.VERSION, "1.3.0")
+        self.assertEqual(d.VERSION, "1.3.1")
+        self.assertEqual(sd.VERSION, "1.3.1")
         self.assertEqual(sd.ASTRA_PROFILE_VERSION, "astra-v2")
         self.assertEqual(sd.ASTRA_SOURCE_PIN, "0159023e")
 

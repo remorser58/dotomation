@@ -119,7 +119,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 ASTRA_PROFILE_VERSION = "astra-v2"
 ASTRA_SOURCE_PIN = "0159023e"
 ASTRA_ROLES = ("worker", "reviewer", "coordinator")
